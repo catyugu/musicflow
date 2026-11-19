@@ -539,8 +539,12 @@ def checks(analysis: Analysis) -> list[dict[str, Any]]:
     """
     systems = analysis.layout.systems
     expected_staves = analysis.score.staff_count
-    matching = sum(1 for system in systems if len(system.staves) == expected_staves)
-    staff_ratio = matching / len(systems) if systems else 0.0
+    # Printed scores drop staves that stay empty (a vocal line during a piano interlude), so fewer
+    # staves than the score declares is normal; more staves than the piece has is a detection error.
+    plausible = sum(1 for system in systems if 2 <= len(system.staves) <= expected_staves)
+    overfull = [system.index for system in systems if len(system.staves) > expected_staves]
+    staff_ratio = plausible / len(systems) if systems else 0.0
+    partial = sum(1 for system in systems if len(system.staves) < expected_staves)
 
     detected_measures = sum(system.measure_count for system in systems)
     score_measures = len(analysis.score.measures)
@@ -557,9 +561,11 @@ def checks(analysis: Analysis) -> list[dict[str, Any]]:
     results = [
         {
             "name": "staffs_per_system",
-            "ok": staff_ratio >= 0.85,
+            "ok": staff_ratio >= 0.85 and not overfull,
             "detail": (
-                f"{matching}/{len(systems)} printed systems carry {expected_staves} staves"
+                f"{plausible}/{len(systems)} printed systems carry 2..{expected_staves} staves "
+                f"({partial} have fewer, which is normal when a staff stays empty); "
+                f"overfull systems: {overfull or 'none'}"
             ),
         },
         {
