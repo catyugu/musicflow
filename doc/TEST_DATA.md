@@ -34,7 +34,7 @@ case2 的谱面 MIDI 按记谱软件的默认速度导出，录音时长是它�
 
 | case | 来源 | 许可 |
 | --- | --- | --- |
-| case1 | 项目所有者提供 | 未确认，不得随项目再分发 |
+| case1 | 曲作者 catyugu 本人提供（原创作品） | 未附加开源许可，随本仓库公开 |
 | case2 | [Schubert Winterreise Dataset 2.1](https://zenodo.org/records/10839767)（doi:10.5281/zenodo.10839767） | CC BY 3.0；HU33 录音为 Public Domain Mark 1.0 |
 | case3 | [OpenScore String Quartet Corpus 3.0.0](https://github.com/OpenScore/StringQuartets)（doi:10.5281/zenodo.21862554） | CC0 1.0 |
 
