@@ -427,21 +427,34 @@ def render(
 
 
 def discover_case(directory: Path) -> tuple[Path, Path, Path]:
-    """Find the PDF, recording and symbolic score of one corpus case directory."""
+    """Find the PDF, recording and symbolic score of one corpus case directory.
+
+    The symbolic preference is deliberate: a directory that holds MusicXML, MXL and MIDI all at
+    once (the test corpus does) must be driven by the richest source, because only MusicXML carries
+    the engraving semantics that ``flow`` needs. MIDI is the last resort.
+    """
+    order = ((".musicxml", ".xml"), (".mxl",), (".mid", ".midi"))
+    for suffixes in order:
+        candidates = sorted(
+            path for path in directory.iterdir()
+            if path.is_file() and path.suffix.lower() in suffixes
+        )
+        if candidates:
+            symbolic = candidates[0]
+            break
+    else:
+        raise InputError(f"{directory.name}: no symbolic score found")
 
     def one(suffixes: Iterable[str], label: str) -> Path:
-        found = sorted(
-            p for p in directory.iterdir() if p.is_file() and p.suffix.lower() in suffixes
+        candidates = sorted(
+            path for path in directory.iterdir()
+            if path.is_file() and path.suffix.lower() in suffixes
         )
-        if not found:
+        if not candidates:
             raise InputError(f"{directory.name}: no {label} found")
-        return found[0]
+        return candidates[0]
 
-    return (
-        one((".pdf",), "PDF score"),
-        one(AUDIO_SUFFIXES, "recording"),
-        one(scorexml.MUSICXML_SUFFIXES + scorexml.MIDI_SUFFIXES, "symbolic score"),
-    )
+    return one((".pdf",), "PDF score"), one(AUDIO_SUFFIXES, "recording"), symbolic
 
 
 @dataclass(frozen=True, slots=True)
@@ -507,6 +520,16 @@ def batch(
             skipped.append({"case": case.name, "mode": "-", "ok": False, "error": str(error)})
             continue
         for mode in modes:
+            if mode == "flow" and symbolic.suffix.lower() in scorexml.MIDI_SUFFIXES:
+                skipped.append(
+                    {
+                        "case": case.name,
+                        "mode": mode,
+                        "ok": True,
+                        "skipped": "flow requires MusicXML or MXL",
+                    }
+                )
+                continue
             tasks.append(
                 BatchTask(
                     case=case.name,

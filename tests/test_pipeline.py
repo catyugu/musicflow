@@ -240,7 +240,27 @@ def test_discover_case_finds_the_three_inputs(case) -> None:
     pdf, audio, symbolic = pipeline.discover_case(case.root)
     assert pdf == case.pdf
     assert audio == case.audio
-    assert symbolic in (case.musicxml, case.mxl, case.midi)
+    # A directory holding MusicXML, MXL and MIDI must be driven by the MusicXML.
+    assert symbolic == case.musicxml
+
+
+def test_batch_skips_flow_for_midi_only_cases(case, tmp_path: Path) -> None:
+    corpus = tmp_path / "corpus"
+    midi_case = corpus / case.name
+    midi_case.mkdir(parents=True)
+    for source in (case.pdf, case.audio, case.midi):
+        (midi_case / source.name).write_bytes(source.read_bytes())
+    records = pipeline.batch(
+        corpus,
+        tmp_path / "out",
+        modes=["flow"],
+        spec=model.VideoSpec(width=320, height=240, fps=10),
+        preview=1.0,
+        jobs=1,
+    )
+    assert len(records) == 1
+    assert records[0]["ok"] is True
+    assert "MusicXML" in records[0]["skipped"]
 
 
 def test_batch_rejects_missing_corpus(tmp_path: Path) -> None:

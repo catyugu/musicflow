@@ -226,6 +226,9 @@ def _cmd_batch(args: argparse.Namespace) -> int:
     )
     failures = 0
     for record in records:
+        if record.get("skipped"):
+            print(f"skip  {record['case']:>8} {record['mode']:<7} {record['skipped']}")
+            continue
         status = "ok  " if record["ok"] else "FAIL"
         detail = record.get("out", "") if record["ok"] else record.get("error", "")
         print(
