@@ -52,6 +52,7 @@ class CaseResult:
     ink_ratio: list[float] = field(default_factory=list)
     line_ratio: list[float] = field(default_factory=list)
     has_audio: bool = False
+    sheet: str = ""
 
     def validate(self) -> list[str]:
         """Everything the video must satisfy to count as a delivered artifact."""
@@ -92,6 +93,7 @@ class CaseResult:
             "expected_frames": self.expected_frames,
             "min_ink_ratio": round(min(self.ink_ratio), 4) if self.ink_ratio else None,
             "min_line_ratio": round(min(self.line_ratio), 4) if self.line_ratio else None,
+            "sheet": self.sheet,
         }
 
 
@@ -191,14 +193,48 @@ def evaluate(
     background = (0xFA, 0xF8, 0xF1)
     line_colour = (0x28, 0x7D, 0x9F)
     span = min(result.video_seconds, result.audio_seconds)
+    sampled: list[np.ndarray] = []
     for index in range(SAMPLE_FRAMES):
         seconds = span * (index + 0.5) / SAMPLE_FRAMES
         frame = sample_frame(video, seconds, frames_dir / f"{case_name}-{mode}-{index}.png", 640)
+        sampled.append(frame)
         result.ink_ratio.append(ink_ratio(frame, background))
         if mode == "flow":
             result.line_ratio.append(line_ratio(frame, line_colour, spec.line_x * 640 / spec.width))
+    result.sheet = str(
+        contact_sheet(sampled, out / f"{case_name}.{mode}.sheet.png", f"{case_name} {mode}")
+    )
     result.ok = True
     return result
+
+
+def contact_sheet(frames: list[np.ndarray], path: Path, label: str) -> Path:
+    """Tile the sampled frames into one image so a reviewer can judge a run at a glance."""
+    if not frames:
+        raise RuntimeError("no frames to put on the contact sheet")
+    columns = 2
+    rows = (len(frames) + columns - 1) // columns
+    height, width = frames[0].shape[:2]
+    margin, caption = 8, 26
+    sheet = Image.new(
+        "RGB",
+        (
+            columns * width + (columns + 1) * margin,
+            rows * (height + caption) + (rows + 1) * margin,
+        ),
+        (235, 232, 224),
+    )
+    from PIL import ImageDraw
+
+    draw = ImageDraw.Draw(sheet)
+    for index, frame in enumerate(frames):
+        column, row = index % columns, index // columns
+        left = margin + column * (width + margin)
+        top = margin + row * (height + caption + margin)
+        sheet.paste(Image.fromarray(frame), (left, top))
+        draw.text((left, top + height + 6), f"{label} #{index + 1}", fill=(40, 40, 40))
+    sheet.save(path)
+    return path
 
 
 def main(argv: list[str] | None = None) -> int:
