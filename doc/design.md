@@ -100,15 +100,16 @@ def build_layout(
 # musicflow.render
 def render_switch(
     *, score: Score, route: Route, layout: StaffLayout, alignment: Alignment,
-    spec: VideoSpec, out: Path, work_dir: Path, preview: float | None,
+    spec: VideoSpec, out: Path, work_dir: Path, preview: float | None, audio: Path,
 ) -> Path
 def render_flow(
     *, score: Score, route: Route, alignment: Alignment, flow: FlowLayout,
-    spec: VideoSpec, out: Path, work_dir: Path, preview: float | None,
+    spec: VideoSpec, out: Path, work_dir: Path, preview: float | None, audio: Path,
 ) -> Path
 ```
 
-`preview` 是秒数（只渲前 N 秒），用于快速迭代；分块编码必须在 `work_dir` 里可续。
+`preview` 是秒数（只渲前 N 秒），用于快速迭代；分块编码必须在 `work_dir` 里可续。`audio` 是原录音
+路径：成片必须封装这条录音，且不能从别的字段推断它（missing → `InputError`）。
 
 ## 五、视频规格
 
@@ -146,6 +147,7 @@ def render_flow(
 | 4 | 输入合法但模式不支持（如 MIDI-only + flow） | `UnsupportedInputError` |
 | 5 | 必需分析步骤无法给出可信结果 | `AnalysisError` |
 | 6 | 合帧或编码失败 | `RenderError` |
+| 7 | 依赖的外部程序缺失（ffmpeg/ffprobe） | `MissingToolError` |
 
 预期失败用异常携带退出码，在 `cli.main` 转成一行消息；未预期失败带着 traceback 抛出。日志只配置一次
 （`cli._configure_logging`），级别 `INFO`（`-v` 到 `DEBUG`，`-q` 到 `WARNING`），写 stderr；数据性

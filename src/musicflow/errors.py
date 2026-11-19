@@ -14,6 +14,7 @@ EXIT_INPUT = 3
 EXIT_UNSUPPORTED = 4
 EXIT_ANALYSIS = 5
 EXIT_RENDER = 6
+EXIT_ENVIRONMENT = 7
 
 
 class MusicFlowError(Exception):
@@ -50,3 +51,9 @@ class RenderError(MusicFlowError):
     """Frame compositing or ffmpeg encoding failed."""
 
     exit_code = EXIT_RENDER
+
+
+class MissingToolError(MusicFlowError):
+    """An external program the pipeline depends on is not available."""
+
+    exit_code = EXIT_ENVIRONMENT

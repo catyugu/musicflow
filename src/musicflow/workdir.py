@@ -49,6 +49,13 @@ def fingerprint(files: Mapping[str, Path], params: Mapping[str, Any]) -> str:
     return digest.hexdigest()
 
 
+def hash_payload(payload: Any) -> str:
+    """Stable digest of a JSON-serialisable artifact, used to key downstream steps."""
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()
+    ).hexdigest()
+
+
 def write_json(path: Path, payload: Any) -> None:
     """Write JSON atomically, so an interrupted run never leaves a half-written artifact."""
     path.parent.mkdir(parents=True, exist_ok=True)
