@@ -115,9 +115,7 @@ def _runs(mask: np.ndarray, offset: int, max_width: int) -> list[float]:
     return [offset + (a + b) / 2 for a, b in groups if b - a + 1 <= max_width]
 
 
-def crossing_columns(
-    raster: PageRaster, upper: Staff, lower: Staff, space: float
-) -> list[float]:
+def crossing_columns(raster: PageRaster, upper: Staff, lower: Staff, space: float) -> list[float]:
     """Barline columns that cover the gap between two staves."""
     top = int(np.ceil(upper.bottom)) + 2
     bottom = int(np.floor(lower.top)) - 2
@@ -164,9 +162,7 @@ def group_barlines(raster: PageRaster, group: Group, space: float) -> list[float
         gap_rows.append(rows)
     if not mask.any():
         return []
-    probe_rows = np.concatenate(
-        [_inner_rows(staff, raster) for staff in group.staves] + gap_rows
-    )
+    probe_rows = np.concatenate([_inner_rows(staff, raster) for staff in group.staves] + gap_rows)
     limit = max(6, round(THIN_STROKE_SPACES * space))
     columns = []
     for start, stop in _runs_bounds(mask):
@@ -302,9 +298,7 @@ def brace_groups(raster: PageRaster, staves: list[Staff], space: float) -> list[
         shorter = min(upper.x1 - upper.x0, staff.x1 - staff.x0)
         crossed = crossing_columns(raster, upper, staff, space)
         big_enough = gap <= MAX_GAP_HEIGHTS * min(upper.height, staff.height)
-        if overlap >= 0.5 * shorter and big_enough and (
-            len(crossed) >= 2
-        ):
+        if overlap >= 0.5 * shorter and big_enough and (len(crossed) >= 2):
             groups[-1].append(staff)
         else:
             groups.append([staff])
@@ -321,9 +315,7 @@ def group_systems(groups: list[Group], raster: PageRaster, space: float) -> list
             Group(
                 staves=group.staves,
                 barlines=(
-                    tuple(group_barlines(raster, group, space))
-                    if len(group.staves) >= 2
-                    else ()
+                    tuple(group_barlines(raster, group, space)) if len(group.staves) >= 2 else ()
                 ),
             )
         )
@@ -346,9 +338,7 @@ def group_systems(groups: list[Group], raster: PageRaster, space: float) -> list
             )
         else:
             agreement = 1.0
-        limit = (
-            EXTENDED_GAP_HEIGHTS if agreement >= STRONG_AGREEMENT else MAX_GAP_HEIGHTS
-        )
+        limit = EXTENDED_GAP_HEIGHTS if agreement >= STRONG_AGREEMENT else MAX_GAP_HEIGHTS
         fits = overlap >= 0.5 * shorter and gap <= limit * height
         pairs.append(
             {
@@ -358,9 +348,7 @@ def group_systems(groups: list[Group], raster: PageRaster, space: float) -> list
                 "fits": 1.0 if fits else 0.0,
             }
         )
-    links = [
-        bool(pair["fits"]) and pair["agreement"] >= MIN_BARLINE_AGREEMENT for pair in pairs
-    ]
+    links = [bool(pair["fits"]) and pair["agreement"] >= MIN_BARLINE_AGREEMENT for pair in pairs]
     # A group joins the nearer of its two neighbours when both links are otherwise plausible.
     changed = True
     while changed:
@@ -478,17 +466,21 @@ def _clear_bounds(
         if y0 > top and (raster.gray[y0 : y0 + band, x0:x1] < threshold).any():
             y0 -= 1
             changed = True
-        if y1 < bottom and y1 - band >= y0 and (
-            raster.gray[y1 - band : y1, x0:x1] < threshold
-        ).any():
+        if (
+            y1 < bottom
+            and y1 - band >= y0
+            and (raster.gray[y1 - band : y1, x0:x1] < threshold).any()
+        ):
             y1 += 1
             changed = True
         if x0 > 0 and (raster.gray[y0:y1, x0 : x0 + band] < threshold).any():
             x0 -= 1
             changed = True
-        if x1 < width and x1 - band >= x0 and (
-            raster.gray[y0:y1, x1 - band : x1] < threshold
-        ).any():
+        if (
+            x1 < width
+            and x1 - band >= x0
+            and (raster.gray[y0:y1, x1 - band : x1] < threshold).any()
+        ):
             x1 += 1
             changed = True
         if not changed:

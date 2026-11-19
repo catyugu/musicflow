@@ -76,9 +76,7 @@ def bind_measures(
         if start < 0 or end < start:
             systems.append(replace(system, first_measure=None, last_measure=None))
         else:
-            systems.append(
-                replace(system, first_measure=indexes[start], last_measure=indexes[end])
-            )
+            systems.append(replace(system, first_measure=indexes[start], last_measure=indexes[end]))
     bound = sum(1 for system in systems if system.first_measure is not None)
     logger.info("bound %d/%d systems to measures", bound, len(systems))
     return replace(layout, systems=tuple(systems), unconfirmed=tuple(unconfirmed))

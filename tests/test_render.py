@@ -109,8 +109,16 @@ def _score(measures: int = 8, length_q: float = 2.0) -> tuple[Score, Route]:
         passes=tuple(MeasurePass(m.index, 1, m.start_q, m.length_q) for m in measure_infos),
         notes=tuple(
             PerformanceNote(
-                f"p-{index:06d}", f"mf-{index:06d}", index, 1,
-                (index - 1) * length_q, length_q, 60 + index, "P1", 1, 1,
+                f"p-{index:06d}",
+                f"mf-{index:06d}",
+                index,
+                1,
+                (index - 1) * length_q,
+                length_q,
+                60 + index,
+                "P1",
+                1,
+                1,
             )
             for index in range(1, measures + 1)
         ),
@@ -160,8 +168,9 @@ def _strip(work_dir: Path) -> FlowLayout:
         Image.fromarray(strip[:, x0 : x0 + tile_width]).save(path)
         tiles.append(Tile(path.name, x0, tile_width, height))
     note_x = tuple((f"mf-{index:06d}", 320.0 + (index - 1) * 680.0) for index in range(1, 9))
-    measure_x = tuple((index, 320.0 + (index - 1) * 680.0, 960.0 + (index - 1) * 680.0)
-                      for index in range(1, 9))
+    measure_x = tuple(
+        (index, 320.0 + (index - 1) * 680.0, 960.0 + (index - 1) * 680.0) for index in range(1, 9)
+    )
     return FlowLayout(
         strip_width=width,
         strip_height=height,
@@ -228,10 +237,24 @@ def test_switch_shows_the_next_system_at_its_first_sounding_measure(tmp_path: Pa
     layout = StaffLayout(
         pages=(PageInfo(1, 595.0, 842.0),),
         systems=(
-            System(1, 1, Rect(80, 118, 560, 278), (Rect(80, 120, 560, 250),),
-                   measure_count=4, first_measure=1, last_measure=4),
-            System(2, 1, Rect(80, 470, 560, 640), (Rect(80, 472, 560, 610),),
-                   measure_count=4, first_measure=5, last_measure=8),
+            System(
+                1,
+                1,
+                Rect(80, 118, 560, 278),
+                (Rect(80, 120, 560, 250),),
+                measure_count=4,
+                first_measure=1,
+                last_measure=4,
+            ),
+            System(
+                2,
+                1,
+                Rect(80, 470, 560, 640),
+                (Rect(80, 472, 560, 610),),
+                measure_count=4,
+                first_measure=5,
+                last_measure=8,
+            ),
         ),
     )
     work = tmp_path / "work"
@@ -278,8 +301,16 @@ def test_switch_plan_follows_a_repeat_back_to_the_first_system() -> None:
         passes.append(MeasurePass(measure, 1 if position <= 4 else 2, start, 2.0))
         notes.append(
             PerformanceNote(
-                f"p-{position:06d}", f"mf-{measure:06d}", measure, passes[-1].pass_index,
-                start, 2.0, 60 + measure, "P1", 1, 1,
+                f"p-{position:06d}",
+                f"mf-{measure:06d}",
+                measure,
+                passes[-1].pass_index,
+                start,
+                2.0,
+                60 + measure,
+                "P1",
+                1,
+                1,
             )
         )
     route = Route(passes=tuple(passes), notes=tuple(notes), total_q=16.0, source="auto_repeats")
@@ -287,10 +318,12 @@ def test_switch_plan_follows_a_repeat_back_to_the_first_system() -> None:
     layout = StaffLayout(
         pages=(PageInfo(1, 595.0, 842.0),),
         systems=(
-            System(1, 1, Rect(80, 100, 560, 240), (), measure_count=2,
-                   first_measure=1, last_measure=2),
-            System(2, 1, Rect(80, 260, 560, 400), (), measure_count=2,
-                   first_measure=3, last_measure=4),
+            System(
+                1, 1, Rect(80, 100, 560, 240), (), measure_count=2, first_measure=1, last_measure=2
+            ),
+            System(
+                2, 1, Rect(80, 260, 560, 400), (), measure_count=2, first_measure=3, last_measure=4
+            ),
         ),
     )
     plan = plan_switch(score=score, route=route, layout=layout, alignment=alignment)
@@ -313,8 +346,9 @@ def test_switch_plan_falls_back_to_proportional_positions(
     layout = StaffLayout(
         pages=(PageInfo(1, 595.0, 842.0),),
         systems=(
-            System(1, 1, Rect(80, 100, 560, 240), (), measure_count=3,
-                   first_measure=1, last_measure=3),
+            System(
+                1, 1, Rect(80, 100, 560, 240), (), measure_count=3, first_measure=1, last_measure=3
+            ),
             System(2, 1, Rect(80, 260, 560, 400), (), measure_count=3),
             System(3, 1, Rect(80, 420, 560, 560), (), measure_count=2),
         ),
@@ -527,8 +561,11 @@ def test_missing_pdf_is_an_input_error(tmp_path: Path) -> None:
     score, route = _score()
     layout = StaffLayout(
         pages=(PageInfo(1, 595.0, 842.0),),
-        systems=(System(1, 1, Rect(80, 118, 560, 278), (), measure_count=8,
-                        first_measure=1, last_measure=8),),
+        systems=(
+            System(
+                1, 1, Rect(80, 118, 560, 278), (), measure_count=8, first_measure=1, last_measure=8
+            ),
+        ),
     )
     with pytest.raises(InputError, match="PDF not found"):
         render_switch(

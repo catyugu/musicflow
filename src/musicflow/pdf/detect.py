@@ -76,9 +76,7 @@ def detect_layout(pdf: Path, *, expected_staves: int | None, debug_dir: Path) ->
                 group_systems(groups, raster, detection.space), detection.space
             )
             geometries = system_boxes(raster, chains, detection.space)
-            labels = printed_candidates(
-                document[number - 1], raster, geometries, detection.space
-            )
+            labels = printed_candidates(document[number - 1], raster, geometries, detection.space)
             write_page_overlay(raster, geometries, debug_dir)
             write_system_crops(raster, geometries, len(systems) + 1, debug_dir)
             for offset, geometry in enumerate(geometries):
@@ -171,9 +169,7 @@ def _assign_printed(
         cumulative = (chosen if chosen is not None else cumulative) + system.measure_count
     if not assigned:
         return systems, notes
-    systems = [
-        replace(system, printed_measure=assigned.get(system.index)) for system in systems
-    ]
+    systems = [replace(system, printed_measure=assigned.get(system.index)) for system in systems]
     return systems, notes
 
 

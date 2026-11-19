@@ -240,9 +240,7 @@ def snap_attacks(
 
     times = np.asarray([node.times[i] for node, i in zip(nodes, chosen, strict=True)])
     picked = np.asarray([node.evidence[i] for node, i in zip(nodes, chosen, strict=True)])
-    from_seed = np.asarray(
-        [bool(node.is_seed[i]) for node, i in zip(nodes, chosen, strict=True)]
-    )
+    from_seed = np.asarray([bool(node.is_seed[i]) for node, i in zip(nodes, chosen, strict=True)])
     fixed_mask = np.asarray([node.fixed for node in nodes])
     ratios = np.ones(times.size)
     if times.size > 1:
@@ -308,9 +306,7 @@ def _viterbi(nodes: list[_Node], expected: np.ndarray) -> tuple[np.ndarray, np.n
     chosen[-1] = int(np.argmin(costs[-1]))
     for index in range(len(nodes) - 1, 0, -1):
         chosen[index - 1] = choices[index][chosen[index]]
-    forced = np.asarray(
-        [bool(forced_flags[i][chosen[i]]) for i in range(len(nodes))], dtype=bool
-    )
+    forced = np.asarray([bool(forced_flags[i][chosen[i]]) for i in range(len(nodes))], dtype=bool)
     return chosen, forced
 
 

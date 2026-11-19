@@ -346,9 +346,7 @@ def _mux(
     measured = _duration_of(temporary, ffprobe)
     if abs(measured - timeline.seconds) > _DURATION_TOLERANCE:
         temporary.unlink(missing_ok=True)
-        raise RenderError(
-            f"muxed video is {measured:.3f} s, expected {timeline.seconds:.3f} s"
-        )
+        raise RenderError(f"muxed video is {measured:.3f} s, expected {timeline.seconds:.3f} s")
     try:
         os.replace(temporary, out)
     except OSError as error:

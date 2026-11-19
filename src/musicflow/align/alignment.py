@@ -182,8 +182,7 @@ def _validate_route(score: Score, route: Route) -> None:
     mismatched = [
         note
         for note in route.notes
-        if known[note.note_id].pitch != note.pitch
-        or known[note.note_id].measure != note.measure
+        if known[note.note_id].pitch != note.pitch or known[note.note_id].measure != note.measure
     ]
     if mismatched:
         first = mismatched[0]
@@ -223,8 +222,11 @@ def _numbers(
         residual_stats = {"median": 0.0, "p90": 0.0, "max": 0.0}
     signed = snapped.residual[snapped.snapped] * 1000.0
     onset_lag = float(np.median(signed)) if signed.size else 0.0
-    measured = [anchor.seconds for anchor in alignment.anchors if anchor.kind != "start"
-                and anchor.kind != "end"]
+    measured = [
+        anchor.seconds
+        for anchor in alignment.anchors
+        if anchor.kind != "start" and anchor.kind != "end"
+    ]
     sounding = measured[-1] - measured[0] if len(measured) >= 2 else features.duration
     sounding = max(sounding, 1e-9)
     length_ratio = max(features.duration / sounding, sounding / features.duration)
@@ -325,8 +327,7 @@ def _payload(
         "length_ratio": round(numbers.length_ratio, 4),
         "dropped_anchors": merge_stats,
         "reviewed_anchors": [
-            {"q": item.q, "seconds": item.seconds, "tolerance": item.tolerance}
-            for item in manual
+            {"q": item.q, "seconds": item.seconds, "tolerance": item.tolerance} for item in manual
         ],
         "route_source": route.source,
         "route_passes": len(route.passes),

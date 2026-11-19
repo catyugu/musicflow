@@ -218,9 +218,7 @@ def evaluate(
     result.video = str(video)
     result.fps, result.frames, result.video_seconds, audio_in_file = probe_video(video)
     result.has_audio = audio_in_file > 0.0
-    result.expected_seconds = (
-        audio_in_file if preview is None else min(preview, audio_in_file)
-    )
+    result.expected_seconds = audio_in_file if preview is None else min(preview, audio_in_file)
     result.expected_frames = round(result.expected_seconds * spec.fps)
 
     frames_dir = out / "frames"
@@ -230,9 +228,7 @@ def evaluate(
     background = (0xFA, 0xF8, 0xF1)
     for index in range(SAMPLE_FRAMES):
         seconds = span * (index + 0.5) / SAMPLE_FRAMES
-        frame = sample_frame(
-            video, seconds, frames_dir / f"{case_name}-{mode}-{index}.png"
-        )
+        frame = sample_frame(video, seconds, frames_dir / f"{case_name}-{mode}-{index}.png")
         sampled.append(frame)
         result.ink.append(ink_ratio(frame, background))
         if mode == "flow":

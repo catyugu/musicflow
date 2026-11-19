@@ -447,7 +447,8 @@ def discover_case(directory: Path) -> tuple[Path, Path, Path]:
     order = ((".musicxml", ".xml"), (".mxl",), (".mid", ".midi"))
     for suffixes in order:
         candidates = sorted(
-            path for path in directory.iterdir()
+            path
+            for path in directory.iterdir()
             if path.is_file() and path.suffix.lower() in suffixes
         )
         if candidates:
@@ -458,7 +459,8 @@ def discover_case(directory: Path) -> tuple[Path, Path, Path]:
 
     def one(suffixes: Iterable[str], label: str) -> Path:
         candidates = sorted(
-            path for path in directory.iterdir()
+            path
+            for path in directory.iterdir()
             if path.is_file() and path.suffix.lower() in suffixes
         )
         if not candidates:

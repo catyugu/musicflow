@@ -79,12 +79,16 @@ def draw_figure(
     draw.text((MAP_BOX[0], 12), "score position to recording time", fill=INK, font=title)
     draw.text((RESIDUAL_BOX[0], 12), "residual of each snapped attack", fill=INK, font=title)
     draw.text(
-        (MAP_BOX[0], 46), "recording time (s) against performance position (quarters)",
-        fill=MUTED, font=small,
+        (MAP_BOX[0], 46),
+        "recording time (s) against performance position (quarters)",
+        fill=MUTED,
+        font=small,
     )
     draw.text(
-        (RESIDUAL_BOX[0], 46), "snapped minus DTW time (ms) against position (quarters)",
-        fill=MUTED, font=small,
+        (RESIDUAL_BOX[0], 46),
+        "snapped minus DTW time (ms) against position (quarters)",
+        fill=MUTED,
+        font=small,
     )
     _panel(draw, MAP_BOX, tiny, total_q, (0.0, alignment.audio_duration))
     _panel(draw, RESIDUAL_BOX, tiny, total_q, (-RESIDUAL_LIMIT_MS, RESIDUAL_LIMIT_MS))

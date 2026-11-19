@@ -50,9 +50,9 @@ class StripTiles:
             rows_to = min(top + height, image.shape[0])
             if columns_to <= columns_from or rows_to <= rows_from:
                 continue
-            buffer[
-                rows_from - top : rows_to - top, columns_from - left : columns_to - left
-            ] = image[rows_from:rows_to, columns_from - tile_left : columns_to - tile_left]
+            buffer[rows_from - top : rows_to - top, columns_from - left : columns_to - left] = (
+                image[rows_from:rows_to, columns_from - tile_left : columns_to - tile_left]
+            )
         return buffer
 
     def _load(self, relative: str) -> np.ndarray:

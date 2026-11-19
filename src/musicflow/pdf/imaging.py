@@ -189,9 +189,7 @@ def rasterise(page: pymupdf.Page, number: int) -> PageRaster:
     skew = _estimate_skew(gray)
     matrix = np.eye(2, 3, dtype=np.float64)
     if abs(skew) >= SKEW_APPLY_THRESHOLD:
-        matrix = cv2.getRotationMatrix2D(
-            (pixmap.width / 2, pixmap.height / 2), skew, 1.0
-        )
+        matrix = cv2.getRotationMatrix2D((pixmap.width / 2, pixmap.height / 2), skew, 1.0)
         gray = cv2.warpAffine(
             gray,
             matrix,
@@ -314,9 +312,7 @@ def merge_fragments(lines: list[StaffLine], space: float) -> list[StaffLine]:
             continue
         other = merged[target]
         ink = other.ink + line.ink
-        centre = (
-            (other.centre * other.ink + line.centre * line.ink) / ink if ink else other.centre
-        )
+        centre = (other.centre * other.ink + line.centre * line.ink) / ink if ink else other.centre
         half = max((other.y1 - other.y0) / 2, (line.y1 - line.y0) / 2)
         merged[target] = StaffLine(
             y0=centre - half,

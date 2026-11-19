@@ -160,16 +160,18 @@ class Score:
             "title": self.title,
             "total_q": self.total_q,
             "unconfirmed": list(self.unconfirmed),
-            "parts": [
-                {"id": p.id, "name": p.name, "staves": p.staves} for p in self.parts
-            ],
+            "parts": [{"id": p.id, "name": p.name, "staves": p.staves} for p in self.parts],
             "measures": [
                 {"index": m.index, "start_q": m.start_q, "length_q": m.length_q}
                 for m in self.measures
             ],
             "repeats": [
-                {"kind": r.kind, "start_measure": r.start_measure,
-                 "end_measure": r.end_measure, "times": r.times}
+                {
+                    "kind": r.kind,
+                    "start_measure": r.start_measure,
+                    "end_measure": r.end_measure,
+                    "times": r.times,
+                }
                 for r in self.repeats
             ],
             "notes": [
@@ -195,8 +197,9 @@ class Score:
                 for r in data["repeats"]
             ),
             notes=tuple(
-                NoteEvent(n[0], n[1], int(n[2]), int(n[3]), int(n[4]), float(n[5]),
-                          float(n[6]), int(n[7]))
+                NoteEvent(
+                    n[0], n[1], int(n[2]), int(n[3]), int(n[4]), float(n[5]), float(n[6]), int(n[7])
+                )
                 for n in data["notes"]
             ),
         )
@@ -260,12 +263,20 @@ class Route:
             "source": self.source,
             "total_q": self.total_q,
             "unconfirmed": list(self.unconfirmed),
-            "passes": [
-                [p.measure, p.pass_index, p.start_q, p.length_q] for p in self.passes
-            ],
+            "passes": [[p.measure, p.pass_index, p.start_q, p.length_q] for p in self.passes],
             "notes": [
-                [n.id, n.note_id, n.measure, n.pass_index, n.onset_q, n.duration_q,
-                 n.pitch, n.part, n.staff, n.voice]
+                [
+                    n.id,
+                    n.note_id,
+                    n.measure,
+                    n.pass_index,
+                    n.onset_q,
+                    n.duration_q,
+                    n.pitch,
+                    n.part,
+                    n.staff,
+                    n.voice,
+                ]
                 for n in self.notes
             ],
         }
@@ -277,12 +288,21 @@ class Route:
             total_q=float(data["total_q"]),
             unconfirmed=tuple(data.get("unconfirmed", [])),
             passes=tuple(
-                MeasurePass(int(p[0]), int(p[1]), float(p[2]), float(p[3]))
-                for p in data["passes"]
+                MeasurePass(int(p[0]), int(p[1]), float(p[2]), float(p[3])) for p in data["passes"]
             ),
             notes=tuple(
-                PerformanceNote(n[0], n[1], int(n[2]), int(n[3]), float(n[4]), float(n[5]),
-                                int(n[6]), n[7], int(n[8]), int(n[9]))
+                PerformanceNote(
+                    n[0],
+                    n[1],
+                    int(n[2]),
+                    int(n[3]),
+                    float(n[4]),
+                    float(n[5]),
+                    int(n[6]),
+                    n[7],
+                    int(n[8]),
+                    int(n[9]),
+                )
                 for n in data["notes"]
             ),
         )

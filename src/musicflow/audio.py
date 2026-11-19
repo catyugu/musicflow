@@ -99,7 +99,5 @@ def decode(path: Path, *, sample_rate: int = ANALYSIS_SAMPLE_RATE) -> np.ndarray
     samples = np.frombuffer(result.stdout, dtype=np.float32)
     if samples.size == 0:
         raise InputError(f"{path} decoded to an empty signal")
-    logger.info(
-        "decoded %s: %.1f s at %d Hz", path.name, samples.size / sample_rate, sample_rate
-    )
+    logger.info("decoded %s: %.1f s at %d Hz", path.name, samples.size / sample_rate, sample_rate)
     return samples

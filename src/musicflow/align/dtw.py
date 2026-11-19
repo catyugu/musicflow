@@ -68,7 +68,7 @@ def _take(values: np.ndarray, delta: int) -> np.ndarray:
     if delta >= 0:
         out[: size - delta] = values[delta:]
     else:
-        out[-delta :] = values[: size + delta]
+        out[-delta:] = values[: size + delta]
     return out
 
 
