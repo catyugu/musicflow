@@ -70,7 +70,7 @@ SVG（`id="mf-000123"`）与 timemap 中，这是流动模式把"源音符 → �
 
 ```python
 # musicflow.symbolic
-def load_score(path: Path) -> Score
+def load_score(path: Path, *, written_path: Path | None = None) -> Score
 def build_route(score: Score, *, override: Path | None = None) -> Route
 
 # musicflow.pdf

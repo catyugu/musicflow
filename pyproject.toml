@@ -13,7 +13,7 @@ dependencies = [
     "opencv-python-headless>=4.10",
     "verovio>=6.4",
     "resvg-py>=0.5",
-    "soundfile>=0.13",
+    "librosa>=1.0",
 ]
 
 [dependency-groups]
