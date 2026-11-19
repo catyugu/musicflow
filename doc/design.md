@@ -56,13 +56,14 @@ SVG（`id="mf-000123"`）与 timemap 中，这是流动模式把"源音符 → �
 | `symbolic` | 符号谱 | `Score` + `written.musicxml` | `written.musicxml` 是注入 id 后的书写谱，供 Verovio 使用 |
 | `route` | `symbolic` | `Route` | 反复展开；默认书写顺序，MIDI 不做推测性展开 |
 | `staffs` | PDF + `symbolic.staff_count` | `StaffLayout`（未绑小节） | 谱行检测；同时写诊断位图 |
-| `staffs-bound` | `staffs` + `symbolic` | `StaffLayout`（含 `first/last_measure`） | 小节线计数 → 小节区间 |
+| `staffs-bound` | `staffs` + `symbolic` | `StaffLayout`（含 `first/last_measure`） | 印刷小节号优先，小节线计数兜底 |
 | `align` | `symbolic` + `route` + 音频 | `Alignment` + 报告 | 谱位→时间锚点、残差报告、待确认项 |
 | `flow` | `symbolic.written.musicxml` + 目标高度 | `FlowLayout` + 瓦片 PNG | 仅 MusicXML/MXL |
 | `render-switch` / `render-flow` | 上述 + `VideoSpec` | MP4 分块与成片 | 分块可续渲 |
 
-缓存键 = 输入文件 sha256 + 影响该步骤的参数 + 工具版本。`workdir.Step.run(key, compute)` 负责命中与
-落盘，步骤内部不判断缓存。
+缓存键 = 输入文件 sha256 + 影响该步骤的参数 + 工具版本 + `pipeline.PIPELINE_VERSION`。**任何步骤的行为
+改变都必须递增 `PIPELINE_VERSION`**，否则旧产物会被当作仍然有效。`workdir.Step.run(key, compute)` 负责
+命中与落盘，步骤内部不判断缓存。
 
 ## 四、模块接口
 
