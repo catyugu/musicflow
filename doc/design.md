@@ -116,6 +116,9 @@ def render_flow(
 （`switch` 用它取谱面位图，`flow` 接受但不用），`audio` 是原录音路径：成片必须封装这条录音。两者都
 是显式输入，不能从别的字段推断（missing → `InputError`）。
 
+`flow` 的瓦片写在 `flow` 步骤目录，`Tile.path` 相对该目录；所以 `render_flow` 的 `work_dir` 就是
+`<workspace>/flow/`，分段也落在那里，而渲染步骤的缓存元数据留在 `<workspace>/render-flow/`。
+
 ## 五、视频规格
 
 | 项 | 默认值 | 说明 |

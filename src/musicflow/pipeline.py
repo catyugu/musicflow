@@ -351,6 +351,8 @@ def render(
         )
     else:
         assert analysis.flow is not None, "flow layout was not built"
+        # Tile paths in FlowLayout are relative to the flow step directory, where the engraver
+        # wrote them, so the renderer works there; its cache metadata stays in this step.
         produced = renderer.render_flow(
             score=analysis.score,
             route=analysis.route,
@@ -358,7 +360,7 @@ def render(
             flow=analysis.flow,
             spec=spec,
             out=out,
-            work_dir=step.path,
+            work_dir=workspace.step("flow").path,
             preview=preview,
             audio=inputs.audio,
         )
