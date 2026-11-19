@@ -100,16 +100,19 @@ def build_layout(
 # musicflow.render
 def render_switch(
     *, score: Score, route: Route, layout: StaffLayout, alignment: Alignment,
-    spec: VideoSpec, out: Path, work_dir: Path, preview: float | None, audio: Path,
+    spec: VideoSpec, out: Path, work_dir: Path, preview: float | None,
+    pdf: Path, audio: Path,
 ) -> Path
 def render_flow(
     *, score: Score, route: Route, alignment: Alignment, flow: FlowLayout,
-    spec: VideoSpec, out: Path, work_dir: Path, preview: float | None, audio: Path,
+    spec: VideoSpec, out: Path, work_dir: Path, preview: float | None,
+    pdf: Path, audio: Path,
 ) -> Path
 ```
 
-`preview` 是秒数（只渲前 N 秒），用于快速迭代；分块编码必须在 `work_dir` 里可续。`audio` 是原录音
-路径：成片必须封装这条录音，且不能从别的字段推断它（missing → `InputError`）。
+`preview` 是秒数（只渲前 N 秒），用于快速迭代；分块编码必须在 `work_dir` 里可续。`pdf` 是原 PDF 路径
+（`switch` 用它取谱面位图，`flow` 接受但不用），`audio` 是原录音路径：成片必须封装这条录音。两者都
+是显式输入，不能从别的字段推断（missing → `InputError`）。
 
 ## 五、视频规格
 
@@ -142,6 +145,7 @@ def render_flow(
 | 退出码 | 含义 | 异常类型 |
 | --- | --- | --- |
 | 0 | 成功 | — |
+| 1 | `batch` 至少一个案例失败（逐案例状态见 stdout） | — |
 | 2 | 命令行用法错误 | `UsageError` |
 | 3 | 输入缺失/损坏/自相矛盾 | `InputError` |
 | 4 | 输入合法但模式不支持（如 MIDI-only + flow） | `UnsupportedInputError` |
@@ -167,5 +171,7 @@ def render_flow(
 以下事项在实践中确认，不由实现者自行发挥：
 
 1. `switch` 是否需要固定留白比例（当前按画布高度 90% 缩放、垂直居中）。
-2. MIDI-only 的小节划分：按时间签名推断，若与 PDF 小节线数不符则按比例映射并标记 `unconfirmed`。
+2. MIDI-only 的小节划分：按时间签名推断，若与 PDF 小节线数不符则按比例映射并标记 `unconfirmed`。MIDI
+   若是"已展开反复"的演奏，其小节数与印刷谱不同（case3：453 对 314），这类输入无法恢复反复处的谱面
+   回跳，`switch` 只能按比例推进，必须在报告里写明。
 3. 长条瓦片尺寸与 `max_strip_width` 上限（Verovio `pageWidth` 上限 100000）。
