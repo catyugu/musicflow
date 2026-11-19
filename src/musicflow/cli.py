@@ -90,6 +90,12 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     print(f"numpy            {numpy.__version__}")
     print(f"scipy            {scipy.__version__}")
 
+    import librosa
+    import partitura
+
+    print(f"librosa          {librosa.__version__}")
+    print(f"partitura        {partitura.__version__}")
+
     corpus = Path(args.corpus)
     if corpus.is_dir():
         cases = sorted(p.name for p in corpus.iterdir() if p.is_dir())

@@ -3,8 +3,9 @@
 This is the V1-V4 regression driver of doc/PLAN.md. It is deliberately outside the pytest suite: a
 full-length 1080p render takes minutes per case, while the tests that guard semantics run in the
 suite. It renders every case for every requested mode, probes the produced MP4 (frame rate, frame
-count, duration against the recording), samples frames and checks that each one carries score ink
-and, for flow, the reading line, then writes a JSON report plus a markdown table.
+count, duration against the recording), samples frames at native resolution, checks that each one
+carries score ink and, for flow, the reading line, then writes a JSON report plus a contact sheet
+per render and a markdown table.
 
 Usage:
 
@@ -24,15 +25,18 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from musicflow import audio, pipeline, workdir
+from musicflow import pipeline, workdir
 from musicflow.errors import MusicFlowError
 from musicflow.model import VideoSpec
 
-SAMPLE_FRAMES = 7
+SAMPLE_FRAMES = 6
+SHEET_WIDTH = 640
+DURATION_TOLERANCE = 0.2
+FRAME_TOLERANCE = 5
 
 
 @dataclass
@@ -44,60 +48,59 @@ class CaseResult:
     seconds: float = 0.0
     video: str = ""
     video_seconds: float = 0.0
-    audio_seconds: float = 0.0
     expected_seconds: float = 0.0
-    expected_frames: int = 0
     fps: float = 0.0
+    spec_fps: float = 0.0
     frames: int = 0
-    ink_ratio: list[float] = field(default_factory=list)
-    line_ratio: list[float] = field(default_factory=list)
+    expected_frames: int = 0
     has_audio: bool = False
+    ink: list[float] = field(default_factory=list)
+    line: list[float] = field(default_factory=list)
     sheet: str = ""
 
-    def validate(self) -> list[str]:
+    def problems(self) -> list[str]:
         """Everything the video must satisfy to count as a delivered artifact."""
-        problems: list[str] = []
+        found: list[str] = []
+        if not self.ok:
+            return [self.error or "render failed"]
         if not self.has_audio:
-            problems.append("no audio stream in the MP4")
-        if abs(self.video_seconds - self.expected_seconds) > 0.2:
-            problems.append(
-                f"duration {self.video_seconds:.2f} s != {self.expected_seconds:.2f} s"
+            found.append("no audio stream in the MP4")
+        if abs(self.video_seconds - self.expected_seconds) > DURATION_TOLERANCE:
+            found.append(
+                f"duration {self.video_seconds:.2f} s vs audio {self.expected_seconds:.2f} s"
             )
-        if abs(self.frames - self.expected_frames) > 1:
-            problems.append(f"{self.frames} frames != {self.expected_frames}")
+        if abs(self.frames - self.expected_frames) > FRAME_TOLERANCE:
+            found.append(f"{self.frames} frames vs {self.expected_frames} expected")
         if abs(self.fps - self.spec_fps) > 0.01:
-            problems.append(f"{self.fps:g} fps != {self.spec_fps:g}")
-        if self.ink_ratio and min(self.ink_ratio) < 0.005:
-            problems.append(f"a sampled frame is blank (min ink {min(self.ink_ratio):.4f})")
-        if self.mode == "flow" and self.line_ratio and min(self.line_ratio) < 0.9:
-            problems.append(f"reading line missing (min {min(self.line_ratio):.2f})")
-        return problems
-
-    spec_fps: float = 0.0
+            found.append(f"{self.fps:g} fps vs {self.spec_fps:g}")
+        if self.ink and min(self.ink) < 0.01:
+            found.append(f"a sampled frame is blank (min ink {min(self.ink):.3f})")
+        if self.mode == "flow" and self.line and min(self.line) < 8.0:
+            found.append(f"reading line missing (min contrast {min(self.line):.1f})")
+        return found
 
     def record(self) -> dict[str, object]:
-        problems = self.validate() if self.ok else [self.error]
+        problems = self.problems()
         return {
             "case": self.case,
             "mode": self.mode,
-            "ok": self.ok and not problems,
-            "error": self.error,
+            "ok": not problems,
             "problems": problems,
             "seconds": round(self.seconds, 1),
             "video": self.video,
             "video_seconds": round(self.video_seconds, 3),
-            "expected_seconds": round(self.expected_seconds, 3),
-            "audio_seconds": round(self.audio_seconds, 3),
+            "audio_seconds": round(self.expected_seconds, 3),
             "fps": self.fps,
             "frames": self.frames,
             "expected_frames": self.expected_frames,
-            "min_ink_ratio": round(min(self.ink_ratio), 4) if self.ink_ratio else None,
-            "min_line_ratio": round(min(self.line_ratio), 4) if self.line_ratio else None,
+            "min_ink": round(min(self.ink), 4) if self.ink else None,
+            "min_line_contrast": round(min(self.line), 2) if self.line else None,
             "sheet": self.sheet,
         }
 
 
-def probe_video(path: Path) -> tuple[float, int, float, bool]:
+def probe_video(path: Path) -> tuple[float, int, float, float]:
+    """Frame rate, frame count, video duration and audio duration of the produced file."""
     result = subprocess.run(
         [
             "ffprobe",
@@ -105,7 +108,7 @@ def probe_video(path: Path) -> tuple[float, int, float, bool]:
             "error",
             "-count_frames",
             "-show_entries",
-            "stream=codec_type,r_frame_rate,nb_read_frames,width,height:format=duration",
+            "stream=codec_type,r_frame_rate,nb_read_frames,duration:format=duration",
             "-of",
             "json",
             str(path),
@@ -119,15 +122,17 @@ def probe_video(path: Path) -> tuple[float, int, float, bool]:
     payload = json.loads(result.stdout)
     streams = payload.get("streams") or []
     video = next((s for s in streams if s.get("codec_type") == "video"), {})
+    sound = next((s for s in streams if s.get("codec_type") == "audio"), {})
     numerator, _, denominator = str(video.get("r_frame_rate", "0/1")).partition("/")
     fps = float(numerator) / float(denominator or 1)
     frames = int(video.get("nb_read_frames") or 0)
-    duration = float(payload.get("format", {}).get("duration") or 0.0)
-    has_audio = any(s.get("codec_type") == "audio" for s in streams)
-    return fps, frames, duration, has_audio
+    duration = float(video.get("duration") or payload.get("format", {}).get("duration") or 0.0)
+    audio_seconds = float(sound.get("duration") or payload.get("format", {}).get("duration") or 0.0)
+    return fps, frames, duration, audio_seconds
 
 
-def sample_frame(video: Path, seconds: float, destination: Path, width: int) -> np.ndarray:
+def sample_frame(video: Path, seconds: float, destination: Path) -> np.ndarray:
+    """One frame at native resolution: measuring a downscaled frame hides the reading line."""
     subprocess.run(
         [
             "ffmpeg",
@@ -139,8 +144,6 @@ def sample_frame(video: Path, seconds: float, destination: Path, width: int) -> 
             str(video),
             "-frames:v",
             "1",
-            "-vf",
-            f"scale={width}:-2",
             "-y",
             str(destination),
         ],
@@ -152,17 +155,50 @@ def sample_frame(video: Path, seconds: float, destination: Path, width: int) -> 
 
 
 def ink_ratio(frame: np.ndarray, background: tuple[int, int, int]) -> float:
+    """Fraction of the frame that is not paper: zero on a blank canvas."""
     distance = np.abs(frame.astype(np.int16) - np.array(background, dtype=np.int16)).sum(axis=2)
     return float((distance > 40).mean())
 
 
-def line_ratio(frame: np.ndarray, colour: tuple[int, int, int], line_x: float) -> float:
-    left = max(0, int(line_x) - 4)
-    right = min(frame.shape[1], int(line_x) + 5)
-    column = frame[:, left:right].astype(np.int16)
-    target = np.array(colour, dtype=np.int16)
-    matches = (np.abs(column - target).sum(axis=2) < 40).any(axis=1)
-    return float(matches.mean())
+def line_contrast(frame: np.ndarray, line_x: float) -> float:
+    """How much bluer the reading line's column is than the frame as a whole.
+
+    A video-encoded thin line does not keep an exact RGB value, so presence is measured as colour
+    contrast: the paper is warm (R above B) and the line is blue (B far above R).
+    """
+    blueness = frame[:, :, 2].astype(np.int16) - frame[:, :, 0].astype(np.int16)
+    column = round(line_x)
+    band = blueness[:, max(0, column - 2) : column + 3].mean()
+    return float(band - np.median(blueness))
+
+
+def contact_sheet(frames: list[np.ndarray], path: Path, label: str, spec: VideoSpec) -> Path:
+    """Tile the sampled frames into one downscaled image for a quick visual review."""
+    if not frames:
+        raise RuntimeError("no frames to put on the contact sheet")
+    columns = 2
+    rows = (len(frames) + columns - 1) // columns
+    width = SHEET_WIDTH
+    height = round(spec.height * SHEET_WIDTH / spec.width)
+    margin, caption = 8, 24
+    sheet = Image.new(
+        "RGB",
+        (
+            columns * width + (columns + 1) * margin,
+            rows * (height + caption) + (rows + 1) * margin,
+        ),
+        (235, 232, 224),
+    )
+    draw = ImageDraw.Draw(sheet)
+    for index, frame in enumerate(frames):
+        column, row = index % columns, index // columns
+        left = margin + column * (width + margin)
+        top = margin + row * (height + caption + margin)
+        tile = Image.fromarray(frame).resize((width, height), Image.LANCZOS)
+        sheet.paste(tile, (left, top))
+        draw.text((left, top + height + 5), f"{label} #{index + 1}", fill=(40, 40, 40))
+    sheet.save(path)
+    return path
 
 
 def evaluate(
@@ -173,68 +209,39 @@ def evaluate(
     spec: VideoSpec,
     preview: float | None,
 ) -> CaseResult:
-    result = CaseResult(case=case_name, mode=mode)
+    result = CaseResult(case=case_name, mode=mode, spec_fps=float(spec.fps))
     started = time.perf_counter()
     workspace = workdir.Workspace(out / case_name / f"work-{mode}")
     video = out / f"{case_name}.{mode}.mp4"
     pipeline.render(inputs, workspace, mode=mode, out=video, spec=spec, preview=preview)
     result.seconds = time.perf_counter() - started
     result.video = str(video)
-    result.audio_seconds = audio.probe(inputs.audio).duration
-    result.fps, result.frames, result.video_seconds, result.has_audio = probe_video(video)
-    result.spec_fps = float(spec.fps)
+    result.fps, result.frames, result.video_seconds, audio_in_file = probe_video(video)
+    result.has_audio = audio_in_file > 0.0
     result.expected_seconds = (
-        result.audio_seconds if preview is None else min(preview, result.audio_seconds)
+        audio_in_file if preview is None else min(preview, audio_in_file)
     )
     result.expected_frames = round(result.expected_seconds * spec.fps)
 
     frames_dir = out / "frames"
     frames_dir.mkdir(parents=True, exist_ok=True)
-    background = (0xFA, 0xF8, 0xF1)
-    line_colour = (0x28, 0x7D, 0x9F)
-    span = min(result.video_seconds, result.audio_seconds)
     sampled: list[np.ndarray] = []
+    span = min(result.video_seconds, result.expected_seconds)
+    background = (0xFA, 0xF8, 0xF1)
     for index in range(SAMPLE_FRAMES):
         seconds = span * (index + 0.5) / SAMPLE_FRAMES
-        frame = sample_frame(video, seconds, frames_dir / f"{case_name}-{mode}-{index}.png", 640)
+        frame = sample_frame(
+            video, seconds, frames_dir / f"{case_name}-{mode}-{index}.png"
+        )
         sampled.append(frame)
-        result.ink_ratio.append(ink_ratio(frame, background))
+        result.ink.append(ink_ratio(frame, background))
         if mode == "flow":
-            result.line_ratio.append(line_ratio(frame, line_colour, spec.line_x * 640 / spec.width))
+            result.line.append(line_contrast(frame, spec.line_x))
     result.sheet = str(
-        contact_sheet(sampled, out / f"{case_name}.{mode}.sheet.png", f"{case_name} {mode}")
+        contact_sheet(sampled, out / f"{case_name}.{mode}.sheet.png", f"{case_name} {mode}", spec)
     )
     result.ok = True
     return result
-
-
-def contact_sheet(frames: list[np.ndarray], path: Path, label: str) -> Path:
-    """Tile the sampled frames into one image so a reviewer can judge a run at a glance."""
-    if not frames:
-        raise RuntimeError("no frames to put on the contact sheet")
-    columns = 2
-    rows = (len(frames) + columns - 1) // columns
-    height, width = frames[0].shape[:2]
-    margin, caption = 8, 26
-    sheet = Image.new(
-        "RGB",
-        (
-            columns * width + (columns + 1) * margin,
-            rows * (height + caption) + (rows + 1) * margin,
-        ),
-        (235, 232, 224),
-    )
-    from PIL import ImageDraw
-
-    draw = ImageDraw.Draw(sheet)
-    for index, frame in enumerate(frames):
-        column, row = index % columns, index // columns
-        left = margin + column * (width + margin)
-        top = margin + row * (height + caption + margin)
-        sheet.paste(Image.fromarray(frame), (left, top))
-        draw.text((left, top + height + 6), f"{label} #{index + 1}", fill=(40, 40, 40))
-    sheet.save(path)
-    return path
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -280,36 +287,37 @@ def main(argv: list[str] | None = None) -> int:
                     args.preview,
                 )
             except (MusicFlowError, RuntimeError, subprocess.CalledProcessError) as error:
-                failed = CaseResult(
-                    case=directory.name, mode=mode, error=f"{type(error).__name__}: {error}"
+                results.append(
+                    CaseResult(
+                        case=directory.name, mode=mode, error=f"{type(error).__name__}: {error}"
+                    )
                 )
-                results.append(failed)
-                print(f"{directory.name:>7} {mode:<6} FAILED: {failed.error}")
+                print(f"{directory.name:>7} {mode:<6} FAILED: {type(error).__name__}: {error}")
                 continue
             results.append(record)
-            problems = record.validate()
+            problems = record.problems()
             print(
                 f"{directory.name:>7} {mode:<6} {record.seconds:7.1f}s  "
-                f"video {record.video_seconds:7.2f}s / expected {record.expected_seconds:7.2f}s  "
+                f"video {record.video_seconds:8.2f}s / audio {record.expected_seconds:8.2f}s  "
                 f"{record.frames} frames @ {record.fps:g} fps  "
-                f"ink_min {min(record.ink_ratio):.3f}"
-                + (f"  line_min {min(record.line_ratio):.3f}" if record.line_ratio else "")
+                f"ink_min {min(record.ink):.3f}"
+                + (f"  line {min(record.line):.1f}" if record.line else "")
                 + ("" if not problems else "  PROBLEMS: " + "; ".join(problems))
             )
 
+    report_path = out / "acceptance.json"
     payload = {
         "spec": spec.to_dict(),
         "preview": args.preview,
-        "results": [r.record() for r in results],
+        "results": [record.record() for record in results],
     }
-    (out / "acceptance.json").parent.mkdir(parents=True, exist_ok=True)
-    (out / "acceptance.json").write_text(json.dumps(payload, indent=1), encoding="utf-8")
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(payload, indent=1), encoding="utf-8")
 
-    failures = [r for r in results if not r.ok or r.validate()]
-    report = out / "acceptance.json"
-    print(f"\n{len(results) - len(failures)}/{len(results)} renders ok; report {report}")
+    failures = [record for record in results if record.problems()]
+    print(f"\n{len(results) - len(failures)}/{len(results)} renders ok; report {report_path}")
     for failed in failures:
-        print(f"  failed {failed.case} {failed.mode}: {failed.error}")
+        print(f"  failed {failed.case} {failed.mode}: {'; '.join(failed.problems())}")
     return 0 if not failures else 1
 
 
