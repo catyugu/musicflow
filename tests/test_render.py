@@ -268,6 +268,43 @@ def test_switch_shows_the_next_system_at_its_first_sounding_measure(tmp_path: Pa
     assert abs(_duration(out) - _duration(_audio_excerpt(tmp_path, 4.0))) <= 0.1
 
 
+def test_switch_plan_follows_a_repeat_back_to_the_first_system() -> None:
+    """A written repeat must put the earlier systems back on screen, in performance order."""
+    score, written = _score(measures=4, length_q=2.0)
+    passes = []
+    notes = []
+    for position, measure in enumerate((1, 2, 3, 4, 1, 2, 3, 4), start=1):
+        start = (position - 1) * 2.0
+        passes.append(MeasurePass(measure, 1 if position <= 4 else 2, start, 2.0))
+        notes.append(
+            PerformanceNote(
+                f"p-{position:06d}", f"mf-{measure:06d}", measure, passes[-1].pass_index,
+                start, 2.0, 60 + measure, "P1", 1, 1,
+            )
+        )
+    route = Route(passes=tuple(passes), notes=tuple(notes), total_q=16.0, source="auto_repeats")
+    alignment = _alignment(route.total_q, 8.0)
+    layout = StaffLayout(
+        pages=(PageInfo(1, 595.0, 842.0),),
+        systems=(
+            System(1, 1, Rect(80, 100, 560, 240), (), measure_count=2,
+                   first_measure=1, last_measure=2),
+            System(2, 1, Rect(80, 260, 560, 400), (), measure_count=2,
+                   first_measure=3, last_measure=4),
+        ),
+    )
+    plan = plan_switch(score=score, route=route, layout=layout, alignment=alignment)
+
+    # 8 quarters over 8 seconds: measure 1 at 0 s and again at 4 s, measure 3 at 2 s and 6 s.
+    assert [system.index for system in plan.systems] == [1, 2, 1, 2]
+    assert plan.times == pytest.approx((0.0, 2.0, 4.0, 6.0))
+    assert plan.system_at(0.0).index == 1
+    assert plan.system_at(3.0).index == 2
+    assert plan.system_at(4.5).index == 1, "the repeat did not bring the first system back"
+    assert plan.system_at(7.5).index == 2
+    assert written.total_q == 8.0
+
+
 def test_switch_plan_falls_back_to_proportional_positions(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:

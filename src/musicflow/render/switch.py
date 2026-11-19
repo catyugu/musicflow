@@ -35,72 +35,91 @@ MARGIN_RATIO = 0.03
 class SwitchPlan:
     """Which system is on screen at a given recording time.
 
-    ``times[i]`` is the switch time of ``systems[i]``; the first system is on screen from t = 0, so
-    only the boundaries after it take part in the lookup.
+    ``times[i]`` is when ``systems[i]`` comes on screen. The entries follow the *performance* order,
+    so a repeated section appears again when the route returns to it: with a written repeat the same
+    system index can occur several times. ``system_at`` takes the last entry whose time is not after
+    the query, and the first entry covers everything before it.
     """
 
     systems: tuple[System, ...]
     times: tuple[float, ...]
 
     def system_at(self, seconds: float) -> System:
-        index = int(np.searchsorted(np.asarray(self.times[1:]), seconds, side="right"))
-        return self.systems[min(index, len(self.systems) - 1)]
+        index = int(np.searchsorted(np.asarray(self.times), seconds, side="right")) - 1
+        return self.systems[max(0, min(index, len(self.systems) - 1))]
 
 
 def plan_switch(
     *, score: Score, route: Route, layout: StaffLayout, alignment: Alignment
 ) -> SwitchPlan:
-    """Switch every system at the recording time its first sounding measure is played."""
-    onsets: dict[int, list[float]] = {}
-    for note in route.notes:
-        onsets.setdefault(note.measure, []).append(note.onset_q)
+    """Follow the performance and switch systems whenever the measure's system changes.
 
-    known_measures = {measure.index for measure in score.measures}
-    unknown = [
-        system.index
-        for system in layout.systems
-        if system.first_measure is not None and system.first_measure not in known_measures
-    ]
-    if unknown:
-        logger.warning(
-            "switch: system(s) %s are bound to measures the written score does not have",
-            unknown,
-        )
-
-    proportional = _proportional_times(layout.systems, route, alignment)
-    unbound: list[int] = []
-    silent: list[int] = []
-    times: list[float] = []
-    for position, system in enumerate(layout.systems):
-        first, last = system.first_measure, system.last_measure
-        if first is None or last is None:
-            unbound.append(system.index)
-            times.append(proportional[position])
+    The route is the authority: a written repeat that sends the performance back to measure 1 must
+    put the first system back on screen, which a document-ordered list of systems cannot express.
+    """
+    by_measure: dict[int, System] = {}
+    for system in layout.systems:
+        if system.first_measure is None or system.last_measure is None:
             continue
-        candidates = [
-            onset for measure in range(first, last + 1) for onset in onsets.get(measure, ())
-        ]
-        if not candidates:
-            silent.append(system.index)
-            times.append(proportional[position])
-            continue
-        times.append(alignment.time_at(min(candidates)))
+        for measure in range(system.first_measure, system.last_measure + 1):
+            by_measure.setdefault(measure, system)
 
-    if unbound:
+    bound = {system.index for system in by_measure.values()}
+    unbound = [system.index for system in layout.systems if system.index not in bound]
+    if not by_measure or unbound:
+        # Without a complete measure map the route cannot drive the switch; spread the printed
+        # systems over the performance instead and say so.
         logger.warning(
             "switch: %d of %d systems have no bound measure range; spreading them over the "
             "performance proportionally",
-            len(unbound),
+            len(unbound) if by_measure else len(layout.systems),
             len(layout.systems),
         )
-    if silent:
+        times = _proportional_times(layout.systems, route, alignment)
+        return SwitchPlan(systems=layout.systems, times=tuple(times))
+
+    known = {measure.index for measure in score.measures}
+    stray = sorted(measure for measure in by_measure if measure not in known)
+    if stray:
         logger.warning(
-            "switch: system(s) %s never sound in the performance; using their proportional "
-            "position",
-            silent,
+            "switch: system binding mentions %d measures the written score does not have: %s",
+            len(stray),
+            stray[:8],
         )
+
+    first_onset: dict[tuple[int, int], float] = {}
+    for note in route.notes:
+        key = (note.measure, note.pass_index)
+        current = first_onset.get(key)
+        if current is None or note.onset_q < current:
+            first_onset[key] = note.onset_q
+
+    visits: list[tuple[float, System]] = []
+    for measure_pass in route.passes:
+        system = by_measure.get(measure_pass.measure)
+        if system is None:
+            continue
+        if visits and visits[-1][1].index == system.index:
+            continue
+        onset = first_onset.get((measure_pass.measure, measure_pass.pass_index))
+        seconds = alignment.time_at(measure_pass.start_q if onset is None else onset)
+        if visits and seconds < visits[-1][0]:
+            seconds = visits[-1][0]
+        visits.append((seconds, system))
+
+    visited = {system.index for _, system in visits}
+    missing = [system.index for system in layout.systems if system.index not in visited]
+    if missing:
+        logger.warning(
+            "switch: %d printed systems never sound in this performance and stay off screen: %s",
+            len(missing),
+            missing[:8],
+        )
+    if not visits:
+        times = _proportional_times(layout.systems, route, alignment)
+        return SwitchPlan(systems=layout.systems, times=tuple(times))
     return SwitchPlan(
-        systems=layout.systems, times=tuple(float(t) for t in np.maximum.accumulate(times))
+        systems=tuple(system for _, system in visits), times=tuple(t for t, _ in visits)
     )
 
 
