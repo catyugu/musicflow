@@ -124,6 +124,11 @@ class Score:
 
     Invariants: ``notes`` are ordered by ``onset_q``; every note's measure exists; measure
     ``start_q`` values are strictly increasing; ``total_q`` equals the last measure's end.
+
+    ``unconfirmed`` carries what the reader noticed but could not represent faithfully (first and
+    second endings it cannot expand, a repeat barline without its partner, a time signature that
+    falls inside a measure). ``build_route`` copies these lines into ``Route.unconfirmed`` so they
+    reach the report instead of dying in a log.
     """
 
     provider: SymbolicProvider
@@ -133,6 +138,7 @@ class Score:
     repeats: tuple[Repeat, ...]
     total_q: float
     title: str = ""
+    unconfirmed: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         assert self.notes, "score has no notes"
@@ -164,6 +170,7 @@ class Score:
             "provider": self.provider,
             "title": self.title,
             "total_q": self.total_q,
+            "unconfirmed": list(self.unconfirmed),
             "parts": [
                 {"id": p.id, "name": p.name, "staves": p.staves} for p in self.parts
             ],
@@ -188,6 +195,7 @@ class Score:
             provider=data["provider"],
             title=data.get("title", ""),
             total_q=float(data["total_q"]),
+            unconfirmed=tuple(data.get("unconfirmed", [])),
             parts=tuple(PartInfo(p["id"], p["name"], int(p["staves"])) for p in data["parts"]),
             measures=tuple(
                 MeasureInfo(int(m["index"]), float(m["start_q"]), float(m["length_q"]))

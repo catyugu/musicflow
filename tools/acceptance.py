@@ -45,39 +45,65 @@ class CaseResult:
     video: str = ""
     video_seconds: float = 0.0
     audio_seconds: float = 0.0
+    expected_seconds: float = 0.0
+    expected_frames: int = 0
     fps: float = 0.0
     frames: int = 0
     ink_ratio: list[float] = field(default_factory=list)
     line_ratio: list[float] = field(default_factory=list)
+    has_audio: bool = False
+
+    def validate(self) -> list[str]:
+        """Everything the video must satisfy to count as a delivered artifact."""
+        problems: list[str] = []
+        if not self.has_audio:
+            problems.append("no audio stream in the MP4")
+        if abs(self.video_seconds - self.expected_seconds) > 0.2:
+            problems.append(
+                f"duration {self.video_seconds:.2f} s != {self.expected_seconds:.2f} s"
+            )
+        if abs(self.frames - self.expected_frames) > 1:
+            problems.append(f"{self.frames} frames != {self.expected_frames}")
+        if abs(self.fps - self.spec_fps) > 0.01:
+            problems.append(f"{self.fps:g} fps != {self.spec_fps:g}")
+        if self.ink_ratio and min(self.ink_ratio) < 0.005:
+            problems.append(f"a sampled frame is blank (min ink {min(self.ink_ratio):.4f})")
+        if self.mode == "flow" and self.line_ratio and min(self.line_ratio) < 0.9:
+            problems.append(f"reading line missing (min {min(self.line_ratio):.2f})")
+        return problems
+
+    spec_fps: float = 0.0
 
     def record(self) -> dict[str, object]:
+        problems = self.validate() if self.ok else [self.error]
         return {
             "case": self.case,
             "mode": self.mode,
-            "ok": self.ok,
+            "ok": self.ok and not problems,
             "error": self.error,
+            "problems": problems,
             "seconds": round(self.seconds, 1),
             "video": self.video,
             "video_seconds": round(self.video_seconds, 3),
+            "expected_seconds": round(self.expected_seconds, 3),
             "audio_seconds": round(self.audio_seconds, 3),
             "fps": self.fps,
             "frames": self.frames,
+            "expected_frames": self.expected_frames,
             "min_ink_ratio": round(min(self.ink_ratio), 4) if self.ink_ratio else None,
             "min_line_ratio": round(min(self.line_ratio), 4) if self.line_ratio else None,
         }
 
 
-def probe_video(path: Path) -> tuple[float, int, float]:
+def probe_video(path: Path) -> tuple[float, int, float, bool]:
     result = subprocess.run(
         [
             "ffprobe",
             "-v",
             "error",
-            "-select_streams",
-            "v:0",
             "-count_frames",
             "-show_entries",
-            "stream=r_frame_rate,nb_read_frames:format=duration",
+            "stream=codec_type,r_frame_rate,nb_read_frames,width,height:format=duration",
             "-of",
             "json",
             str(path),
@@ -89,12 +115,14 @@ def probe_video(path: Path) -> tuple[float, int, float]:
     if result.returncode != 0:
         raise RuntimeError(f"ffprobe failed on {path}: {result.stderr.strip()}")
     payload = json.loads(result.stdout)
-    stream = (payload.get("streams") or [{}])[0]
-    numerator, _, denominator = str(stream.get("r_frame_rate", "0/1")).partition("/")
+    streams = payload.get("streams") or []
+    video = next((s for s in streams if s.get("codec_type") == "video"), {})
+    numerator, _, denominator = str(video.get("r_frame_rate", "0/1")).partition("/")
     fps = float(numerator) / float(denominator or 1)
-    frames = int(stream.get("nb_read_frames") or 0)
+    frames = int(video.get("nb_read_frames") or 0)
     duration = float(payload.get("format", {}).get("duration") or 0.0)
-    return fps, frames, duration
+    has_audio = any(s.get("codec_type") == "audio" for s in streams)
+    return fps, frames, duration, has_audio
 
 
 def sample_frame(video: Path, seconds: float, destination: Path, width: int) -> np.ndarray:
@@ -136,17 +164,27 @@ def line_ratio(frame: np.ndarray, colour: tuple[int, int, int], line_x: float) -
 
 
 def evaluate(
-    case_name: str, mode: str, inputs: pipeline.Inputs, out: Path, spec: VideoSpec
+    case_name: str,
+    mode: str,
+    inputs: pipeline.Inputs,
+    out: Path,
+    spec: VideoSpec,
+    preview: float | None,
 ) -> CaseResult:
     result = CaseResult(case=case_name, mode=mode)
     started = time.perf_counter()
     workspace = workdir.Workspace(out / case_name / f"work-{mode}")
     video = out / f"{case_name}.{mode}.mp4"
-    pipeline.render(inputs, workspace, mode=mode, out=video, spec=spec, preview=None)
+    pipeline.render(inputs, workspace, mode=mode, out=video, spec=spec, preview=preview)
     result.seconds = time.perf_counter() - started
     result.video = str(video)
     result.audio_seconds = audio.probe(inputs.audio).duration
-    result.fps, result.frames, result.video_seconds = probe_video(video)
+    result.fps, result.frames, result.video_seconds, result.has_audio = probe_video(video)
+    result.spec_fps = float(spec.fps)
+    result.expected_seconds = (
+        result.audio_seconds if preview is None else min(preview, result.audio_seconds)
+    )
+    result.expected_frames = round(result.expected_seconds * spec.fps)
 
     frames_dir = out / "frames"
     frames_dir.mkdir(parents=True, exist_ok=True)
@@ -203,6 +241,7 @@ def main(argv: list[str] | None = None) -> int:
                     pipeline.Inputs(pdf=pdf, audio=track, symbolic=symbolic),
                     out,
                     spec,
+                    args.preview,
                 )
             except (MusicFlowError, RuntimeError, subprocess.CalledProcessError) as error:
                 failed = CaseResult(
@@ -212,12 +251,14 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"{directory.name:>7} {mode:<6} FAILED: {failed.error}")
                 continue
             results.append(record)
+            problems = record.validate()
             print(
                 f"{directory.name:>7} {mode:<6} {record.seconds:7.1f}s  "
-                f"video {record.video_seconds:7.2f}s / audio {record.audio_seconds:7.2f}s  "
+                f"video {record.video_seconds:7.2f}s / expected {record.expected_seconds:7.2f}s  "
                 f"{record.frames} frames @ {record.fps:g} fps  "
                 f"ink_min {min(record.ink_ratio):.3f}"
                 + (f"  line_min {min(record.line_ratio):.3f}" if record.line_ratio else "")
+                + ("" if not problems else "  PROBLEMS: " + "; ".join(problems))
             )
 
     payload = {
@@ -228,7 +269,7 @@ def main(argv: list[str] | None = None) -> int:
     (out / "acceptance.json").parent.mkdir(parents=True, exist_ok=True)
     (out / "acceptance.json").write_text(json.dumps(payload, indent=1), encoding="utf-8")
 
-    failures = [r for r in results if not r.ok]
+    failures = [r for r in results if not r.ok or r.validate()]
     report = out / "acceptance.json"
     print(f"\n{len(results) - len(failures)}/{len(results)} renders ok; report {report}")
     for failed in failures:
