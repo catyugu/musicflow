@@ -37,6 +37,7 @@ class Inputs:
     symbolic: Path
     route_override: Path | None = None
     anchors: Path | None = None
+    staff_override: Path | None = None
 
     def validate(self) -> None:
         for label, path in (("PDF score", self.pdf), ("recording", self.audio)):
@@ -54,7 +55,11 @@ class Inputs:
             raise UnsupportedInputError(
                 f"symbolic score must be MusicXML, MXL or MIDI, got {self.symbolic.suffix}"
             )
-        for label, path in (("route override", self.route_override), ("anchors", self.anchors)):
+        for label, path in (
+            ("route override", self.route_override),
+            ("anchors", self.anchors),
+            ("staff override", self.staff_override),
+        ):
             if path is not None and not path.is_file():
                 raise InputError(f"{label} file not found: {path}")
 
@@ -163,14 +168,21 @@ def _staffs_step(inputs: Inputs, score: Score, workspace: workdir.Workspace) -> 
     return layout
 
 
-def _bound_step(layout: StaffLayout, score: Score, workspace: workdir.Workspace) -> StaffLayout:
+def _bound_step(
+    inputs: Inputs, layout: StaffLayout, score: Score, workspace: workdir.Workspace
+) -> StaffLayout:
     from . import pdf
 
     step = workspace.step("staffs-bound")
-    key = workdir.hash_payload({"layout": layout.to_dict(), "score": score.to_dict()})
+    files = {"symbolic": inputs.symbolic}
+    if inputs.staff_override is not None:
+        files["staff_override"] = inputs.staff_override
+    key = workdir.fingerprint(
+        files, {"layout": workdir.hash_payload(layout.to_dict()), "score": score.to_dict()}
+    )
 
     def compute(_: Path) -> dict[str, Any]:
-        return pdf.bind_measures(layout, score).to_dict()
+        return pdf.bind_measures(layout, score, override=inputs.staff_override).to_dict()
 
     bound = StaffLayout.from_dict(step.run(key, compute))
     return bound
@@ -267,7 +279,7 @@ def analyze(
     started = time.monotonic()
     score, written = _symbolic_step(inputs, workspace)
     route = _route_step(inputs, score, workspace)
-    layout = _bound_step(_staffs_step(inputs, score, workspace), score, workspace)
+    layout = _bound_step(inputs, _staffs_step(inputs, score, workspace), score, workspace)
     alignment, report = _align_step(inputs, score, route, workspace)
     flow_layout = None
     if with_flow:

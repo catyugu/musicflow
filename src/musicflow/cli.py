@@ -132,13 +132,17 @@ def _video_spec(args: argparse.Namespace) -> VideoSpec:
     )
 
 
-def _input_paths(args: argparse.Namespace) -> tuple[Path, Path, Path, Path | None, Path | None]:
-    pdf = Path(args.pdf)
-    audio = Path(args.audio)
-    symbolic = Path(args.symbolic)
-    override = Path(args.route) if args.route else None
-    anchors = Path(args.anchors) if args.anchors else None
-    return pdf, audio, symbolic, override, anchors
+def _inputs(args: argparse.Namespace):
+    from . import pipeline
+
+    return pipeline.Inputs(
+        pdf=Path(args.pdf),
+        audio=Path(args.audio),
+        symbolic=Path(args.symbolic),
+        route_override=Path(args.route) if args.route else None,
+        anchors=Path(args.anchors) if args.anchors else None,
+        staff_override=Path(args.staffs) if args.staffs else None,
+    )
 
 
 def _workspace(args: argparse.Namespace) -> Path:
@@ -150,10 +154,7 @@ def _workspace(args: argparse.Namespace) -> Path:
 def _cmd_analyze(args: argparse.Namespace) -> int:
     from . import pipeline, workdir
 
-    pdf, audio, symbolic, override, anchors = _input_paths(args)
-    inputs = pipeline.Inputs(
-        pdf=pdf, audio=audio, symbolic=symbolic, route_override=override, anchors=anchors
-    )
+    inputs = _inputs(args)
     workspace = workdir.Workspace(_workspace(args))
     spec = _video_spec(args)
     analysis = pipeline.analyze(inputs, workspace, spec=spec, with_flow=args.with_flow)
@@ -190,10 +191,7 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
 def _cmd_render(args: argparse.Namespace) -> int:
     from . import pipeline, workdir
 
-    pdf, audio, symbolic, override, anchors = _input_paths(args)
-    inputs = pipeline.Inputs(
-        pdf=pdf, audio=audio, symbolic=symbolic, route_override=override, anchors=anchors
-    )
+    inputs = _inputs(args)
     workspace = workdir.Workspace(_workspace(args))
     out = Path(args.out) if args.out else Path("build") / f"{Path(args.pdf).stem}.{args.mode}.mp4"
     produced = pipeline.render(
@@ -241,6 +239,7 @@ def _add_input_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--symbolic", required=True, help="MusicXML, MXL or MIDI of the same music")
     parser.add_argument("--route", help="JSON route override (performance order per measure)")
     parser.add_argument("--anchors", help="JSON manual score-to-audio anchors")
+    parser.add_argument("--staffs", help="JSON manual PDF-system to measure-range override")
 
 
 def _add_video_arguments(parser: argparse.ArgumentParser) -> None:
