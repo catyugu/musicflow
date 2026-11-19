@@ -123,8 +123,3 @@ class Workspace:
 
     def step(self, name: str) -> Step:
         return Step(self.root / name)
-
-    def file(self, relative: str) -> Path:
-        path = self.root / relative
-        path.parent.mkdir(parents=True, exist_ok=True)
-        return path

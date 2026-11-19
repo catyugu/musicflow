@@ -3,6 +3,10 @@
 This module owns the cache keys and the order of stages; the stages themselves live in
 ``musicflow.symbolic``, ``musicflow.pdf``, ``musicflow.align``, ``musicflow.flow`` and
 ``musicflow.render`` and are pure functions over the structures in ``musicflow.model``.
+
+The stage modules are imported inside their stage functions on purpose: importing ``librosa``,
+``verovio`` and ``partitura`` costs seconds, and `musicflow --help`, `musicflow doctor` and the
+input-validation paths must not pay for a stage they never run.
 """
 
 from __future__ import annotations

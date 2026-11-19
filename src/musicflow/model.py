@@ -49,10 +49,6 @@ class Rect:
     def height(self) -> float:
         return self.y1 - self.y0
 
-    @property
-    def center_y(self) -> float:
-        return (self.y0 + self.y1) / 2
-
     def inflate(self, dx: float, dy: float) -> Rect:
         return Rect(self.x0 - dx, self.y0 - dy, self.x1 + dx, self.y1 + dy)
 
@@ -158,13 +154,6 @@ class Score:
     def note_by_id(self) -> dict[str, NoteEvent]:
         return {n.id: n for n in self.notes}
 
-    def measure_of_q(self, q: float) -> int:
-        """Measure containing written position ``q`` (clamped to the score)."""
-        starts = [m.start_q for m in self.measures]
-        index = bisect.bisect_right(starts, q) - 1
-        index = max(0, min(index, len(self.measures) - 1))
-        return self.measures[index].index
-
     def to_dict(self) -> dict[str, Any]:
         return {
             "provider": self.provider,
@@ -265,19 +254,6 @@ class Route:
         starts = [p.start_q for p in self.passes]
         assert starts == sorted(starts), "performance measure passes are not ordered"
         assert self.total_q > 0, "route has no duration"
-
-    def pass_at(self, q: float) -> MeasurePass:
-        starts = [p.start_q for p in self.passes]
-        index = max(0, min(bisect.bisect_right(starts, q) - 1, len(self.passes) - 1))
-        return self.passes[index]
-
-    def notes_between(self, start_q: float, end_q: float) -> tuple[PerformanceNote, ...]:
-        return tuple(n for n in self.notes if start_q <= n.onset_q < end_q)
-
-    def first_onset_of_measure(self, measure: int) -> float | None:
-        """Earliest performance position at which ``measure`` sounds, if it ever does."""
-        candidates = [n.onset_q for n in self.notes if n.measure == measure]
-        return min(candidates) if candidates else None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -496,9 +472,6 @@ class FlowLayout:
     @property
     def note_positions(self) -> dict[str, float]:
         return dict(self.note_x)
-
-    def x_for_note(self, note_id: str) -> float | None:
-        return dict(self.note_x).get(note_id)
 
     def to_dict(self) -> dict[str, Any]:
         return {
