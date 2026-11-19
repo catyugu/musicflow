@@ -179,6 +179,9 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
         for key in ("route_unconfirmed", "staff_layout_unconfirmed", "alignment_unconfirmed"):
             for line in payload[key]:
                 print(f"unconfirmed      {key}: {line}")
+        for check in payload["checks"]:
+            status = "ok  " if check["ok"] else "FAIL"
+            print(f"check            {status} {check['name']}: {check['detail']}")
         if payload["flow"]:
             print(
                 f"flow             strip {payload['flow']['strip_width']:.0f} units, "

@@ -286,3 +286,9 @@ def test_summary_payload_is_json_serialisable(case) -> None:
     )
     payload = pipeline.summary_payload(_inputs(case), analysis)
     assert json.loads(json.dumps(payload))["provider"] == "musicxml"
+
+    names = {check["name"] for check in payload["checks"]}
+    assert names == {"staffs_per_system", "measure_count", "tempo", "alignment_confidence"}
+    measure_check = next(c for c in payload["checks"] if c["name"] == "measure_count")
+    assert measure_check["ok"] is False, "a PDF with no detected measures cannot agree"
+    assert payload["implied_bpm"] > 0

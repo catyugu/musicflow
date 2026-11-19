@@ -443,9 +443,83 @@ def batch(
     return skipped + records
 
 
+def checks(analysis: Analysis) -> list[dict[str, Any]]:
+    """Cross-check the artifacts against each other: the diagnostics of doc/PLAN.md 二.5.
+
+    These are the comparisons that can be made without reading the PDF as notation: the staff count
+    each printed system carries, the number of measures the printed barlines divide the page into,
+    the tempo the recording implies for the route, the number of engraved notes the flow layout
+    resolved, and whether the aligner can stand behind its map.
+    """
+    systems = analysis.layout.systems
+    expected_staves = analysis.score.staff_count
+    matching = sum(1 for system in systems if len(system.staves) == expected_staves)
+    staff_ratio = matching / len(systems) if systems else 0.0
+
+    detected_measures = sum(system.measure_count for system in systems)
+    score_measures = len(analysis.score.measures)
+    measure_ok = score_measures > 0 and abs(detected_measures - score_measures) <= max(
+        2, round(0.02 * score_measures)
+    )
+
+    implied_bpm = (
+        60.0 * analysis.route.total_q / analysis.audio_duration
+        if analysis.audio_duration > 0
+        else 0.0
+    )
+
+    results = [
+        {
+            "name": "staffs_per_system",
+            "ok": staff_ratio >= 0.85,
+            "detail": (
+                f"{matching}/{len(systems)} printed systems carry {expected_staves} staves"
+            ),
+        },
+        {
+            "name": "measure_count",
+            "ok": measure_ok,
+            "detail": (
+                f"barlines give {detected_measures} measures, the symbolic score has "
+                f"{score_measures}"
+            ),
+        },
+        {
+            "name": "tempo",
+            "ok": 20.0 <= implied_bpm <= 300.0,
+            "detail": f"the route implies {implied_bpm:.1f} quarter notes per minute",
+        },
+        {
+            "name": "alignment_confidence",
+            "ok": not analysis.alignment.unconfirmed,
+            "detail": (
+                "the aligner reported no unconfirmed item"
+                if not analysis.alignment.unconfirmed
+                else "; ".join(analysis.alignment.unconfirmed)
+            ),
+        },
+    ]
+    if analysis.flow is not None:
+        resolved = len(analysis.flow.note_x)
+        total = len(analysis.score.notes)
+        results.append(
+            {
+                "name": "flow_note_coverage",
+                "ok": total > 0 and resolved / total >= 0.99,
+                "detail": f"{resolved}/{total} written notes have an engraved position",
+            }
+        )
+    return results
+
+
 def summary_payload(inputs: Inputs, analysis: Analysis) -> dict[str, Any]:
     """Compact, JSON-serialisable description of an analysis, for ``musicflow analyze --json``."""
     report = analysis.align_report
+    implied_bpm = (
+        60.0 * analysis.route.total_q / analysis.audio_duration
+        if analysis.audio_duration > 0
+        else 0.0
+    )
     return {
         "pdf": str(inputs.pdf),
         "audio": str(inputs.audio),
@@ -470,7 +544,9 @@ def summary_payload(inputs: Inputs, analysis: Analysis) -> dict[str, Any]:
         "alignment_method": analysis.alignment.method,
         "anchors": len(analysis.alignment.anchors),
         "audio_duration": round(analysis.audio_duration, 3),
+        "implied_bpm": round(implied_bpm, 2),
         "align_report": report,
+        "checks": checks(analysis),
         "flow": None
         if analysis.flow is None
         else {
