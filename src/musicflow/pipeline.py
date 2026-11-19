@@ -334,6 +334,7 @@ def render(
             out=out,
             work_dir=step.path,
             preview=preview,
+            pdf=inputs.pdf,
             audio=inputs.audio,
         )
     else:

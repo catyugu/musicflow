@@ -34,7 +34,7 @@ def blank(spec: VideoSpec) -> np.ndarray:
 
 def draw_reading_line(frame: np.ndarray, spec: VideoSpec) -> None:
     """Paint the fixed reading line, centred on ``spec.line_x``, over the whole height."""
-    left = int(round(spec.line_x)) - spec.line_width // 2
+    left = round(spec.line_x) - spec.line_width // 2
     left = max(0, min(left, spec.width - spec.line_width))
     frame[:, left : left + spec.line_width] = rgb(spec.line_color)
 
