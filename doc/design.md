@@ -75,7 +75,9 @@ def build_route(score: Score, *, override: Path | None = None) -> Route
 
 # musicflow.pdf
 def detect_layout(pdf: Path, *, expected_staves: int | None, debug_dir: Path) -> StaffLayout
-def bind_measures(layout: StaffLayout, score: Score) -> StaffLayout
+def bind_measures(
+    layout: StaffLayout, score: Score, *, override: Path | None = None
+) -> StaffLayout
 
 # musicflow.align
 def align(
