@@ -86,6 +86,7 @@ recomputes what the change touched; renders resume from completed segments.
 
 ```text
 build/<stem>/
+  run.json                 provenance: input paths and sha256, tool versions, spec, checks
   analysis.json            summary printed by `analyze` (checks, counts, unconfirmed items)
   symbolic/                Score JSON + written.musicxml (id-annotated, for Verovio)
   route/                   performance route (repeat expansion)

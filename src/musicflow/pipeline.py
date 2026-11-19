@@ -286,8 +286,7 @@ def analyze(
         assert written is not None, "flow mode requires a written MusicXML file"
         flow_layout = _flow_step(score, written, workspace, spec)
     audio_info = audio.probe(inputs.audio)
-    logger.info("analysis finished in %.1f s", time.monotonic() - started)
-    return Analysis(
+    analysis = Analysis(
         score=score,
         route=route,
         layout=layout,
@@ -297,6 +296,64 @@ def analyze(
         flow=flow_layout,
         align_report=report,
     )
+    write_provenance(workspace, inputs, analysis, spec)
+    logger.info("analysis finished in %.1f s", time.monotonic() - started)
+    return analysis
+
+
+def write_provenance(
+    workspace: workdir.Workspace, inputs: Inputs, analysis: Analysis, spec: VideoSpec
+) -> Path:
+    """Record what produced this run: input paths and hashes, tools, spec and the verdict.
+
+    The step directories keep opaque cache keys; this file is the readable evidence trail the plan
+    asks for ("save the input fingerprints and the reviewed evidence"), and it is what makes a
+    delivered video traceable back to its materials.
+    """
+    files = {
+        "pdf": inputs.pdf,
+        "audio": inputs.audio,
+        "symbolic": inputs.symbolic,
+    }
+    if inputs.route_override is not None:
+        files["route_override"] = inputs.route_override
+    if inputs.anchors is not None:
+        files["anchors"] = inputs.anchors
+    if inputs.staff_override is not None:
+        files["staff_override"] = inputs.staff_override
+    payload = {
+        "inputs": {
+            name: {
+                "path": str(path.resolve()),
+                "bytes": path.stat().st_size,
+                "sha256": workdir.sha256_file(path),
+            }
+            for name, path in files.items()
+        },
+        "tools": _tool_versions(
+            "partitura", "pymupdf", "opencv-python-headless", "verovio", "resvg-py", "librosa"
+        ),
+        "spec": spec.to_dict(),
+        "provider": analysis.score.provider,
+        "measures": len(analysis.score.measures),
+        "written_notes": len(analysis.score.notes),
+        "route": {
+            "source": analysis.route.source,
+            "passes": len(analysis.route.passes),
+            "notes": len(analysis.route.notes),
+            "total_q": analysis.route.total_q,
+            "unconfirmed": list(analysis.route.unconfirmed),
+        },
+        "alignment": {
+            "method": analysis.alignment.method,
+            "anchors": len(analysis.alignment.anchors),
+            "unconfirmed": list(analysis.alignment.unconfirmed),
+        },
+        "checks": checks(analysis),
+    }
+    path = workspace.root / "run.json"
+    workdir.write_json(path, payload)
+    return path
 
 
 def render(
