@@ -381,7 +381,12 @@ class PageInfo:
 
 @dataclass(frozen=True, slots=True)
 class System:
-    """One staff system of a PDF page, in PDF points."""
+    """One staff system of a PDF page, in PDF points.
+
+    ``printed_measure`` is the measure number engraved at the start of the system when the PDF has
+    a text layer (vector exports do, scans do not). It is the binding ground truth when present;
+    ``measure_count`` from barlines is then only a cross-check.
+    """
 
     index: int
     page: int
@@ -391,6 +396,7 @@ class System:
     measure_count: int = 0
     first_measure: int | None = None
     last_measure: int | None = None
+    printed_measure: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -419,6 +425,7 @@ class StaffLayout:
                     "measure_count": s.measure_count,
                     "first_measure": s.first_measure,
                     "last_measure": s.last_measure,
+                    "printed_measure": s.printed_measure,
                 }
                 for s in self.systems
             ],
@@ -439,6 +446,9 @@ class StaffLayout:
                     measure_count=int(s["measure_count"]),
                     first_measure=None if s["first_measure"] is None else int(s["first_measure"]),
                     last_measure=None if s["last_measure"] is None else int(s["last_measure"]),
+                    printed_measure=None
+                    if s.get("printed_measure") is None
+                    else int(s["printed_measure"]),
                 )
                 for s in data["systems"]
             ),
