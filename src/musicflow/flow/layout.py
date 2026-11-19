@@ -145,12 +145,16 @@ def build_layout(
     work_dir: Path,
     target_content_height: int,
     max_strip_width: float,
+    paper: str = "#ffffff",
 ) -> FlowLayout:
     """Engrave ``written_musicxml`` into one strip and return its note/measure geometry.
 
     ``written_musicxml`` must be the id-annotated copy produced by
     :func:`musicflow.scorexml.write_normalized_musicxml`; the note ids are the bridge
     between ``score.notes`` and the horizontal positions in the engraving.
+
+    ``paper`` is the colour the strip is rasterised onto. The delivery pipeline passes the video
+    canvas colour so the engraved page and the canvas cannot disagree at the strip's ends.
     """
     assert target_content_height > 0, "target content height must be positive"
     started = time.perf_counter()
@@ -166,7 +170,7 @@ def build_layout(
             probe.page_count,
         )
     probe_ink = ink_bounds(
-        probe.document, strip_width=probe.width, strip_height=probe.document.height
+        probe.document, strip_width=probe.width, strip_height=probe.document.height, paper=paper
     )
     if probe_ink is None or probe_ink.height < 1:
         raise AnalysisError(f"the engraved strip of {written_musicxml} has no ink")
@@ -208,6 +212,7 @@ def build_layout(
         work_dir=work_dir,
         strip_width=strip_width,
         strip_height=strip_height,
+        paper=paper,
     )
     if content is None:
         raise AnalysisError(f"the rasterised strip of {written_musicxml} has no ink")
@@ -219,7 +224,13 @@ def build_layout(
         raise AnalysisError("no measure of the score has a resolved engraved position")
 
     overview = work_dir / "overview.png"
-    write_overview(engraving.document, overview, strip_width=strip_width, strip_height=strip_height)
+    write_overview(
+        engraving.document,
+        overview,
+        strip_width=strip_width,
+        strip_height=strip_height,
+        paper=paper,
+    )
 
     layout = FlowLayout(
         strip_width=strip_width,

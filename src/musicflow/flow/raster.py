@@ -42,13 +42,20 @@ def bands(strip_width: float, strip_height: float) -> Iterator[tuple[int, int]]:
         start += width
 
 
-def render(document: SvgDocument, x0: float, width: int, height: int) -> np.ndarray:
-    """Render a full-height strip window at one pixel per layout unit (``RGB``)."""
+def render(
+    document: SvgDocument, x0: float, width: int, height: int, *, paper: str = "#ffffff"
+) -> np.ndarray:
+    """Render a full-height strip window at one pixel per layout unit (``RGB``).
+
+    ``paper`` is the rasteriser's background. The delivery pipeline passes the video canvas colour,
+    so the engraved strip's paper and the canvas are the same colour and the frame has no visible
+    seam where the strip ends.
+    """
     data = resvg_py.svg_to_bytes(
         svg_string=document.window(x0, 0.0, width, height),
         width=width,
         height=height,
-        background="#ffffff",
+        background=paper,
     )
     image = Image.open(BytesIO(bytes(data))).convert("RGB")
     if image.size != (width, height):
@@ -73,11 +80,14 @@ def _bounds(mask: np.ndarray, x0: int) -> Rect | None:
     )
 
 
-def ink_bounds(document: SvgDocument, *, strip_width: float, strip_height: float) -> Rect | None:
+def ink_bounds(
+    document: SvgDocument, *, strip_width: float, strip_height: float, paper: str = "#ffffff"
+) -> Rect | None:
     """Ink bounding box of the whole strip, in layout units."""
     found: Rect | None = None
     for x0, width in bands(strip_width, strip_height):
-        bounds = _bounds(_ink_mask(render(document, x0, width, math.ceil(strip_height))), x0)
+        pixels = render(document, x0, width, math.ceil(strip_height), paper=paper)
+        bounds = _bounds(_ink_mask(pixels), x0)
         if bounds is not None:
             found = bounds if found is None else found.union(bounds)
     return found
@@ -89,6 +99,7 @@ def write_tiles(
     work_dir: Path,
     strip_width: float,
     strip_height: float,
+    paper: str = "#ffffff",
 ) -> tuple[tuple[Tile, ...], Rect | None]:
     """Rasterise the strip into ``work_dir/tiles`` and report its ink bounding box."""
     directory = work_dir / "tiles"
@@ -97,7 +108,7 @@ def write_tiles(
     tiles: list[Tile] = []
     content: Rect | None = None
     for band_x0, band_width in bands(strip_width, strip_height):
-        pixels = render(document, band_x0, band_width, height)
+        pixels = render(document, band_x0, band_width, height, paper=paper)
         bounds = _bounds(_ink_mask(pixels), band_x0)
         if bounds is not None:
             content = bounds if content is None else content.union(bounds)
@@ -122,6 +133,7 @@ def write_overview(
     *,
     strip_width: float,
     strip_height: float,
+    paper: str = "#ffffff",
 ) -> None:
     """Write a downscaled picture of the whole strip for a human to eyeball."""
     width = min(strip_width, _OVERVIEW_MAX_WIDTH)
@@ -130,6 +142,6 @@ def write_overview(
     data = resvg_py.svg_to_bytes(
         svg_string=document.markup,
         width=max(1, int(width)),
-        background="#ffffff",
+        background=paper,
     )
     Image.open(BytesIO(bytes(data))).convert("RGB").save(path)

@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 Mode = Literal["switch", "flow"]
 # Bump when a stage's behaviour changes: every cache key includes it, so stale artifacts from an
 # older algorithm can never be mistaken for current output.
-PIPELINE_VERSION = 2
+PIPELINE_VERSION = 3
 
 AUDIO_SUFFIXES = (".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".opus", ".wma")
 
@@ -251,6 +251,7 @@ def _flow_step(
         {
             "target_content_height": target_height,
             "max_strip_width": 100000.0,
+            "paper": spec.background,
             **_tool_versions("verovio", "resvg-py"),
         },
     )
@@ -262,6 +263,7 @@ def _flow_step(
             work_dir=path,
             target_content_height=target_height,
             max_strip_width=100000.0,
+            paper=spec.background,
         ).to_dict()
 
     layout = FlowLayout.from_dict(step.run(key, compute))
