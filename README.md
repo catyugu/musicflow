@@ -110,8 +110,14 @@ uv run python tools/acceptance.py --out build/acceptance --preview 20 --size 960
 ```
 
 The acceptance harness renders the corpus, then measures the delivered videos: frame count against
-`duration x fps`, duration against the recording, audio stream present, sampled frames non-blank and
-(for flow) the reading line intact. It writes `build/acceptance/acceptance.json`.
+`duration x fps`, duration against the recording, audio stream present, sampled frames carry score
+ink, and (for flow) the reading line is intact. It writes `acceptance.json` plus one contact sheet per
+render. `doc/ACCEPTANCE.md` records the numbers of the last full run.
+
+Measured on this machine (CPU encoding): `switch` renders about 12 ms per 1080p frame, `flow` about
+90-150 ms per frame, so a four-minute song takes roughly two minutes in `switch` and 15-20 minutes in
+`flow`. A render resumes from completed 600-frame segments, and an unchanged input set re-renders
+nothing.
 
 ## Layout
 
@@ -130,7 +136,8 @@ src/musicflow/
   render/           frame compositing (switch and flow), chunked ffmpeg encoding
 tests/              module tests and end-to-end corpus checks
 tools/              acceptance harness for full renders
-doc/                requirements (PLAN.md), corpus notes (TEST_DATA.md), design contract
+doc/                requirements (PLAN.md), corpus notes (TEST_DATA.md), design contract,
+                    acceptance record (ACCEPTANCE.md)
 ```
 
 ## Documentation
@@ -138,6 +145,7 @@ doc/                requirements (PLAN.md), corpus notes (TEST_DATA.md), design 
 - `doc/PLAN.md` — requirements and implementation plan (authoritative scope).
 - `doc/TEST_DATA.md` — the three-case test corpus and its limitations.
 - `doc/design.md` — data structures, invariants, module interfaces, error and caching contract.
+- `doc/ACCEPTANCE.md` — the acceptance evidence of the last full run: numbers, checks, known limits.
 - `AGENTS.md` — instructions for agents working in this repository.
 
 ## Limitations
@@ -152,3 +160,7 @@ doc/                requirements (PLAN.md), corpus notes (TEST_DATA.md), design 
   and the alignment's own confidence. Note-level differences (clefs, articulations) are not detected
   automatically.
 - A 96 dpi scan (case2) is rasterised beyond its resolution for `switch`; it is legible, not sharp.
+- A printed score drops staves that stay empty, so a system may legally carry fewer staves than the
+  score declares; detection reports the counts instead of forcing a match.
+- `doc/ACCEPTANCE.md` lists the remaining differences between the printed score and the symbolic
+  source that were found and could not be fixed without editing the score.
