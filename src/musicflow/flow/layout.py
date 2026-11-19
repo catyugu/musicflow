@@ -35,9 +35,16 @@ MAX_STRIP_WIDTH = 100_000.0
 SCALE_ATTEMPTS = 4
 MEASURE_PAD_STAFF_SPACES = 0.5
 
+# Verovio stamps a per-rendering id token on the page and scopes its stylesheet with it.
+# Seeding the token keeps the markup byte-stable across runs; it must be set before the
+# file is loaded, because the id is minted when the toolkit builds the document.
+ID_SEED = 7
+
 # Verovio engine options. ``pageWidth`` is at its ceiling so that a wide movement is
 # never broken; margins are pinned so the strip has a little air around the ink without
-# depending on the engine's defaults.
+# depending on the engine's defaults. The top margin is the generous one: marks placed
+# above the top staff (ledger lines, tempo directions) stick out of the system's own box,
+# and the page top is the one edge Verovio cannot grow.
 _OPTIONS: dict[str, object] = {
     "breaks": "none",
     "header": "none",
@@ -45,7 +52,7 @@ _OPTIONS: dict[str, object] = {
     "condense": "none",
     "adjustPageHeight": True,
     "pageWidth": int(MAX_STRIP_WIDTH),
-    "pageMarginTop": 100,
+    "pageMarginTop": 200,
     "pageMarginBottom": 100,
     "pageMarginLeft": 100,
     "pageMarginRight": 100,
@@ -65,6 +72,7 @@ class _Engraving:
 
 def _engrave(source: Path, scale: int) -> _Engraving:
     toolkit = verovio.toolkit()
+    toolkit.setOptions({"xmlIdSeed": ID_SEED})
     if not toolkit.loadFile(str(source.resolve())):
         raise InputError(f"Verovio cannot read the written MusicXML: {source}")
     options = dict(_OPTIONS)
@@ -162,7 +170,7 @@ def build_layout(
     )
     if probe_ink is None or probe_ink.height < 1:
         raise AnalysisError(f"the engraved strip of {written_musicxml} has no ink")
-    scale = max(MIN_SCALE, int(round(PROBE_SCALE * target_content_height / probe_ink.height)))
+    scale = max(MIN_SCALE, round(PROBE_SCALE * target_content_height / probe_ink.height))
     logger.info(
         "flow: probe at scale %d is %.0fx%.0f units with %.0f units of ink; target %d -> scale %d",
         PROBE_SCALE,
@@ -179,7 +187,9 @@ def build_layout(
     wanted = {note.id for note in score.notes}
     positions = engraving.document.note_x(wanted)
     if not positions:
-        raise AnalysisError(f"none of the {len(wanted)} score notes has a position in the engraving")
+        raise AnalysisError(
+            f"none of the {len(wanted)} score notes has a position in the engraving"
+        )
     missing = sorted(wanted - positions.keys())
     if missing:
         listing = work_dir / "missing_ids.txt"
@@ -209,9 +219,7 @@ def build_layout(
         raise AnalysisError("no measure of the score has a resolved engraved position")
 
     overview = work_dir / "overview.png"
-    write_overview(
-        engraving.document, overview, strip_width=strip_width, strip_height=strip_height
-    )
+    write_overview(engraving.document, overview, strip_width=strip_width, strip_height=strip_height)
 
     layout = FlowLayout(
         strip_width=strip_width,

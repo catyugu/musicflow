@@ -10,7 +10,8 @@
 * the score's own repeat spans, expanded here.
 
 D.C./D.S./Fine/Coda and segno/coda markers are reported as unconfirmed and never invented: an
-expanded jump needs the recording to confirm where it lands, which is the aligner's job.
+expanded jump needs the recording to confirm where it lands, which is the aligner's job. Lines the
+reader could not represent (``Score.unconfirmed``) are carried in front of those.
 """
 
 from __future__ import annotations
@@ -52,14 +53,21 @@ def build_route(score: Score, *, override: Path | None = None) -> Route:
     Without repeats and without ``override`` the route is the written order, one pass per measure.
     With repeat spans it is their expansion; with ``override`` it is the measure order listed in
     that JSON file, which is the manual escape hatch for a recording that follows its own route.
+
+    Whatever the reader could not represent faithfully (``Score.unconfirmed``) is carried into
+    ``Route.unconfirmed``, in front of what the route itself has to confess, so that it reaches the
+    report instead of dying in a log.
     """
+    assert score.measures, "score has no measures to route"
     if override is not None:
-        return _route(score, _override_measures(score, Path(override)), "override")
+        return _route(
+            score, _override_measures(score, Path(override)), "override", score.unconfirmed
+        )
     if score.provider == "midi":
-        return _route(score, _written(score), "written", (MIDI_MEASURE_NOTE,))
-    measures, unconfirmed = _repeat_measures(score)
+        return _route(score, _written(score), "written", (*score.unconfirmed, MIDI_MEASURE_NOTE))
+    measures, reported = _repeat_measures(score)
     source: RouteSource = "written" if measures == _written(score) else "auto_repeats"
-    return _route(score, measures, source, unconfirmed)
+    return _route(score, measures, source, (*score.unconfirmed, *reported))
 
 
 def _written(score: Score) -> tuple[int, ...]:

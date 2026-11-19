@@ -1,9 +1,9 @@
 """MusicXML and MXL input: sounding notes, the written measure grid, repeat instructions.
 
-Positions come from partitura in quarter notes (``onset_quarter`` / ``duration_quarter``), which
-is tempo independent and matches the ``q`` convention of ``musicflow.model``. The ``*_beat``
-fields are deliberately not used: partitura's beat is the time signature's beat unit, so in 6/8 it
-counts eighths and would disagree with the measure grid derived from the same document.
+Positions are quarter notes throughout, recomputed from the divisions partitura read (``q`` in
+``musicflow.model``). partitura's ``*_beat`` fields are deliberately not used: its beat is the time
+signature's beat unit, so in 6/8 it counts eighths and would disagree with the measure grid taken
+from the same document.
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ from .assembly import ONSET_EPSILON, RawNote, assemble_score
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_TIMES = 2
+_DEFAULT_TIMES = 2
 
 _JUMP_ATTRIBUTES = (
     ("dacapo", "da_capo"),
@@ -52,15 +52,19 @@ def read_musicxml_score(path: Path, written_path: Path | None) -> Score:
 def _read_annotated(annotated: Path, source: Path) -> Score:
     tree = parse_musicxml(annotated)
     loaded = _load(annotated, source)
+    if not loaded.parts:
+        raise InputError(f"{source}: the document has no parts")
     parts = _parts(loaded, _declared_staves(tree), source)
     grid = _grid(loaded, source)
+    repeats, unconfirmed = _repeats(tree, len(grid), source)
     return assemble_score(
         provider="musicxml",
         title=_title(loaded),
         parts=parts,
         grid=grid,
         notes=_notes(loaded, parts, tree),
-        repeats=_repeats(tree, len(grid), source),
+        repeats=repeats,
+        unconfirmed=unconfirmed,
     )
 
 
@@ -145,7 +149,13 @@ def _notes(loaded, parts: Sequence[PartInfo], tree: etree._ElementTree) -> list[
     notes: list[RawNote] = []
     for info, part in zip(parts, loaded.parts, strict=True):
         rows = part.note_array(include_staff=True, include_grace_notes=True)
-        for row in rows:
+        # Positions are recomputed from the divisions partitura read instead of taken from the
+        # note array: that array stores them as float32, and a note sitting exactly on a barline
+        # must not land a hair before it in a float64 measure grid. Ties are already merged in
+        # ``duration_div``, and a grace note has a zero length there.
+        onsets = part.quarter_map(rows["onset_div"])
+        ends = part.quarter_map(rows["onset_div"] + rows["duration_div"])
+        for row, onset, end in zip(rows, onsets, ends, strict=True):
             identifier = str(row["id"])
             if identifier in cues:
                 continue
@@ -155,8 +165,8 @@ def _notes(loaded, parts: Sequence[PartInfo], tree: etree._ElementTree) -> list[
                     part=info.id,
                     staff=int(row["staff"]),
                     voice=int(row["voice"]),
-                    onset_q=float(row["onset_quarter"]),
-                    duration_q=float(row["duration_quarter"]),
+                    onset_q=float(onset),
+                    duration_q=float(end) - float(onset),
                     pitch=int(row["pitch"]),
                 )
             )
@@ -171,18 +181,23 @@ def _cue_note_ids(tree: etree._ElementTree) -> set[str]:
     }
 
 
-def _repeats(tree: etree._ElementTree, measure_count: int, source: Path) -> tuple[Repeat, ...]:
-    """Repeat spans and jump markers in shared measure numbers.
+def _repeats(
+    tree: etree._ElementTree, measure_count: int, source: Path
+) -> tuple[tuple[Repeat, ...], tuple[str, ...]]:
+    """Repeat spans and jump markers in shared measure numbers, plus what cannot be honoured.
 
     A repeat barline is written on every part's staff, so the same instruction is found once per
     part; identical instructions collapse into one entry. ``measure_count`` bounds the numbers
-    because a span is only meaningful if it names measures of this score.
+    because a span is only meaningful if it names measures of this score. The returned lines are
+    the constructs ``Repeat`` cannot express, worded for the run report.
     """
     root = tree.getroot()
     if etree.QName(root).localname != "score-partwise":
         raise InputError(f"{source}: only score-partwise MusicXML is supported")
     spans: list[Repeat] = []
     markers: list[Repeat] = []
+    reported: list[str] = []
+    endings: dict[int, set[str]] = {}
     for part in root.iter("{*}part"):
         measures = [
             child
@@ -200,6 +215,9 @@ def _repeats(tree: etree._ElementTree, measure_count: int, source: Path) -> tupl
                     spans.append(Repeat("repeat_span", start, number, _times(repeat.get("times"))))
                     forward = None
             markers.extend(_markers(measure, number))
+            for ending in measure.iter("{*}ending"):
+                label = (ending.get("number") or "").strip() or "?"
+                endings.setdefault(number, set()).add(label)
         if forward is not None:
             # A forward repeat without a partner is played again to the end of the movement.
             logger.warning(
@@ -207,7 +225,11 @@ def _repeats(tree: etree._ElementTree, measure_count: int, source: Path) -> tupl
                 source,
                 forward,
             )
-            spans.append(Repeat("repeat_span", forward, measure_count, DEFAULT_TIMES))
+            reported.append(
+                f"forward repeat at measure {forward} has no backward repeat: "
+                "repeated to the last measure"
+            )
+            spans.append(Repeat("repeat_span", forward, measure_count, _DEFAULT_TIMES))
     usable = [
         span for span in spans if 1 <= span.start_measure <= span.end_measure <= measure_count
     ]
@@ -215,8 +237,28 @@ def _repeats(tree: etree._ElementTree, measure_count: int, source: Path) -> tupl
         logger.warning(
             "%s: %d repeat spans name measures outside the score", source, len(spans) - len(usable)
         )
+    reported.extend(_ending_notes(endings))
     unique = list(dict.fromkeys(usable + markers))
-    return tuple(sorted(unique, key=lambda r: (r.start_measure, r.end_measure, r.kind)))
+    repeats = tuple(sorted(unique, key=lambda r: (r.start_measure, r.end_measure, r.kind)))
+    return repeats, tuple(dict.fromkeys(reported))
+
+
+def _ending_notes(endings: dict[int, set[str]]) -> list[str]:
+    """One line per first/second ending: the measures it covers cannot be played differently."""
+    measures_by_ending: dict[str, list[int]] = {}
+    for number, labels in endings.items():
+        for label in labels:
+            measures_by_ending.setdefault(label, []).append(number)
+    notes: list[str] = []
+    for label in sorted(measures_by_ending):
+        numbers = sorted(measures_by_ending[label])
+        first, last = numbers[0], numbers[-1]
+        name = "an ending" if label == "?" else f"ending {label}"
+        where = f"measure {first}" if first == last else f"measures {first}..{last}"
+        notes.append(
+            f"{name} at {where} is expanded as a plain repeat: every pass plays the same measures"
+        )
+    return notes
 
 
 def _markers(measure: etree._Element, number: int) -> list[Repeat]:
@@ -237,10 +279,10 @@ def _present(value: str | None) -> bool:
 
 def _times(value: str | None) -> int:
     if value is None:
-        return DEFAULT_TIMES
+        return _DEFAULT_TIMES
     try:
         times = int(value.strip())
     except ValueError:
-        logger.warning("unreadable repeat count %r; assuming %d", value, DEFAULT_TIMES)
-        return DEFAULT_TIMES
-    return times if times >= 1 else DEFAULT_TIMES
+        logger.warning("unreadable repeat count %r; assuming %d", value, _DEFAULT_TIMES)
+        return _DEFAULT_TIMES
+    return times if times >= 1 else _DEFAULT_TIMES

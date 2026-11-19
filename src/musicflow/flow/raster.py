@@ -26,7 +26,7 @@ INK_THRESHOLD = 200
 
 _BAND_PIXEL_BUDGET = 24_000_000
 _OVERVIEW_PIXEL_BUDGET = 8_000_000
-_OVERVIEW_MAX_WIDTH = 16_000
+_OVERVIEW_MAX_WIDTH = 12_000
 
 
 def bands(strip_width: float, strip_height: float) -> Iterator[tuple[int, int]]:
@@ -104,7 +104,7 @@ def write_tiles(
         for offset in range(0, band_width, TILE_WIDTH):
             tile_width = min(TILE_WIDTH, band_width - offset)
             name = f"strip-{len(tiles):04d}.png"
-            Image.fromarray(pixels[:, offset:offset + tile_width]).save(directory / name)
+            Image.fromarray(pixels[:, offset : offset + tile_width]).save(directory / name)
             tiles.append(
                 Tile(
                     path=f"tiles/{name}",
@@ -124,12 +124,9 @@ def write_overview(
     strip_height: float,
 ) -> None:
     """Write a downscaled picture of the whole strip for a human to eyeball."""
-    height = max(1, math.ceil(strip_height))
-    width = min(
-        strip_width,
-        _OVERVIEW_MAX_WIDTH,
-        max(512, _OVERVIEW_PIXEL_BUDGET // height),
-    )
+    width = min(strip_width, _OVERVIEW_MAX_WIDTH)
+    # Both axes scale, so the raster area grows with the square of the width.
+    width = min(width, math.sqrt(_OVERVIEW_PIXEL_BUDGET * strip_width / max(1.0, strip_height)))
     data = resvg_py.svg_to_bytes(
         svg_string=document.markup,
         width=max(1, int(width)),

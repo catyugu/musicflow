@@ -50,6 +50,7 @@ def assemble_score(
     grid: Sequence[tuple[float, float]],
     notes: Sequence[RawNote],
     repeats: Sequence[Repeat] = (),
+    unconfirmed: Sequence[str] = (),
 ) -> Score:
     """Build a score from a measure grid and sounding notes."""
     if not grid:
@@ -96,6 +97,7 @@ def assemble_score(
         notes=tuple(events),
         repeats=tuple(repeats),
         total_q=measures[-1].end_q,
+        unconfirmed=tuple(unconfirmed),
     )
 
 

@@ -361,6 +361,44 @@ def test_second_render_reuses_segments_and_frames_depend_only_on_time(tmp_path: 
     assert _video_frames(tmp_path / "longer.mp4") == 34
 
 
+def test_segments_concatenate_without_losing_or_reordering_frames(tmp_path: Path) -> None:
+    """Each frame is filled with a colour derived from its index, so a concat gap or swap shows."""
+    from musicflow.render import encoder
+
+    spec = VideoSpec(width=160, height=90, fps=10)
+    work = tmp_path / "work"
+    out = tmp_path / "segments.mp4"
+    excerpt = _audio_excerpt(tmp_path, 2.5)
+
+    def frame_at(index: int) -> np.ndarray:
+        frame = np.empty((spec.height, spec.width, 3), dtype=np.uint8)
+        frame[:, :] = (index * 8, 40, 90)
+        return frame
+
+    encoder.encode(
+        frame_at,
+        spec=spec,
+        audio=excerpt,
+        out=out,
+        work_dir=work,
+        preview=None,
+        kind="flow",
+        parameters={"probe": True},
+        segment_frames=4,
+    )
+
+    total = round(_duration(excerpt) * spec.fps)
+    segments = sorted(work.glob("*.mp4"))
+    assert len(segments) > 1, f"the render did not split into segments: {segments}"
+    assert _video_frames(out) == total
+    for seconds, index in ((0.0, 0), (0.9, 9), ((total - 1) / spec.fps, total - 1)):
+        frame = _frame(out, seconds, tmp_path / f"at-{index}.png")
+        red = int(frame[:, :, 0].mean())
+        assert abs(red - index * 8) <= 6, (
+            f"frame at {seconds:.1f} s should be frame {index} (red {index * 8}), got red {red}"
+        )
+
+
 def test_missing_tile_is_a_render_error(tmp_path: Path) -> None:
     work = tmp_path / "work"
     work.mkdir()

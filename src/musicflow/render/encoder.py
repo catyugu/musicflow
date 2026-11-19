@@ -69,6 +69,7 @@ def encode(
     preview: float | None,
     kind: str,
     parameters: Mapping[str, Any],
+    segment_frames: int = SEGMENT_FRAMES,
 ) -> Path:
     """Encode every frame of the timeline and mux the recording; return the MP4 path."""
     ffmpeg = require_tool("ffmpeg")
@@ -79,7 +80,7 @@ def encode(
 
     digest = parameters_digest(kind, spec, parameters)
     segments: list[Path] = []
-    count = math.ceil(timeline.frames / SEGMENT_FRAMES)
+    count = math.ceil(timeline.frames / segment_frames)
     logger.info(
         "%s: %d frames at %d fps (%.2f s), %d segment(s)",
         kind,
@@ -89,8 +90,8 @@ def encode(
         count,
     )
     for index in range(count):
-        start = index * SEGMENT_FRAMES
-        frames = min(SEGMENT_FRAMES, timeline.frames - start)
+        start = index * segment_frames
+        frames = min(segment_frames, timeline.frames - start)
         path = work_dir / f"{kind}-{index:05d}-{digest}.mp4"
         segments.append(path)
         if _segment_is_usable(path, frames, ffprobe):
@@ -107,6 +108,11 @@ def encode(
             label=f"{kind} segment {index + 1}/{count}",
         )
         elapsed = time.perf_counter() - started
+        written = _segment_frames(path, ffprobe)
+        if written != frames:
+            raise RenderError(
+                f"{kind} segment {index + 1}/{count} holds {written} frames, expected {frames}"
+            )
         logger.info(
             "%s: segment %d/%d encoded, %d frames in %.1f s (%.0f ms/frame)",
             kind,
@@ -268,10 +274,13 @@ def _segment_is_usable(path: Path, frames: int, ffprobe: str) -> bool:
 
 
 def _drop_stale(work_dir: Path, kind: str, *, keep: set[Path]) -> None:
+    """Remove segments and segment lists of an older parameter set, and nothing else."""
     for path in work_dir.iterdir():
         if path in keep or not path.is_file() or not path.name.startswith(f"{kind}-"):
             continue
-        if path.suffix in {".mp4", ".txt"}:
+        parts = path.name.split("-")
+        is_segment = len(parts) == 3 and parts[1].isdigit() and parts[2].endswith(".mp4")
+        if is_segment or path.name.endswith("-concat.txt"):
             path.unlink(missing_ok=True)
 
 

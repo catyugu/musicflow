@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Set
+from itertools import pairwise
 
 from lxml import etree
 
@@ -24,12 +25,10 @@ from ..errors import AnalysisError
 
 SVG_NAMESPACE = "http://www.w3.org/2000/svg"
 
-_NOTE_ID = re.compile(r"mf-\d{6}")
 _TRANSFORM_FUNCTION = re.compile(r"(\w+)\s*\(([^)]*)\)")
 _NUMBER = re.compile(r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?")
 _ROOT_TAG = re.compile(r"<svg\b[^>]*>")
 _INNER_TAG = re.compile(r'<svg\b[^>]*\bclass="definition-scale"[^>]*>')
-_ROOT_ID = re.compile(r'<svg\b[^>]*\bid="([^"]+)"')
 
 Matrix = tuple[float, float, float, float, float, float]
 IDENTITY: Matrix = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
@@ -54,33 +53,15 @@ def _set_length(tag: str, name: str, value: str) -> str:
     return re.sub(rf'\b{name}="[^"]*"', f'{name}="{value}"', tag, count=1)
 
 
-def _stabilize_ids(markup: str) -> str:
-    """Replace Verovio's random per-rendering id token with a fixed one.
-
-    Verovio derives a random token from the toolkit instance and suffixes every internal
-    id with it, so the same input renders to different bytes each time. The token is not
-    part of any contract here (notes are addressed by their injected ``mf-`` ids), but a
-    stable artifact keeps the diagnostic SVG and cached runs comparable.
-    """
-    root = _ROOT_TAG.search(markup)
-    token = _ROOT_ID.search(root.group(0)) if root is not None else None
-    if token is None:
-        return markup
-    suffix = token.group(1)
-    return markup.replace(f"-{suffix}", "-mf").replace(f'id="{suffix}"', 'id="mf-strip"')
-
-
 def _transform_matrix(value: str) -> Matrix:
     """Compose an SVG transform list into a matrix, ignoring unsupported functions."""
     matrix = IDENTITY
     for name, arguments in _TRANSFORM_FUNCTION.findall(value):
         numbers = [float(v) for v in _NUMBER.findall(arguments)]
         if name == "translate" and numbers:
-            step: Matrix = (1.0, 0.0, 0.0, 1.0, numbers[0],
-                            numbers[1] if len(numbers) > 1 else 0.0)
+            step: Matrix = (1.0, 0.0, 0.0, 1.0, numbers[0], numbers[1] if len(numbers) > 1 else 0.0)
         elif name == "scale" and numbers:
-            step = (numbers[0], 0.0, 0.0, numbers[1] if len(numbers) > 1 else numbers[0],
-                    0.0, 0.0)
+            step = (numbers[0], 0.0, 0.0, numbers[1] if len(numbers) > 1 else numbers[0], 0.0, 0.0)
         elif name == "matrix" and len(numbers) == 6:
             step = (numbers[0], numbers[1], numbers[2], numbers[3], numbers[4], numbers[5])
         else:
@@ -139,11 +120,47 @@ def _walk(
             _walk(child, matrix, wanted, positions)
 
 
+def _walk_staff_lines(
+    element: etree._Element,
+    matrix: Matrix,
+    lines: list[tuple[float, float, float]],
+) -> None:
+    """Collect horizontal staff-line segments, with every ancestor transform applied."""
+    transform = element.get("transform")
+    if transform:
+        matrix = _compose(matrix, _transform_matrix(transform))
+    if etree.QName(element).localname == "path":
+        parent = element.getparent()
+        if parent is not None and parent.get("class") == "staff":
+            numbers = [float(v) for v in _NUMBER.findall(element.get("d") or "")]
+            if len(numbers) == 4 and numbers[1] == numbers[3]:
+                start = (
+                    matrix[0] * numbers[0] + matrix[2] * numbers[1] + matrix[4],
+                    matrix[1] * numbers[0] + matrix[3] * numbers[1] + matrix[5],
+                )
+                end = (
+                    matrix[0] * numbers[2] + matrix[2] * numbers[3] + matrix[4],
+                    matrix[1] * numbers[2] + matrix[3] * numbers[3] + matrix[5],
+                )
+                if abs(start[1] - end[1]) < 1e-6:
+                    lines.append((min(start[0], end[0]), start[1], max(start[0], end[0])))
+    for child in element:
+        if isinstance(child.tag, str):
+            _walk_staff_lines(child, matrix, lines)
+
+
 class SvgDocument:
-    """One rendered single-system page, addressed in layout units."""
+    """One rendered single-system page, addressed in layout units.
+
+    The markup is kept exactly as Verovio produced it. It carries a stylesheet scoped by
+    the page's own id (``#<token> path {stroke: currentColor}`` and the rule that hides
+    the invisible break anchors), so rewriting any id would silently drop every
+    stroke-only element: staff lines, stems, barlines, slurs and hairpins. Verovio's id
+    token is fixed by the ``xmlIdSeed`` option instead of by post-processing.
+    """
 
     def __init__(self, markup: str) -> None:
-        self.markup = _stabilize_ids(markup)
+        self.markup = markup
         root = _ROOT_TAG.search(self.markup)
         inner = _INNER_TAG.search(self.markup)
         if root is None or inner is None:
@@ -185,19 +202,16 @@ class SvgDocument:
 
     def staff_space(self) -> float | None:
         """Vertical distance between two staff lines, in layout units."""
-        for group in self._element().iter(f"{{{SVG_NAMESPACE}}}g"):
-            if group.get("class") != "staff":
-                continue
-            lines = set()
-            for path in group.iter(f"{{{SVG_NAMESPACE}}}path"):
-                numbers = [float(v) for v in _NUMBER.findall(path.get("d") or "")]
-                if len(numbers) == 4 and numbers[1] == numbers[3]:
-                    lines.add(numbers[1])
-            ordered = sorted(lines)
-            gaps = [b - a for a, b in zip(ordered, ordered[1:], strict=False) if b > a]
-            if gaps:
-                return min(gaps) * self.scale
-        return None
+        rows = sorted({round(line[1], 6) for line in self.staff_lines()})
+        gaps = [b - a for a, b in pairwise(rows) if b > a + 1e-9]
+        return min(gaps) if gaps else None
+
+    def staff_lines(self) -> tuple[tuple[float, float, float], ...]:
+        """Every horizontal staff line as ``(x0, y, x1)`` in layout units."""
+        lines: list[tuple[float, float, float]] = []
+        to_layout: Matrix = (self.scale, 0.0, 0.0, self.scale, self.offset_x, self.offset_y)
+        _walk_staff_lines(self._element(), to_layout, lines)
+        return tuple(lines)
 
     def window(self, x0: float, y0: float, width: int, height: int) -> str:
         """Markup for the crop ``[x0, x0 + width) x [y0, y0 + height)`` at one pixel per unit.
@@ -210,9 +224,8 @@ class SvgDocument:
         root = root.replace("<svg", f'<svg viewBox="{x0} {y0} {width} {height}"', 1)
         inner = self._inner_tag.replace(
             'class="definition-scale"',
-            f'class="definition-scale" x="0" y="0" '
-            f'width="{self.width}" height="{self.height}"',
+            f'class="definition-scale" x="0" y="0" width="{self.width}" height="{self.height}"',
             1,
         )
-        body = self.markup[len(self._root_tag):].replace(self._inner_tag, inner, 1)
+        body = self.markup[len(self._root_tag) :].replace(self._inner_tag, inner, 1)
         return root + body

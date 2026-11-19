@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections import OrderedDict
 from collections.abc import Callable, Hashable, Mapping
 from pathlib import Path
@@ -90,9 +92,6 @@ def file_signature(path: Path) -> list[Any]:
 
 def parameters_digest(kind: str, spec: VideoSpec, parameters: Mapping[str, Any]) -> str:
     """Segment-name digest over everything that changes the pixels of a frame."""
-    import hashlib
-    import json
-
     payload = json.dumps(
         {"kind": kind, "spec": spec.to_dict(), "parameters": dict(parameters)},
         sort_keys=True,
