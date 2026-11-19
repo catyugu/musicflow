@@ -307,10 +307,10 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    if hasattr(args, "size"):
-        args.width, args.height = _parse_size(args.size)
     _configure_logging(args.verbose, args.quiet)
     try:
+        if hasattr(args, "size"):
+            args.width, args.height = _parse_size(args.size)
         return int(args.handler(args))
     except MusicFlowError as error:
         print(f"musicflow: {error}", file=sys.stderr)

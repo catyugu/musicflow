@@ -334,6 +334,7 @@ def render(
             out=out,
             work_dir=step.path,
             preview=preview,
+            audio=inputs.audio,
         )
     else:
         assert analysis.flow is not None, "flow layout was not built"
@@ -346,6 +347,7 @@ def render(
             out=out,
             work_dir=step.path,
             preview=preview,
+            audio=inputs.audio,
         )
     step.store(key, {"out": str(produced), "seconds": round(time.monotonic() - started, 3)})
     logger.info("rendered %s in %.1f s", produced, time.monotonic() - started)
