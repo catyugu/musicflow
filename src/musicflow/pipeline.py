@@ -387,6 +387,45 @@ def discover_case(directory: Path) -> tuple[Path, Path, Path]:
     )
 
 
+@dataclass(frozen=True, slots=True)
+class BatchTask:
+    """One (case, mode) attempt, picklable so a batch can run in worker processes."""
+
+    case: str
+    mode: Mode
+    inputs: Inputs
+    out: Path
+    work_dir: Path
+    spec: VideoSpec
+    preview: float | None
+
+
+def run_batch_task(task: BatchTask) -> dict[str, Any]:
+    """Render one batch task and describe the outcome; never raises for a case failure."""
+    started = time.monotonic()
+    record: dict[str, Any] = {
+        "case": task.case,
+        "mode": task.mode,
+        "ok": False,
+        "out": str(task.out),
+    }
+    try:
+        produced = render(
+            task.inputs,
+            workdir.Workspace(task.work_dir),
+            mode=task.mode,
+            out=task.out,
+            spec=task.spec,
+            preview=task.preview,
+        )
+        record["ok"] = True
+        record["out"] = str(produced)
+    except Exception as error:
+        record["error"] = f"{type(error).__name__}: {error}"
+    record["seconds"] = round(time.monotonic() - started, 1)
+    return record
+
+
 def batch(
     corpus: Path,
     out_dir: Path,
@@ -402,7 +441,7 @@ def batch(
     cases = sorted(p for p in corpus.iterdir() if p.is_dir())
     if not cases:
         raise InputError(f"no case directories in {corpus}")
-    attempts: list[tuple[str, Mode, Path, Path, Path]] = []
+    tasks: list[BatchTask] = []
     skipped: list[dict[str, Any]] = []
     for case in cases:
         try:
@@ -411,37 +450,25 @@ def batch(
             skipped.append({"case": case.name, "mode": "-", "ok": False, "error": str(error)})
             continue
         for mode in modes:
-            attempts.append((case.name, mode, pdf, track, symbolic))
-
-    def run_one(item: tuple[str, Mode, Path, Path, Path]) -> dict[str, Any]:
-        name, mode, pdf, track, symbolic = item
-        started = time.monotonic()
-        workspace = workdir.Workspace(out_dir / name / f"work-{mode}")
-        target = out_dir / f"{name}.{mode}.mp4"
-        record: dict[str, Any] = {"case": name, "mode": mode, "ok": False, "out": str(target)}
-        try:
-            produced = render(
-                Inputs(pdf=pdf, audio=track, symbolic=symbolic),
-                workspace,
-                mode=mode,
-                out=target,
-                spec=spec,
-                preview=preview,
+            tasks.append(
+                BatchTask(
+                    case=case.name,
+                    mode=mode,
+                    inputs=Inputs(pdf=pdf, audio=track, symbolic=symbolic),
+                    out=out_dir / f"{case.name}.{mode}.mp4",
+                    work_dir=out_dir / case.name / f"work-{mode}",
+                    spec=spec,
+                    preview=preview,
+                )
             )
-            record["ok"] = True
-            record["out"] = str(produced)
-        except Exception as error:
-            record["error"] = f"{type(error).__name__}: {error}"
-        record["seconds"] = round(time.monotonic() - started, 1)
-        return record
 
     if jobs <= 1:
-        records = [run_one(item) for item in attempts]
+        records = [run_batch_task(task) for task in tasks]
     else:
         from concurrent.futures import ProcessPoolExecutor
 
         with ProcessPoolExecutor(max_workers=jobs) as pool:
-            records = list(pool.map(run_one, attempts))
+            records = list(pool.map(run_batch_task, tasks))
     return skipped + records
 
 

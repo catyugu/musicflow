@@ -255,6 +255,24 @@ def test_batch_rejects_missing_corpus(tmp_path: Path) -> None:
         )
 
 
+def test_batch_task_is_picklable(case, tmp_path: Path) -> None:
+    """A batch runs in worker processes, so its tasks must survive pickling."""
+    import pickle
+
+    task = pipeline.BatchTask(
+        case=case.name,
+        mode="switch",
+        inputs=_inputs(case),
+        out=tmp_path / "out.mp4",
+        work_dir=tmp_path / "work",
+        spec=model.VideoSpec(width=320, height=240, fps=10),
+        preview=2.0,
+    )
+    restored = pickle.loads(pickle.dumps(task))
+    assert restored == task
+    assert pipeline.run_batch_task.__module__ == "musicflow.pipeline"
+
+
 def test_summary_payload_is_json_serialisable(case) -> None:
     pytest.importorskip("musicflow.symbolic")
     from musicflow.symbolic import build_route, load_score
