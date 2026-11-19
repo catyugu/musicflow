@@ -34,8 +34,10 @@ COARSE_BAND_RATIO = 0.12
 MEDIUM_COLUMN_SECONDS = 0.02
 MEDIUM_BAND_SECONDS = 0.9
 FINE_BAND_SECONDS = 0.25
-POSITION_WEIGHTS = DtwWeights(attack=0.5)
-TIMING_WEIGHTS = DtwWeights(attack=5.0)
+POSITION_ATTACK_WEIGHT = 0.5
+TIMING_ATTACK_WEIGHT = 5.0
+SMOOTH_PENALTY = (0.05, 3.2)
+SMOOTH_DEVIATION_SCALE = 0.10
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,6 +145,38 @@ def _coarse(
     return best[1], best[2]
 
 
+def tempo_deviation(path: TimeMap, *, windows: int = 40) -> float:
+    """How much the local tempo of ``path`` roams, as the 95th percentile of |ln(local/typical)|.
+
+    Measured over windows of a few percent of the piece, not between neighbouring samples: a path
+    may legitimately stand still while the score rests, and that is not a tempo excursion. This is
+    what decides how strongly the next stage may insist on a straight diagonal: a piece whose tempo
+    really moves must be allowed to move, while a metronomic one must not wander in its corridor.
+    """
+    count = path.q.size
+    if count < 4:
+        return 0.0
+    span = max(2, count // (2 * windows))
+    low = np.clip(np.arange(count) - span, 0, count - 1)
+    high = np.clip(np.arange(count) + span, 0, count - 1)
+    delta_q = path.q[high] - path.q[low]
+    delta_t = path.seconds[high] - path.seconds[low]
+    valid = (delta_q > 1e-6) & (delta_t > 1e-6)
+    if not valid.any():
+        return 0.0
+    local = delta_t[valid] / delta_q[valid]
+    typical = float(np.median(local))
+    if typical <= 0.0:
+        return 0.0
+    return float(np.percentile(np.abs(np.log(local / typical)), 95))
+
+
+def smooth_penalty(deviation: float) -> float:
+    """Price of leaving the diagonal, scaled by how steady the measured tempo is."""
+    low, high = SMOOTH_PENALTY
+    return low + high * float(np.exp(-((deviation / SMOOTH_DEVIATION_SCALE) ** 2)))
+
+
 def _refine(
     source: TimeMap,
     features: AudioFeatures,
@@ -151,12 +185,15 @@ def _refine(
     column_seconds: float,
     band_seconds: float,
     scale: float,
-    weights: DtwWeights,
+    attack: float,
 ) -> TimeMap:
     audio = features.pooled(pool_factor(features, column_seconds))
     step_q = (1.0 / audio.rate) / scale
     grid = build_score_grid(route, step_q)
     centre = source.at(np.arange(1, grid.cells + 1) * step_q) * audio.rate
+    deviation = tempo_deviation(source)
+    penalty = smooth_penalty(deviation)
+    weights = DtwWeights(attack=attack, fast_step=penalty, slow_step=penalty)
     path = align_path(
         grid,
         audio,
@@ -165,8 +202,11 @@ def _refine(
         weights=weights,
     )
     logger.info(
-        "refined path on %.3f s columns: %d cells, similarity %.3f",
+        "refined path on %.3f s columns: tempo deviation %.3f -> smoothness %.2f, "
+        "%d cells, similarity %.3f",
         column_seconds,
+        deviation,
+        penalty,
         path.path_cells,
         path.mean_similarity,
     )
@@ -186,7 +226,7 @@ def staged_path(features: AudioFeatures, route: Route) -> Stages:
         column_seconds=MEDIUM_COLUMN_SECONDS,
         band_seconds=MEDIUM_BAND_SECONDS,
         scale=expected,
-        weights=POSITION_WEIGHTS,
+        attack=POSITION_ATTACK_WEIGHT,
     )
     fine = _refine(
         medium,
@@ -195,7 +235,7 @@ def staged_path(features: AudioFeatures, route: Route) -> Stages:
         column_seconds=1.0 / features.rate,
         band_seconds=FINE_BAND_SECONDS,
         scale=expected,
-        weights=TIMING_WEIGHTS,
+        attack=TIMING_ATTACK_WEIGHT,
     )
     return Stages(
         coarse=coarse,

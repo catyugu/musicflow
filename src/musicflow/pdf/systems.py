@@ -496,6 +496,24 @@ def _clear_bounds(
     return x0, y0, x1, y1
 
 
+def _blank_bands(
+    profile: np.ndarray, rows: range, threshold: int, lower: int
+) -> list[tuple[int, int, int]]:
+    """Runs of rows whose ink count does not exceed ``threshold``, as ``(width, first, last)``."""
+    bands: list[tuple[int, int, int]] = []
+    start: int | None = None
+    for row in rows:
+        if profile[row] <= threshold:
+            if start is None:
+                start = row
+        elif start is not None:
+            bands.append((row - start, start, row - 1))
+            start = None
+    if start is not None:
+        bands.append((lower + 1 - start, start, lower))
+    return bands
+
+
 def _gap_splits(
     raster: PageRaster, unions: list[tuple[float, float]], spans: list[tuple[float, float]]
 ) -> list[tuple[int, int]]:
@@ -517,17 +535,14 @@ def _gap_splits(
         profile = raster.ink[:, left:right].sum(axis=1)
         rows = range(max(0, upper), min(raster.ink.shape[0], lower + 1))
         middle = (upper + lower) / 2
+        # A clean export has rows with no ink at all; a scan speckles every row, so the blank test
+        # falls back to a noise floor only when no truly empty band exists.
+        noise = max(1, round(0.002 * (right - left)))
         bands: list[tuple[int, int, int]] = []
-        start: int | None = None
-        for row in rows:
-            if profile[row] == 0:
-                if start is None:
-                    start = row
-            elif start is not None:
-                bands.append((row - start, start, row - 1))
-                start = None
-        if start is not None:
-            bands.append((lower + 1 - start, start, lower))
+        for threshold in (0, noise):
+            bands = _blank_bands(profile, rows, threshold, lower)
+            if bands:
+                break
         wide = [band for band in bands if band[0] >= 4]
         if wide:
             width, start, _ = max(
@@ -598,7 +613,14 @@ def system_boxes(
         threshold = max(1, round(0.002 * (right - left)))
         top_limit = splits[index - 1][1] if index else 0
         bottom_limit = splits[index][0] if index < len(splits) else height
-        upper_limit = max(int(PAD_TOP_SPACES * space) + gap_rows, int(top) - top_limit)
+        first = index == 0
+        # The top edge of the first system has no neighbour to stop the walk at, so page furniture
+        # could chain into the band: a title sits far above the first staff. Capping that one edge
+        # keeps the title out without cutting any stave.
+        if first:
+            upper_limit = int(PAD_TOP_SPACES * space) + gap_rows
+        else:
+            upper_limit = max(int(PAD_TOP_SPACES * space) + gap_rows, int(top) - top_limit)
         lower_limit = max(int(PAD_BOTTOM_SPACES * space) + gap_rows, bottom_limit - int(bottom))
         y0 = _grow_vertical(profile, int(np.floor(top)), -1, upper_limit, gap_rows, threshold)
         y1 = _grow_vertical(profile, int(np.ceil(bottom)), 1, lower_limit, gap_rows, threshold)

@@ -8,14 +8,15 @@ the expensive part.
 
 from __future__ import annotations
 
+import itertools
 import json
-import sys
 from dataclasses import replace
 from pathlib import Path
 
 import cv2
 import numpy as np
 import pytest
+from conftest import Case
 from lxml import etree
 
 from musicflow.errors import InputError
@@ -32,18 +33,15 @@ from musicflow.model import (
 from musicflow.pdf import bind_measures, detect_layout
 from musicflow.pdf.imaging import open_document, rasterise
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
-import itertools
-
-from conftest import Case
-
 EXPECTED_STAVES = {"case1": 3, "case2": 3, "case3": 4}
 EXPECTED_MEASURES = {"case1": 148, "case2": 82, "case3": 314}
 #: case2 engraves four of its 21 systems for piano alone (the introduction and the postlude), so
 #: only 17/21 systems carry the full staff count; the vector cases carry it everywhere.
 MIN_MATCHING_STAVES = {"case1": 0.95, "case2": 0.75, "case3": 0.95}
-#: Scan pages are packed tighter than four blank rows between systems, so a clear crop border is
-#: not always possible there; vector pages have room and are held to a stricter share.
+#: A crop border is only blank when the gap to the next system holds a few empty rows. The 96 dpi
+#: scan packs its systems tighter than that and is rotated by 0.66 degrees while boxes stay
+#: axis-aligned in PDF points, so part of its borders necessarily hold ink; the vector pages have
+#: room. A swallowed neighbour is caught by the staff-line count instead.
 MIN_CLEAR_BORDER_SHARE = {"case1": 0.85, "case2": 0.5, "case3": 0.85}
 
 _DETECTION: dict[str, StaffLayout] = {}

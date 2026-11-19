@@ -89,6 +89,22 @@ def _number(path: Path, value: Any, label: str) -> float:
     return number
 
 
+def validate_bounds(
+    constraints: tuple[Constraint, ...], *, total_q: float, audio_duration: float
+) -> None:
+    """Reject a reviewed anchor that cannot belong to this score or this recording."""
+    for item in constraints:
+        if not 0.0 <= item.q <= total_q:
+            raise InputError(
+                f"alignment constraint at q={item.q:.3f} is outside the performance route"
+            )
+        if not 0.0 <= item.seconds <= audio_duration:
+            raise InputError(
+                f"alignment constraint at q={item.q:.3f} maps to {item.seconds:.3f} s, "
+                f"outside the recording"
+            )
+
+
 def merge_anchors(
     automated: list[Anchor],
     manual: tuple[Constraint, ...],
@@ -97,17 +113,8 @@ def merge_anchors(
     audio_duration: float,
 ) -> tuple[tuple[Anchor, ...], dict[str, int]]:
     """Merge reviewed and automated anchors into one strictly increasing sequence."""
+    validate_bounds(manual, total_q=total_q, audio_duration=audio_duration)
     fixed = sorted((item.as_anchor() for item in manual), key=lambda anchor: anchor.q)
-    for anchor in fixed:
-        if not 0.0 <= anchor.q <= total_q:
-            raise InputError(
-                f"alignment constraint at q={anchor.q:.3f} is outside the performance route"
-            )
-        if not 0.0 <= anchor.seconds <= audio_duration:
-            raise InputError(
-                f"alignment constraint at q={anchor.q:.3f} maps to {anchor.seconds:.3f} s, "
-                f"outside the recording"
-            )
     kept: list[Anchor] = []
     dropped_manual_conflict = 0
     fixed_index = 0

@@ -31,7 +31,7 @@ from musicflow.errors import AnalysisError, InputError
 from musicflow.model import Alignment, Anchor, Route, Score
 
 from . import report, stages
-from .constraints import Constraint, merge_anchors, read_constraints
+from .constraints import Constraint, merge_anchors, read_constraints, validate_bounds
 from .dtw import TimeMap
 from .features import AudioFeatures, build_attacks, read_audio
 from .snap import Snapped, snap_attacks
@@ -45,6 +45,7 @@ MAX_RESIDUAL_SECONDS = 0.25
 BPM_RANGE = (30.0, 240.0)
 MIN_COVERAGE = 0.8
 MAX_DROP_RATIO = 0.05
+MAX_RELOCATED_RATIO = 0.05
 MAX_LENGTH_RATIO = 2.0
 
 
@@ -80,6 +81,8 @@ def align(
     features = read_audio(audio_path)
     if features.duration < MIN_DURATION:
         raise AnalysisError(f"{audio_path.name} is too short to align ({features.duration:.2f} s)")
+    if manual:
+        validate_bounds(manual, total_q=route.total_q, audio_duration=features.duration)
     logger.info(
         "aligning %.1f s of audio against %.1f quarters on a %.0f frame grid",
         features.duration,
@@ -89,7 +92,12 @@ def align(
 
     chain = stages.staged_path(features, route)
     attacks = build_attacks(route)
-    snapped = snap_attacks(attacks, chain.fine, features)
+    snapped = snap_attacks(
+        attacks,
+        chain.fine,
+        features,
+        fixed=_chain_fixed_points(route, features.duration, manual),
+    )
     automated = [
         Anchor(
             q=float(q),
@@ -140,6 +148,20 @@ def align(
         elapsed,
     )
     return alignment
+
+
+def _chain_fixed_points(
+    route: Route, audio_duration: float, manual: tuple[Constraint, ...]
+) -> tuple[tuple[float, float], ...]:
+    """Recording boundaries plus reviewed anchors: the points the timing chain must pass through.
+
+    The boundaries are not decoration: without them the first and last attacks are anchored only by
+    the chroma path, whose ends are the least constrained part of the whole alignment.
+    """
+    points: dict[float, float] = {0.0: 0.0, route.total_q: audio_duration}
+    for item in manual:
+        points[item.q] = item.seconds
+    return tuple(sorted(points.items()))
 
 
 def _validate_route(score: Score, route: Route) -> None:
@@ -244,6 +266,11 @@ def _honesty(
         notes.append(
             f"only {numbers.coverage * 100:.0f}% of score onsets were snapped to an onset peak"
         )
+    if snaps.relocated > MAX_RELOCATED_RATIO * max(snaps.q.size, 1):
+        notes.append(
+            f"{snaps.relocated} of {snaps.q.size} onsets had to be placed away from the DTW path "
+            "to keep the tempo plausible: the path itself is unreliable there"
+        )
     dropped = merge_stats["dropped_against_manual"] + merge_stats["dropped_at_boundary"]
     if alignment.anchors and dropped > MAX_DROP_RATIO * max(len(snaps.q), 1):
         notes.append(
@@ -287,6 +314,7 @@ def _payload(
         "similarity_mean": round(numbers.similarity_mean, 4),
         "attack_count": int(snapped.q.size),
         "snapped_attacks": int(np.count_nonzero(snapped.snapped)),
+        "relocated_attacks": snapped.relocated,
         "anchors_onset": onset_anchors,
         "anchors_manual": manual_anchors,
         "residual_ms": {key: round(value, 3) for key, value in numbers.residual.items()},

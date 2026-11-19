@@ -4,6 +4,13 @@ Both exist so that a person can judge a run without recomputing anything: the re
 numbers that decide whether the map is trustworthy, and the figure shows the map itself with the
 anchor evidence and the per-attack residual. The figure is drawn with Pillow on purpose; adding a
 plotting dependency to make two panels would be a poor trade.
+
+``residual_ms`` is the distance from the accepted onset peak to the DTW position of the same attack,
+so it measures how much timing evidence moved an anchor, not how wrong the anchor is; there is no
+ground truth at run time. It is reported over the attacks a local snap accepted, and
+``relocated_attacks`` counts the ones the ordered chain had to place further away because the local
+choice was not compatible with a plausible tempo. A large ``relocated_attacks`` means the DTW path
+itself is locally wrong.
 """
 
 from __future__ import annotations
