@@ -27,7 +27,9 @@ from .model import Alignment, FlowLayout, Route, Score, StaffLayout, VideoSpec
 logger = logging.getLogger(__name__)
 
 Mode = Literal["switch", "flow"]
-PIPELINE_VERSION = 1
+# Bump when a stage's behaviour changes: every cache key includes it, so stale artifacts from an
+# older algorithm can never be mistaken for current output.
+PIPELINE_VERSION = 2
 
 AUDIO_SUFFIXES = (".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".opus", ".wma")
 
@@ -182,7 +184,12 @@ def _bound_step(
     if inputs.staff_override is not None:
         files["staff_override"] = inputs.staff_override
     key = workdir.fingerprint(
-        files, {"layout": workdir.hash_payload(layout.to_dict()), "score": score.to_dict()}
+        files,
+        {
+            "layout": workdir.hash_payload(layout.to_dict()),
+            "score": score.to_dict(),
+            **_tool_versions(),
+        },
     )
 
     def compute(_: Path) -> dict[str, Any]:
