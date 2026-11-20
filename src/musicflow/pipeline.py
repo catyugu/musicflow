@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 Mode = Literal["switch", "flow"]
 # Bump when a stage's behaviour changes: every cache key includes it, so stale artifacts from an
 # older algorithm can never be mistaken for current output.
-PIPELINE_VERSION = 4
+PIPELINE_VERSION = 5
 
 AUDIO_SUFFIXES = (".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".opus", ".wma")
 

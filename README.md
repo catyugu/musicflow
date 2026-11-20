@@ -144,7 +144,7 @@ doc/                requirements (PLAN.md), corpus notes (TEST_DATA.md), design 
 ## Documentation
 
 - `doc/PLAN.md` — requirements and implementation plan (authoritative scope).
-- `doc/TEST_DATA.md` — the three-case test corpus and its limitations.
+- `doc/TEST_DATA.md` — the four-case test corpus and its limitations.
 - `doc/design.md` — data structures, invariants, module interfaces, error and caching contract.
 - `doc/ACCEPTANCE.md` — the acceptance evidence of the last full run: numbers, checks, known limits.
 - `AGENTS.md` — instructions for agents working in this repository.
@@ -161,9 +161,12 @@ doc/                requirements (PLAN.md), corpus notes (TEST_DATA.md), design 
   and the alignment's own confidence. Note-level differences (clefs, articulations) are not detected
   automatically.
 - A 96 dpi scan (case2) is rasterised beyond its resolution for `switch`; it is legible, not sharp.
-- Detection keeps one system per staff for a single-staff score, but barline-based measure counting
-  only runs inside multi-staff systems: a scanned solo score cannot bind measures and `switch` falls
-  back to proportional system timing (a vector solo score binds through its printed measure numbers).
+- A single-staff score offers no gap between staves to test a column against, so its barlines are
+  found from where the ink stops: a barline ends on the staff lines, while a stem runs past them into
+  its notehead or beam, and a slur, tie or hairpin out there is a separate stroke. A stem whose
+  notehead sits on the line and inside the staff, or a barline drawn well past the lines, can still
+  be read the wrong way; the measure total is cross-checked against the symbolic score and against
+  any printed numbers, and a disagreement is reported.
 - A printed score drops staves that stay empty, so a system may legally carry fewer staves than the
   score declares; detection reports the counts instead of forcing a match.
 - `doc/ACCEPTANCE.md` lists the remaining differences between the printed score and the symbolic

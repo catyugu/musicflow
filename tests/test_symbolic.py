@@ -34,6 +34,7 @@ WRITTEN = {
     "case1": {"parts": 2, "staves": 3, "measures": 148, "notes": 2500, "note_elements": 2720},
     "case2": {"parts": 2, "staves": 3, "measures": 82, "notes": 1641, "note_elements": 1807},
     "case3": {"parts": 4, "staves": 4, "measures": 314, "notes": 4158, "note_elements": 4730},
+    "case4": {"parts": 1, "staves": 1, "measures": 42, "notes": 704, "note_elements": 707},
 }
 
 # What build_route makes of each written score. case3 writes one repeat span over measures 1..139,
@@ -42,6 +43,7 @@ ROUTES = {
     "case1": {"source": "written", "passes": 148, "notes": 2500, "total_q": 502.0},
     "case2": {"source": "written", "passes": 82, "notes": 1641, "total_q": 246.0},
     "case3": {"source": "auto_repeats", "passes": 453, "notes": 5937, "total_q": 1359.0},
+    "case4": {"source": "written", "passes": 42, "notes": 704, "total_q": 168.0},
 }
 
 # MIDI event counts, measure counts and quarter lengths. case1 and case3 keep their time
@@ -51,12 +53,13 @@ MIDI = {
     "case1": {"notes": 2500, "measures": 148, "total_q": 502.0},
     "case2": {"notes": 1637, "measures": 62, "total_q": 248.0},
     "case3": {"notes": 7664, "measures": 453, "total_q": 1359.0},
+    "case4": {"notes": 704, "measures": 42, "total_q": 168.0},
 }
 
 # Sum of the durations the document writes for its pitched notes. case2 is a performance-derived
 # document whose written durations do not add up to partitura's timeline (a chord note is cut at
 # the next performed onset), so the identity is only asserted where the notation is strict.
-WRITTEN_DURATION_Q = {"case1": 1799.0, "case3": 3513.0}
+WRITTEN_DURATION_Q = {"case1": 1799.0, "case3": 3513.0, "case4": 188.0}
 
 MANUAL_SPANS = [[1, 2], [1, 2], [3, 4]]
 
@@ -64,7 +67,7 @@ MIDI_MEASURE_NOTE = "midi measures are inferred from time signatures"
 
 # Tie continuations partitura leaves as notes of their own. case2 is derived from a performance,
 # so one tie starts the note a little after its predecessor ends; a tie with a gap is not merged.
-UNMERGED_CONTINUATIONS = {"case1": set(), "case2": {"mf-001797"}, "case3": set()}
+UNMERGED_CONTINUATIONS = {"case1": set(), "case2": {"mf-001797"}, "case3": set(), "case4": set()}
 
 
 @cache

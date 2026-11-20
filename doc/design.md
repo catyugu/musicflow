@@ -73,7 +73,7 @@ SVG（`id="mf-000123"`）与 timemap 中，这是流动模式把"源音符 → �
 | --- | --- | --- |
 | `symbolic` | `load_score` | 读 MusicXML / MXL / MIDI 为 `Score`，MXL 就地解包 |
 | `symbolic` | `build_route` | 按书面反复展开演奏顺序，override 文件优先 |
-| `pdf` | `detect_layout` | 以光栅检测谱行与谱表，同时写诊断位图 |
+| `pdf` | `detect_layout` | 以光栅检测谱行、谱表与小节线，同时写诊断位图 |
 | `pdf` | `bind_measures` | 把谱行绑定到小节范围，印刷小节号优先、小节线计数兜底 |
 | `align` | `align` | 产出谱位到录音时间的锚点与残差报告 |
 | `flow` | `build_layout` | 把书写谱排成一整条 system 并栅格化成瓦片 |
@@ -133,9 +133,9 @@ SVG（`id="mf-000123"`）与 timemap 中，这是流动模式把"源音符 → �
 ## 八、测试策略
 
 - 模块级测试只测语义与不变量，不追求分支覆盖。
-- 端到端以 `test_cases/case1..3` 为准：V1 谱行检测与排谱、V2 两种符号输入的 switch、V3 flow、V4 拒绝与
-  缓存。
-- 同步精度用可量化判据：合成音频（case1、case3）的对齐残差中位数应 ≤ 20 ms；真实录音（case2）应
+- 端到端以 `test_cases/case1..4` 为准：V1 谱行检测与排谱（case4 是单谱表谱面）、V2 两种符号输入的
+  switch、V3 flow、V4 拒绝与缓存。
+- 同步精度用可量化判据：合成音频（case1、case3）的对齐残差中位数应 ≤ 20 ms；真实录音（case2、case4）应
   ≤ 150 ms，并且报告里残差分布可视检。
 - 渲染验收抽样帧，检查阅读线位置、谱面完整、无空白帧、音频时长一致。
 

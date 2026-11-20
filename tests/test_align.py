@@ -9,10 +9,12 @@ Two families of checks, both semantic rather than structural:
   part is a property of the corpus audio: its onset evidence trails the symbolic timeline by
   ~50 ms, measured four ways (chroma transition centroid, onset-novelty cross-correlation against
   the MIDI impulse train, nearest onset peak, note-off cross-correlation). A case whose MIDI is
-  provably on another quarter grid is skipped, never quietly passed.
-* case2 is a real recording of a differently notated MIDI, so it has no ground truth. It is checked
-  against invariants instead: residual, coverage, monotonicity, boundaries, and the control that
-  the produced map scores at least twice as well as the same map shifted by two seconds.
+  provably not this performance - another quarter grid, or another tempo - is skipped with the
+  reason, never quietly passed.
+* case2 and case4 are real recordings of a differently notated MIDI, so they have no ground truth.
+  They are checked against invariants instead: residual, coverage, monotonicity, boundaries, and the
+  control that the produced map scores at least twice as well as the same map shifted by two
+  seconds.
 
 Alignments are cached per case in a module-scoped fixture: case3 takes ~20 s and no test needs it
 twice.
@@ -47,6 +49,7 @@ P90_LIMIT_MS = 60.0
 OFFSET_LIMIT_MS = 100.0
 MIN_MATCH_RATE = 0.95
 GRID_RATIO = (0.9, 1.1)
+DURATION_RATIO = (0.95, 1.05)
 RESIDUAL_LIMIT_MS = 150.0
 MIN_COVERAGE = 0.9
 BPM_RANGE = (30.0, 240.0)
@@ -93,12 +96,15 @@ def _corpus_paths(case_name: str) -> tuple[Score, Route, Path]:
     return score, build_route(score), root / f"{case_name}.mp3"
 
 
-def _midi_pairs(case_name: str) -> tuple[dict[tuple[float, int], list[float]], float]:
-    """MIDI (quarter position, pitch) -> performed onset times, plus the grid's last quarter.
+def _midi_pairs(
+    case_name: str,
+) -> tuple[dict[tuple[float, int], list[float]], float, float]:
+    """MIDI (quarter position, pitch) -> performed onset times, plus its last quarter and second.
 
-    The corpus MIDI renders the same performance, so its tick position divided by the 480 ticks
-    per quarter *is* the written quarter position; grouping by that pair matches a route note to
-    its MIDI note without depending on the alignment itself.
+    Where the corpus MIDI renders this very performance, its tick position divided by the 480 ticks
+    per quarter *is* the written quarter position, and its onset seconds are the performed times;
+    grouping by that pair matches a route note to its MIDI note without depending on the alignment
+    itself.
     """
     path = CORPUS / case_name / f"{case_name}.mid"
     if not path.is_file():
@@ -107,17 +113,18 @@ def _midi_pairs(case_name: str) -> tuple[dict[tuple[float, int], list[float]], f
     ticks = np.asarray(notes["onset_tick"], dtype=float)
     pitches = np.asarray(notes["pitch"])
     seconds = np.asarray(notes["onset_sec"], dtype=float)
+    ends = seconds + np.asarray(notes["duration_sec"], dtype=float)
     buckets: dict[tuple[float, int], list[float]] = {}
     for tick, pitch, second in zip(ticks, pitches, seconds, strict=True):
         buckets.setdefault((round(tick / 480.0, 3), int(pitch)), []).append(float(second))
     for values in buckets.values():
         values.sort()
-    return buckets, float(ticks.max() / 480.0)
+    return buckets, float(ticks.max() / 480.0), float(ends.max())
 
 
 def _error_against_midi(run: Run) -> tuple[np.ndarray, float, int]:
     """Millisecond error of the map against the MIDI, plus its match rate and pair count."""
-    buckets, midi_span_q = _midi_pairs(run.case_name)
+    buckets, midi_span_q, midi_end_sec = _midi_pairs(run.case_name)
     last_attack_q = max(note.onset_q for note in run.route.notes)
     ratio = midi_span_q / max(last_attack_q, 1e-9)
     if not GRID_RATIO[0] <= ratio <= GRID_RATIO[1]:
@@ -125,6 +132,13 @@ def _error_against_midi(run: Run) -> tuple[np.ndarray, float, int]:
             f"{run.case_name}'s MIDI is notated on a different quarter grid "
             f"({midi_span_q:.1f} quarters against {last_attack_q:.1f} sounding quarters), "
             "so it is not this performance"
+        )
+    duration_ratio = midi_end_sec / max(run.alignment.audio_duration, 1e-9)
+    if not DURATION_RATIO[0] <= duration_ratio <= DURATION_RATIO[1]:
+        pytest.skip(
+            f"{run.case_name}'s MIDI ends at {midi_end_sec:.1f}s against a"
+            f" {run.alignment.audio_duration:.1f}s recording, so it is the notation at its own"
+            " tempo, not this performance"
         )
     quarters: list[float] = []
     times: list[float] = []

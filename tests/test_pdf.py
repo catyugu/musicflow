@@ -1,9 +1,9 @@
 """End-to-end checks of PDF staff-system detection on the curated corpus.
 
 The corpus is the acceptance target: case1 is a vector MuseScore export (3 staves per system),
-case2 a 96 dpi scan (2 staves in the piano-only systems, 3 elsewhere) and case3 a vector OpenScore
-quartet export (4 staves per system). A generated single-staff page covers the solo-instrument path.
-Detection is cached per case because rasterising 23 pages is the expensive part.
+case2 a 96 dpi scan (2 staves in the piano-only systems, 3 elsewhere), case3 a vector OpenScore
+quartet export (4 staves per system) and case4 a vector solo-cello score (1 staff per system).
+Detection is cached per case because rasterising 25 pages is the expensive part.
 """
 
 from __future__ import annotations
@@ -32,18 +32,19 @@ from musicflow.model import (
     System,
 )
 from musicflow.pdf import bind_measures, detect_layout
-from musicflow.pdf.imaging import RENDER_DPI, open_document, rasterise
+from musicflow.pdf.imaging import RENDER_DPI, detect_staves, open_document, rasterise
+from musicflow.pdf.systems import Group, group_barlines
 
-EXPECTED_STAVES = {"case1": 3, "case2": 3, "case3": 4}
-EXPECTED_MEASURES = {"case1": 148, "case2": 82, "case3": 314}
+EXPECTED_STAVES = {"case1": 3, "case2": 3, "case3": 4, "case4": 1}
+EXPECTED_MEASURES = {"case1": 148, "case2": 82, "case3": 314, "case4": 42}
 #: case2 engraves four of its 21 systems for piano alone (the introduction and the postlude), so
 #: only 17/21 systems carry the full staff count; the vector cases carry it everywhere.
-MIN_MATCHING_STAVES = {"case1": 0.95, "case2": 0.75, "case3": 0.95}
+MIN_MATCHING_STAVES = {"case1": 0.95, "case2": 0.75, "case3": 0.95, "case4": 1.0}
 #: A crop border is only blank when the gap to the next system holds a few empty rows. The 96 dpi
 #: scan packs its systems tighter than that and is rotated by 0.66 degrees while boxes stay
 #: axis-aligned in PDF points, so part of its borders necessarily hold ink; the vector pages have
 #: room. A swallowed neighbour is caught by the staff-line count instead.
-MIN_CLEAR_BORDER_SHARE = {"case1": 0.85, "case2": 0.5, "case3": 0.85}
+MIN_CLEAR_BORDER_SHARE = {"case1": 0.85, "case2": 0.5, "case3": 0.85, "case4": 0.85}
 
 _DETECTION: dict[str, StaffLayout] = {}
 
@@ -166,7 +167,9 @@ def test_staff_counts(layout: StaffLayout, case: Case) -> None:
     expected = EXPECTED_STAVES[case.name]
     counts = [len(system.staves) for system in layout.systems]
     matching = sum(1 for count in counts if count == expected)
-    assert min(counts) >= 2, f"{case.name}: a system with fewer than two staves: {counts}"
+    assert min(counts) >= min(2, expected), (
+        f"{case.name}: a system with fewer staves than the score has: {counts}"
+    )
     assert matching / len(counts) >= MIN_MATCHING_STAVES[case.name], (
         f"{case.name}: only {matching}/{len(counts)} systems have {expected} staves: {counts}"
     )
@@ -286,6 +289,114 @@ def test_single_staff_systems_stay_separate(tmp_path: Path) -> None:
         document.save(str(pdf))
     layout = detect_layout(pdf, expected_staves=1, debug_dir=tmp_path)
     assert [len(system.staves) for system in layout.systems] == [1, 1]
+
+
+def draw_solo_system(page: pymupdf.Page, space: float, *extra: tuple[float, float]) -> None:
+    """One staff, its two bars and one chord stem with a notehead below the staff.
+
+    ``extra`` items are drawn as thin lines from x to y below the staff, the way a tie, a slur or a
+    hairpin crosses a barline without touching it.
+    """
+    top, left, right = 150.0, 72.0, 523.0
+    for line in range(5):
+        page.draw_line(
+            (left, top + line * space), (right, top + line * space), color=(0, 0, 0), width=0.6
+        )
+    for bar in (306.0, right):
+        page.draw_line((bar, top), (bar, top + 4 * space), color=(0, 0, 0), width=0.8)
+    stem = 200.0
+    page.draw_line((stem, top), (stem, top + 4.7 * space), color=(0, 0, 0), width=0.8)
+    notehead = pymupdf.Rect(
+        stem - 0.4 * space, top + 4.2 * space, stem + 0.6 * space, top + 5.2 * space
+    )
+    page.draw_rect(notehead, color=None, fill=(0, 0, 0))
+    for start, stop in extra:
+        y = top + 5.8 * space
+        page.draw_line((start, y), (stop, y), color=(0, 0, 0), width=1.0)
+
+
+def solo_page(path: Path, space: float, *extra: tuple[float, float]) -> Path:
+    with pymupdf.open() as document:
+        page = document.new_page(width=595, height=842)
+        draw_solo_system(page, space, *extra)
+        document.save(str(path))
+    return path
+
+
+def test_a_chord_stem_is_not_a_barline(tmp_path: Path) -> None:
+    """A solo system has no gap between staves to test a column against.
+
+    A chord stem inks the whole staff exactly like a barline, so the candidate finder keeps it; only
+    the notehead it ends in tells them apart, and counting candidates alone would read this page as
+    three measures.
+    """
+    space = 14 * 72 / RENDER_DPI
+    pdf = solo_page(tmp_path / "stem.pdf", space)
+    document = open_document(pdf)
+    try:
+        raster = rasterise(document[0], 1)
+    finally:
+        document.close()
+    detection = detect_staves(raster)
+    staff = detection.staves[0]
+    candidates = group_barlines(raster, Group(staves=(staff,)), detection.space)
+    assert len(candidates) == 3, (
+        "the stem must reach the candidate stage for this test to mean anything"
+    )
+    layout = detect_layout(pdf, expected_staves=1, debug_dir=tmp_path)
+    assert [system.measure_count for system in layout.systems] == [2]
+    assert [round(x) for x in layout.systems[0].barlines] == [306, 523], (
+        "the counted bars must be the drawn ones, not the stem"
+    )
+
+
+def test_a_tie_across_a_barline_does_not_hide_it(tmp_path: Path) -> None:
+    """A tie, slur or hairpin is a separate thin stroke, so it must not reject the barline.
+
+    That is the false negative this rule can produce, and it is worse than a false positive: the
+    measure count then disagrees with the score on a perfectly clean page.
+    """
+    space = 14 * 72 / RENDER_DPI
+    pdf = solo_page(tmp_path / "tie.pdf", space, (250.0, 400.0))
+    layout = detect_layout(pdf, expected_staves=1, debug_dir=tmp_path)
+    assert [system.measure_count for system in layout.systems] == [2]
+
+
+def scanned_copy(case: Case, target: Path, dpi: int = 150) -> Path:
+    """A copy of the case PDF with no text layer: what a scan of the same page offers."""
+    with pymupdf.open(case.pdf) as source, pymupdf.open() as scanned:
+        for page in source:
+            pixmap = page.get_pixmap(dpi=dpi, colorspace=pymupdf.csGRAY)
+            sheet = scanned.new_page(width=page.rect.width, height=page.rect.height)
+            sheet.insert_image(page.rect, stream=pixmap.tobytes("png"))
+        scanned.save(str(target))
+    return target
+
+
+def test_solo_scan_counts_its_measures_from_the_barlines(solo: Case, tmp_path: Path) -> None:
+    """Without a text layer the barlines are the only thing that names the measures.
+
+    This is the solo-score path that used to give up: measures were counted between staves only, so
+    a single staff reported none, nothing could be bound and ``switch`` fell back to proportional
+    system timing.
+    """
+    layout = detect_layout(
+        scanned_copy(solo, tmp_path / "scan.pdf"), expected_staves=1, debug_dir=tmp_path
+    )
+    assert [system.printed_measure for system in layout.systems] == [None] * len(layout.systems)
+    assert [system.measure_count for system in layout.systems] == [2] * 21, (
+        "every system of the Prelude holds two measures"
+    )
+    score = score_of(solo.musicxml)
+    assert sum(system.measure_count for system in layout.systems) == len(score.measures)
+    bound = bind_measures(layout, score)
+    cursor = 1
+    for system in bound.systems:
+        assert system.first_measure == cursor, f"system {system.index} starts at the wrong measure"
+        assert system.last_measure == cursor + system.measure_count - 1
+        cursor = system.last_measure + 1
+    assert cursor == len(score.measures) + 1
+    assert not [line for line in bound.unconfirmed if "rescaled" in line]
 
 
 def synthetic_layout(counts: list[int], printed: list[int | None] | None = None) -> StaffLayout:

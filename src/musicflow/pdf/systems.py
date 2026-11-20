@@ -7,8 +7,9 @@ grand-staff
 gap can be larger than the gap between two tightly set systems.
 
 Measure counts come from the barlines: the x positions of vertical strokes that run through the
-whole height of a multi-staff group. The leftmost one is the system-start barline and is not
-counted.
+whole height of a staff group. The leftmost one is the system-start barline and is not counted. In a
+multi-staff group the gaps between the staves already tell a barline from a chord stem; a single
+staff has no gaps to offer, so there the ends of the stroke decide - see :func:`staff_barlines`.
 """
 
 from __future__ import annotations
@@ -32,6 +33,11 @@ STAFF_COVERAGE = 0.90
 GAP_COVERAGE = 0.50
 THIN_STROKE_SPACES = 0.8
 MIN_THIN_SHARE = 0.80
+#: Barline detection on a single staff: a chord stem is the same thin column, so what separates
+#: them is where the ink stops. A barline ends on the staff lines; a stem runs past them into its
+#: notehead or its beam, and a slur or a tie out there is a separate stroke with paper between it
+#: and the lines. This is how far, in staff spaces, the ink may continue past a line.
+STEM_OVERSHOOT_SPACES = 0.35
 #: Barline positions closer than this share of a staff space are one barline: a repeat or final
 #: bar is engraved as two strokes but separates one measure.
 BARLINE_CLUSTER = 1.2
@@ -118,13 +124,14 @@ def crossing_columns(raster: PageRaster, upper: Staff, lower: Staff, space: floa
 
 
 def group_barlines(raster: PageRaster, group: Group, space: float) -> list[float]:
-    """Barlines of a multi-staff group.
+    """Barline candidates of a group: thin columns that ink every staff and every gap between them.
 
     A barline inks every space row of every staff of the group and most of the gaps between them,
     and it is a *thin* vertical stroke. Chords at the same rhythmic position also ink whole staves,
     so the stroke width is what separates a barline from a chord column. Bars are sometimes broken
     inside a gap (a dynamic or a clef change is set there), which is why the gaps are held to a
-    lower coverage than the staves.
+    lower coverage than the staves. For a single-staff group the gap evidence is absent, so this
+    function keeps chord stems too; :func:`staff_barlines` is the entry point that rejects them.
     """
     total_height = int(np.ceil(group.bottom)) - int(np.floor(group.top)) + 1
     if total_height < 8:
@@ -157,6 +164,39 @@ def group_barlines(raster: PageRaster, group: Group, space: float) -> list[float
         if _thin_share(raster.ink, probe_rows, centre, limit) >= MIN_THIN_SHARE:
             columns.append(float(centre))
     return columns
+
+
+def staff_barlines(raster: PageRaster, staff: Staff, space: float) -> list[float]:
+    """Barlines of a single staff: thin columns across it whose ink stops at the staff lines.
+
+    A chord stem is the same thin column across the same rows, and a solo score has no second staff
+    to reject it with. The ends decide instead: a stem runs past the lines into a notehead or a
+    beam, while a barline stops on them, and a slur, a tie or a hairpin outside the staff is a
+    separate stroke with paper between it and the lines.
+    """
+    top = int(np.floor(staff.top))
+    bottom = int(np.ceil(staff.bottom))
+    limit = round(STEM_OVERSHOOT_SPACES * space)
+    return [
+        column
+        for column in group_barlines(raster, Group(staves=(staff,)), space)
+        if _overshoot(raster.ink, round(column), top, bottom) <= limit
+    ]
+
+
+def _overshoot(ink: np.ndarray, column: int, top: int, bottom: int) -> int:
+    """Rows the ink run through ``column`` reaches past the staff lines, above or below."""
+    row = (top + bottom) // 2
+    window = ink[:, max(0, column - 1) : column + 2]
+    if not window[row].any():
+        return 0
+    up = row
+    while up > 0 and window[up - 1].any():
+        up -= 1
+    down = row
+    while down + 1 < window.shape[0] and window[down + 1].any():
+        down += 1
+    return max(0, top - up, down - bottom)
 
 
 def _runs_bounds(mask: np.ndarray) -> list[tuple[int, int]]:
@@ -359,14 +399,22 @@ def group_systems(groups: list[Group], raster: PageRaster, space: float) -> list
     return systems
 
 
-def system_barlines(system: list[Group], space: float) -> list[float]:
-    """Barlines of a system, from its most complete multi-staff group."""
-    best: list[float] = []
-    for group in system:
-        if len(group.staves) < 2 or not group.barlines:
-            continue
-        if len(group.barlines) > len(best):
-            best = list(group.barlines)
+def system_barlines(raster: PageRaster, system: list[Group], space: float) -> list[float]:
+    """Barlines of a system: from its most complete multi-staff group, else from its single staff.
+
+    A multi-staff group is the authority even when it found nothing: its gaps are the evidence, and
+    substituting one staff's columns would trade a reported zero for invented measures.
+    """
+    groups = [group for group in system if len(group.staves) >= 2]
+    if groups:
+        best = max((list(group.barlines) for group in groups), key=len, default=[])
+    else:
+        best = []
+        for group in system:
+            for staff in group.staves:
+                found = staff_barlines(raster, staff, space)
+                if len(found) > len(best):
+                    best = found
     return _cluster(best, BARLINE_CLUSTER * space)
 
 
@@ -607,7 +655,7 @@ def system_boxes(
             bottom_limit,
             clear_threshold,
         )
-        barlines = system_barlines(system, space)
+        barlines = system_barlines(raster, system, space)
         edge = x0 + LEADING_EDGE_SPACES * space
         counted = tuple(barline for barline in barlines if barline > edge)
         geometries.append(
