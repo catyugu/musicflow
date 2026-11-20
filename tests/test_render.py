@@ -185,14 +185,13 @@ def _strip(work_dir: Path) -> FlowLayout:
 def test_flow_moves_the_strip_past_the_reading_line(tmp_path: Path) -> None:
     work = tmp_path / "work"
     work.mkdir()
-    score, route = _score()
+    _, route = _score()
     alignment = _alignment(route.total_q, 6.0)
     flow = _strip(work)
     spec = VideoSpec(width=640, height=360, fps=10)
     out = tmp_path / "flow.mp4"
 
     produced = render_flow(
-        score=score,
         route=route,
         alignment=alignment,
         flow=flow,
@@ -370,13 +369,12 @@ def test_switch_plan_falls_back_to_proportional_positions(
 def test_output_duration_matches_the_recording(tmp_path: Path) -> None:
     work = tmp_path / "work"
     work.mkdir()
-    score, route = _score()
+    _, route = _score()
     alignment = _alignment(route.total_q, 6.0)
     excerpt = _audio_excerpt(tmp_path, 6.0)
     out = tmp_path / "full.mp4"
 
     render_flow(
-        score=score,
         route=route,
         alignment=alignment,
         flow=_strip(work),
@@ -397,13 +395,12 @@ def test_output_duration_matches_the_recording(tmp_path: Path) -> None:
 def test_second_render_reuses_segments_and_frames_depend_only_on_time(tmp_path: Path) -> None:
     work = tmp_path / "work"
     work.mkdir()
-    score, route = _score()
+    _, route = _score()
     alignment = _alignment(route.total_q, 6.0)
     flow = _strip(work)
     spec = VideoSpec(width=640, height=360, fps=10)
     excerpt = _audio_excerpt(tmp_path, 6.0)
     arguments = {
-        "score": score,
         "route": route,
         "alignment": alignment,
         "flow": flow,
@@ -473,7 +470,7 @@ def test_segments_concatenate_without_losing_or_reordering_frames(tmp_path: Path
 def test_missing_tile_is_a_render_error(tmp_path: Path) -> None:
     work = tmp_path / "work"
     work.mkdir()
-    score, route = _score()
+    _, route = _score()
     flow = _strip(work)
     broken = FlowLayout(
         strip_width=flow.strip_width,
@@ -486,7 +483,6 @@ def test_missing_tile_is_a_render_error(tmp_path: Path) -> None:
     )
     with pytest.raises(RenderError, match="tile is missing"):
         render_flow(
-            score=score,
             route=route,
             alignment=_alignment(route.total_q, 6.0),
             flow=broken,
@@ -501,10 +497,9 @@ def test_missing_tile_is_a_render_error(tmp_path: Path) -> None:
 def test_missing_audio_is_an_input_error(tmp_path: Path) -> None:
     work = tmp_path / "work"
     work.mkdir()
-    score, route = _score()
+    _, route = _score()
     with pytest.raises(InputError, match="not found"):
         render_flow(
-            score=score,
             route=route,
             alignment=_alignment(route.total_q, 6.0),
             flow=_strip(work),
@@ -540,10 +535,9 @@ def test_unwritable_output_is_a_render_error(tmp_path: Path) -> None:
     work.mkdir()
     blocker = tmp_path / "blocker"
     blocker.write_text("not a directory", encoding="utf-8")
-    score, route = _score()
+    _, route = _score()
     with pytest.raises(RenderError, match="output path"):
         render_flow(
-            score=score,
             route=route,
             alignment=_alignment(route.total_q, 6.0),
             flow=_strip(work),

@@ -27,11 +27,10 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageDraw
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-
-from musicflow import pipeline, workdir
+from musicflow import pipeline, scorexml, workdir
 from musicflow.errors import MusicFlowError
 from musicflow.model import VideoSpec
+from musicflow.render.canvas import rgb
 
 SAMPLE_FRAMES = 6
 SHEET_WIDTH = 640
@@ -225,12 +224,11 @@ def evaluate(
     frames_dir.mkdir(parents=True, exist_ok=True)
     sampled: list[np.ndarray] = []
     span = min(result.video_seconds, result.expected_seconds)
-    background = (0xFA, 0xF8, 0xF1)
     for index in range(SAMPLE_FRAMES):
         seconds = span * (index + 0.5) / SAMPLE_FRAMES
         frame = sample_frame(video, seconds, frames_dir / f"{case_name}-{mode}-{index}.png")
         sampled.append(frame)
-        result.ink.append(ink_ratio(frame, background))
+        result.ink.append(ink_ratio(frame, rgb(spec.background)))
         if mode == "flow":
             result.line.append(line_contrast(frame, spec.line_x))
     result.sheet = str(
@@ -269,7 +267,7 @@ def main(argv: list[str] | None = None) -> int:
     for directory in cases:
         pdf, track, symbolic = pipeline.discover_case(directory)
         for mode in [part.strip() for part in args.modes.split(",") if part.strip()]:
-            if mode == "flow" and symbolic.suffix.lower() in (".mid", ".midi"):
+            if mode == "flow" and symbolic.suffix.lower() in scorexml.MIDI_SUFFIXES:
                 print(f"{directory.name:>7} {mode:<6} skipped: MIDI cannot drive flow")
                 continue
             print(f"{directory.name:>7} {mode:<6} rendering ...", flush=True)

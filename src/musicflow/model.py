@@ -12,7 +12,7 @@ Conventions used by every module:
   for page geometry, layout units for engraving geometry, video pixels for frame windows. Each
   structure documents which one it uses.
 * Note identifiers are ``mf-NNNNNN``: assigned in MusicXML document order to every ``<note>``
-  element, rests included, by :func:`musicflow.scorexml.inject_note_ids`.
+  element, rests included, by :func:`musicflow.scorexml.assign_note_ids`.
 """
 
 from __future__ import annotations
@@ -23,11 +23,7 @@ from typing import Any, Literal
 
 SymbolicProvider = Literal["musicxml", "midi"]
 RouteSource = Literal["written", "auto_repeats", "override"]
-AnchorKind = Literal["start", "onset", "dtw", "manual", "end"]
-
-
-def _rect_from_list(values: list[float]) -> Rect:
-    return Rect(*(float(v) for v in values))
+AnchorKind = Literal["start", "onset", "manual", "end"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,7 +61,7 @@ class Rect:
 
     @classmethod
     def from_list(cls, values: list[float]) -> Rect:
-        return _rect_from_list(values)
+        return Rect(*(float(v) for v in values))
 
 
 @dataclass(frozen=True, slots=True)
@@ -239,8 +235,8 @@ class PerformanceNote:
 class Route:
     """The performance route: which written measures are played, in which order.
 
-    Invariants: ``passes`` are contiguous and ordered; ``notes`` are ordered by ``onset_q`` and
-    each refers to an existing pass; ``total_q`` equals the last pass's end.
+    Invariants: ``passes`` are contiguous and ordered, ``notes`` are ordered by ``onset_q`` and each
+    sits on a pass they declare, and ``total_q`` equals the summed pass lengths.
     """
 
     passes: tuple[MeasurePass, ...]
@@ -252,11 +248,19 @@ class Route:
     def __post_init__(self) -> None:
         assert self.passes, "route has no measures"
         assert self.notes, "route has no notes"
-        onsets = [n.onset_q for n in self.notes]
-        assert onsets == sorted(onsets), "performance notes are not ordered by onset"
-        starts = [p.start_q for p in self.passes]
-        assert starts == sorted(starts), "performance measure passes are not ordered"
+        cursor = 0.0
+        declared: set[tuple[int, int]] = set()
+        for measure_pass in self.passes:
+            assert measure_pass.start_q == cursor, "performance measure passes are not contiguous"
+            cursor += measure_pass.length_q
+            declared.add((measure_pass.measure, measure_pass.pass_index))
+        assert self.total_q == cursor, "route total does not match its pass lengths"
         assert self.total_q > 0, "route has no duration"
+        onsets = [note.onset_q for note in self.notes]
+        assert onsets == sorted(onsets), "performance notes are not ordered by onset"
+        assert all((note.measure, note.pass_index) in declared for note in self.notes), (
+            "performance note is not on a declared measure pass"
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -548,7 +552,3 @@ class VideoSpec:
             "line_x_ratio": self.line_x_ratio,
             "line_width": self.line_width,
         }
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> VideoSpec:
-        return cls(**{k: data[k] for k in data if k in cls.__dataclass_fields__})

@@ -3,7 +3,9 @@
 The public entry point is :func:`detect_layout`. Each page is rasterised at
 :data:`musicflow.pdf.imaging.RENDER_DPI`, deskewed if needed, and reduced to staves, systems,
 barlines and measure counts; every coordinate is converted back to PDF points before it leaves this
-module, so downstream code never sees raster units.
+module, so downstream code never sees raster units. Joining staves into systems only applies to a
+score that prints more than one staff per system; a single-staff score gives each staff its own
+system.
 """
 
 from __future__ import annotations
@@ -16,6 +18,7 @@ from pathlib import Path
 
 from ..errors import AnalysisError
 from ..model import PageInfo, Rect, StaffLayout, System
+from ._text import _numbers
 from .debug import write_page_overlay, write_system_crops
 from .imaging import PageRaster, detect_staves, open_document, rasterise
 from .labels import printed_candidates
@@ -38,9 +41,10 @@ MAX_PRINTED_DRIFT = 8
 def detect_layout(pdf: Path, *, expected_staves: int | None, debug_dir: Path) -> StaffLayout:
     """Detect the staff systems of ``pdf`` and write diagnostic images into ``debug_dir``.
 
-    ``expected_staves`` is the staff count of the piece from its symbolic score; it is used as a
-    validation prior, not as a detection input. A systematic mismatch is reported in
-    :attr:`StaffLayout.unconfirmed` instead of being silently accepted.
+    ``expected_staves`` is the staff count of the piece from its symbolic score. ``1`` selects the
+    single-staff path, where each detected staff is its own system; any other value is used as a
+    validation prior only. A systematic mismatch is reported in :attr:`StaffLayout.unconfirmed`
+    instead of being silently accepted.
     """
     assert expected_staves is None or expected_staves >= 1, "expected_staves must be positive"
     started = time.perf_counter()
@@ -71,10 +75,11 @@ def detect_layout(pdf: Path, *, expected_staves: int | None, debug_dir: Path) ->
                     f"page {number}: ignored {detection.dropped_staves} horizontal candidate(s)"
                     " too short to belong to a system"
                 )
-            groups = brace_groups(raster, detection.staves, detection.space)
-            chains = _absorb_singletons(
-                group_systems(groups, raster, detection.space), detection.space
-            )
+            if expected_staves == 1:
+                chains = [[Group(staves=(staff,))] for staff in detection.staves]
+            else:
+                groups = brace_groups(raster, detection.staves, detection.space)
+                chains = _absorb_singletons(group_systems(groups, raster, detection.space))
             geometries = system_boxes(raster, chains, detection.space)
             labels = printed_candidates(document[number - 1], raster, geometries, detection.space)
             write_page_overlay(raster, geometries, debug_dir)
@@ -124,11 +129,6 @@ def detect_layout(pdf: Path, *, expected_staves: int | None, debug_dir: Path) ->
     return StaffLayout(pages=tuple(pages), systems=tuple(systems), unconfirmed=tuple(unconfirmed))
 
 
-def _numbers(values: list[int], limit: int = 8) -> str:
-    shown = ", ".join(str(value) for value in values[:limit])
-    return shown if len(values) <= limit else f"{shown}, ... ({len(values)} total)"
-
-
 def _assign_printed(
     systems: list[System], candidates: dict[int, list[int]]
 ) -> tuple[list[System], list[str]]:
@@ -173,8 +173,11 @@ def _assign_printed(
     return systems, notes
 
 
-def _absorb_singletons(systems: list[list[Group]], space: float) -> list[list[Group]]:
-    """Attach a lone staff to the nearer neighbour: a one-staff system is a grouping failure."""
+def _absorb_singletons(systems: list[list[Group]]) -> list[list[Group]]:
+    """Attach a lone staff to the nearer neighbour.
+
+    In a multi-staff score a one-staff system is a grouping failure.
+    """
     if len(systems) < 2:
         return systems
     result = [list(system) for system in systems]

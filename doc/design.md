@@ -24,7 +24,7 @@ SVG（`id="mf-000123"`）与 timemap 中，这是流动模式把"源音符 → �
 
 ## 二、数据结构
 
-全部位于 `musicflow/model.py`，都是冻结 dataclass，`to_dict()/from_dict()` 即 JSON 产物格式。
+全部位于 `musicflow/model.py`，都是冻结 dataclass；产物类型以 `to_dict()/from_dict()` 定义 JSON 产物格式，`VideoSpec` 是配置，只有 `to_dict()`。
 核心不变量写进了 `__post_init__` 的 `assert`：内部实现违约就是 bug，不当作数据错误处理。
 
 | 类型 | 语义 | 关键不变量 |
@@ -35,9 +35,9 @@ SVG（`id="mf-000123"`）与 timemap 中，这是流动模式把"源音符 → �
 | `Repeat` | 书面反复/跳转指令 | 小节号在谱面范围内 |
 | `NoteEvent` | 书写音符 | `duration_q > 0`、`pitch` 为 MIDI 音高 |
 | `Score` | 书写谱面 | 音符按 onset 有序、小节存在、`total_q` 为正 |
-| `MeasurePass` | 演奏中的一次小节出现 | 与 `Route` 一起检查有序、连续 |
+| `MeasurePass` | 演奏中的一次小节出现 | `start_q` 接续前序 pass 的长度累加 |
 | `PerformanceNote` | 演奏中的音符 | 按 onset 有序，回指 `note_id` 与 `pass_index` |
-| `Route` | 演奏路线 | pass 起点递增、`total_q` 为正 |
+| `Route` | 演奏路线 | `total_q` 为正且等于各 pass 长度之和，每个音符落在已声明的 `(measure, pass_index)` 上 |
 | `Anchor` / `Alignment` | 谱位-时间对应 | 两者都严格递增，至少两个锚点 |
 | `System` / `StaffLayout` | PDF 谱行 | `index` 从 1 连续编号，`page` 存在 |
 | `Tile` / `FlowLayout` | 排谱长条与瓦片 | 至少一个瓦片、至少一个小节区间 |
@@ -61,61 +61,28 @@ SVG（`id="mf-000123"`）与 timemap 中，这是流动模式把"源音符 → �
 | `flow` | `symbolic.written.musicxml` + 目标高度 | `FlowLayout` + 瓦片 PNG | 仅 MusicXML/MXL |
 | `render-switch` / `render-flow` | 上述 + `VideoSpec` | MP4 分块与成片 | 分块可续渲 |
 
-缓存键 = 输入文件 sha256 + 影响该步骤的参数 + 工具版本 + `pipeline.PIPELINE_VERSION`。**任何步骤的行为
-改变都必须递增 `PIPELINE_VERSION`**，否则旧产物会被当作仍然有效。`workdir.Step.run(key, compute)` 负责
-命中与落盘，步骤内部不判断缓存。
+缓存键 = 输入文件 sha256 + 每个上游产物 `payload.json` 内容的 hash + 影响该步骤的参数 + 工具版本 +
+`pipeline.PIPELINE_VERSION`。**任何步骤的行为改变都必须递增 `PIPELINE_VERSION`**，否则旧产物会被当作
+仍然有效。`workdir.Step.run(key, compute)` 负责命中与落盘，步骤内部不判断缓存。
 
 ## 四、模块接口
 
 包内每个模块都是库：不配置 logging、不 print、不读环境变量。唯一的入口是 `musicflow.cli`。
 
-```python
-# musicflow.symbolic
-def load_score(path: Path, *, written_path: Path | None = None) -> Score
-def build_route(score: Score, *, override: Path | None = None) -> Route
+| 模块 | 入口 | 语义 |
+| --- | --- | --- |
+| `symbolic` | `load_score` | 读 MusicXML / MXL / MIDI 为 `Score`，MXL 就地解包 |
+| `symbolic` | `build_route` | 按书面反复展开演奏顺序，override 文件优先 |
+| `pdf` | `detect_layout` | 以光栅检测谱行与谱表，同时写诊断位图 |
+| `pdf` | `bind_measures` | 把谱行绑定到小节范围，印刷小节号优先、小节线计数兜底 |
+| `align` | `align` | 产出谱位到录音时间的锚点与残差报告 |
+| `flow` | `build_layout` | 把书写谱排成一整条 system 并栅格化成瓦片 |
+| `render` | `render_switch` | 用原 PDF 位图按谱行切谱 |
+| `render` | `render_flow` | 把 `flow` 写下的瓦片沿阅读线平移 |
 
-# musicflow.pdf
-def detect_layout(pdf: Path, *, expected_staves: int | None, debug_dir: Path) -> StaffLayout
-def bind_measures(
-    layout: StaffLayout, score: Score, *, override: Path | None = None
-) -> StaffLayout
-
-# musicflow.align
-def align(
-    score: Score,
-    route: Route,
-    audio: Path,
-    *,
-    work_dir: Path,
-    constraints: Path | None = None,
-) -> Alignment
-
-# musicflow.flow
-def build_layout(
-    score: Score,
-    written_musicxml: Path,
-    *,
-    work_dir: Path,
-    target_content_height: int,
-    max_strip_width: float,
-) -> FlowLayout
-
-# musicflow.render
-def render_switch(
-    *, score: Score, route: Route, layout: StaffLayout, alignment: Alignment,
-    spec: VideoSpec, out: Path, work_dir: Path, preview: float | None,
-    pdf: Path, audio: Path,
-) -> Path
-def render_flow(
-    *, score: Score, route: Route, alignment: Alignment, flow: FlowLayout,
-    spec: VideoSpec, out: Path, work_dir: Path, preview: float | None,
-    pdf: Path, audio: Path,
-) -> Path
-```
-
-`preview` 是秒数（只渲前 N 秒），用于快速迭代；分块编码必须在 `work_dir` 里可续。`pdf` 是原 PDF 路径
-（`switch` 用它取谱面位图，`flow` 接受但不用），`audio` 是原录音路径：成片必须封装这条录音。两者都
-是显式输入，不能从别的字段推断（missing → `InputError`）。
+`preview` 是秒数（只渲前 N 秒），用于快速迭代；分块编码必须在 `work_dir` 里可续。`switch` 消费原 PDF
+位图与录音，`flow` 消费 `flow` 步骤写下的瓦片与录音、不读 PDF；两条路径都在调用处显式命名输入，不从
+别的字段推断（missing → `InputError`）。
 
 `flow` 的瓦片写在 `flow` 步骤目录，`Tile.path` 相对该目录；所以 `render_flow` 的 `work_dir` 就是
 `<workspace>/flow/`，分段也落在那里，而渲染步骤的缓存元数据留在 `<workspace>/render-flow/`。
@@ -141,7 +108,7 @@ def render_flow(
 ## 六、对齐与诚实边界
 
 - 对齐输出锚点序列，不是每个音符独立测时。锚点来源写进 `kind`：`start`、`onset`（局部音头证据）、
-  `dtw`（密集 DTW 路径）、`manual`（已审约束）、`end`。
+  `manual`（已审约束）、`end`。
 - 无法可靠确定的片段写进 `Alignment.unconfirmed`，并在报告里给出残差分布；禁止把低置信度结果当成
   成功静默输出。
 - 谱面与录音实质不符（音符数、段落、时长比例）时，`analyze` 必须在报告里列出，且不得自动改写谱面。
@@ -180,4 +147,4 @@ def render_flow(
 2. MIDI-only 的小节划分：按时间签名推断，若与 PDF 小节线数不符则按比例映射并标记 `unconfirmed`。MIDI
    若是"已展开反复"的演奏，其小节数与印刷谱不同（case3：453 对 314），这类输入无法恢复反复处的谱面
    回跳，`switch` 只能按比例推进，必须在报告里写明。
-3. 长条瓦片尺寸与 `max_strip_width` 上限（Verovio `pageWidth` 上限 100000）。
+3. 长条瓦片尺寸受内部常量 `MAX_STRIP_WIDTH`（Verovio `pageWidth` 上限 100000）约束，超出时降 scale 重排。

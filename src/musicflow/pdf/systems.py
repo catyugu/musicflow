@@ -45,8 +45,6 @@ STRONG_AGREEMENT = 0.75
 EXTENDED_GAP_HEIGHTS = 3.6
 #: A multi-staff group's barlines must agree with the system's barlines at least this well.
 MIN_BARLINE_AGREEMENT = 0.5
-#: A staff supports a set of barline columns when this share of them is covered full height.
-MIN_SUPPORT = 0.6
 #: Vertical and horizontal padding of a system box, in staff spaces.
 PAD_TOP_SPACES = 3.0
 PAD_BOTTOM_SPACES = 4.0
@@ -54,7 +52,6 @@ PAD_SIDE_SPACES = 1.5
 #: Whitespace, in staff spaces, that a system box may bridge while collecting its own ink: pedal
 #: marks and dynamics sit well below the last staff line.
 BOX_GAP_SPACES = 2.5
-MAX_SIDE_GROWTH_SPACES = 6.0
 #: A pixel darker than this share of the paper level is ink for crop clearance.
 PAPER_INK_SHARE = 0.35
 
@@ -100,21 +97,6 @@ class SystemGeometry:
     measure_count: int
 
 
-def _runs(mask: np.ndarray, offset: int, max_width: int) -> list[float]:
-    """Centres of the True runs in ``mask`` that are narrower than ``max_width``."""
-    groups: list[tuple[int, int]] = []
-    start: int | None = None
-    for index, value in enumerate(mask):
-        if value and start is None:
-            start = index
-        elif not value and start is not None:
-            groups.append((start, index - 1))
-            start = None
-    if start is not None:
-        groups.append((start, len(mask) - 1))
-    return [offset + (a + b) / 2 for a, b in groups if b - a + 1 <= max_width]
-
-
 def crossing_columns(raster: PageRaster, upper: Staff, lower: Staff, space: float) -> list[float]:
     """Barline columns that cover the gap between two staves."""
     top = int(np.ceil(upper.bottom)) + 2
@@ -127,7 +109,12 @@ def crossing_columns(raster: PageRaster, upper: Staff, lower: Staff, space: floa
         return []
     block = raster.ink[top : bottom + 1, x0 : x1 + 1]
     coverage = block.mean(axis=0)
-    return _runs(coverage >= CROSSING_COVERAGE, x0, max(6, round(1.2 * space)))
+    limit = max(6, round(1.2 * space))
+    return [
+        x0 + (start + stop) / 2
+        for start, stop in _runs_bounds(coverage >= CROSSING_COVERAGE)
+        if stop - start + 1 <= limit
+    ]
 
 
 def group_barlines(raster: PageRaster, group: Group, space: float) -> list[float]:
@@ -381,14 +368,6 @@ def system_barlines(system: list[Group], space: float) -> list[float]:
         if len(group.barlines) > len(best):
             best = list(group.barlines)
     return _cluster(best, BARLINE_CLUSTER * space)
-
-
-def measure_count(barlines: list[float], x0: float, space: float) -> int:
-    """Measures spanned by a system: every barline right of the system-start barline."""
-    if not barlines:
-        return 0
-    edge = x0 + LEADING_EDGE_SPACES * space
-    return sum(1 for barline in barlines if barline > edge)
 
 
 def _ink_profile(raster: PageRaster, x0: int, x1: int) -> np.ndarray:

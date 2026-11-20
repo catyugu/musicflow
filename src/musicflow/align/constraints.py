@@ -27,7 +27,6 @@ class Constraint:
 
     q: float
     seconds: float
-    tolerance: float | None = None
 
     def as_anchor(self) -> Anchor:
         return Anchor(q=self.q, seconds=self.seconds, kind="manual", confidence=1.0)
@@ -65,19 +64,13 @@ def _one(path: Path, row: Any) -> Constraint:
         if len(row) != 2:
             raise InputError(f"alignment constraints {path}: anchor {row!r} is not a pair")
         q, seconds = row
-        tolerance = None
     elif isinstance(row, dict):
         if "q" not in row or "seconds" not in row:
             raise InputError(f"alignment constraints {path}: anchor {row!r} needs q and seconds")
         q, seconds = row["q"], row["seconds"]
-        tolerance = row.get("tolerance")
-        if tolerance is not None:
-            tolerance = _number(path, tolerance, "tolerance")
     else:
         raise InputError(f"alignment constraints {path}: anchor {row!r} is not a pair")
-    return Constraint(
-        q=_number(path, q, "q"), seconds=_number(path, seconds, "seconds"), tolerance=tolerance
-    )
+    return Constraint(q=_number(path, q, "q"), seconds=_number(path, seconds, "seconds"))
 
 
 def _number(path: Path, value: Any, label: str) -> float:

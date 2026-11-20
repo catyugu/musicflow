@@ -148,7 +148,6 @@ class StaffDetection:
 
     staves: list[Staff] = field(default_factory=list)
     space: float = 0.0
-    lines: list[StaffLine] = field(default_factory=list)
     dropped_staves: int = 0
 
 
@@ -397,4 +396,4 @@ def detect_staves(raster: PageRaster) -> StaffDetection:
         ]
         dropped = len(staves) - len(kept)
         staves = kept
-    return StaffDetection(staves=staves, space=space, lines=lines, dropped_staves=dropped)
+    return StaffDetection(staves=staves, space=space, dropped_staves=dropped)

@@ -3,8 +3,8 @@
 Both axes are laid out so that the *expected* tempo is the main diagonal, which keeps the step set
 small: ``(1, 1)`` holds the current local tempo, ``(1, 2)`` lets the recording run faster than the
 score, ``(2, 1)`` slower. A corridor around a previous estimate (or around a global tempo
-hypothesis) keeps the cost matrix small; ``half_width=None`` means a full-width search with a free
-start and a free end, which is how the first stage finds leading silence.
+hypothesis) keeps the cost matrix small, and the free start and end of that corridor are how a
+stage finds leading silence.
 
 The inner loop is one Python iteration per score row over NumPy slices, so a 519 s recording on a
 48 000-row fine grid stays in the low seconds; no per-cell Python loop exists.
@@ -49,15 +49,6 @@ class TimeMap:
     def at(self, q: np.ndarray | float) -> np.ndarray:
         return np.interp(q, self.q, self.seconds)
 
-    def similarity_at(self, seconds: float, *, radius: float = 0.3) -> float:
-        """Mean aligned similarity within ``radius`` seconds of ``seconds``."""
-        low = int(np.searchsorted(self.seconds, seconds - radius, side="left"))
-        high = int(np.searchsorted(self.seconds, seconds + radius, side="right"))
-        if high <= low:
-            index = int(np.clip(np.searchsorted(self.seconds, seconds), 0, self.seconds.size - 1))
-            return float(self.similarity[index])
-        return float(self.similarity[low:high].mean())
-
 
 def _take(values: np.ndarray, delta: int) -> np.ndarray:
     """``out[k] = values[k + delta]``, with ``inf`` where that falls outside ``values``."""
@@ -82,20 +73,16 @@ def align_path(
     score: ScoreGrid,
     audio: AudioFeatures,
     *,
-    centre: np.ndarray | None = None,
-    half_width: int | None = None,
+    centre: np.ndarray,
+    half_width: int,
     weights: DtwWeights = DtwWeights(),
 ) -> TimeMap:
     """Best monotone path through the cost matrix, returned as a time map over ``score`` rows."""
     rows = score.cells
     frames = audio.frames
     assert frames >= 4, "audio is too short to align"
-    if half_width is None:
-        starts = np.zeros(rows, dtype=np.int64)
-        width = frames
-    else:
-        assert centre is not None and centre.size == rows, "banded search needs one centre per row"
-        starts, width = band(centre, half_width, frames)
+    assert centre.size == rows, "banded search needs one centre per row"
+    starts, width = band(centre, half_width, frames)
     offsets = np.arange(width, dtype=np.int64)
     score_chroma = score.chroma
     attack = score.attack
@@ -137,9 +124,7 @@ def align_path(
         previous_two, previous_two_start = previous, previous_start
         previous, previous_start = current, start
 
-    total = float(np.min(previous))
-    if not np.isfinite(total):
-        raise AssertionError("no feasible path through the alignment corridor")
+    assert np.isfinite(previous).any(), "no feasible path through the alignment corridor"
     return _trace(score, audio, starts, width, pointers, previous)
 
 

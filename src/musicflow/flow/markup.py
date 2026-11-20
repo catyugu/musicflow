@@ -23,8 +23,6 @@ from lxml import etree
 
 from ..errors import AnalysisError
 
-SVG_NAMESPACE = "http://www.w3.org/2000/svg"
-
 _TRANSFORM_FUNCTION = re.compile(r"(\w+)\s*\(([^)]*)\)")
 _NUMBER = re.compile(r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?")
 _ROOT_TAG = re.compile(r"<svg\b[^>]*>")

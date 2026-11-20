@@ -2,8 +2,8 @@
 
 The corpus is the acceptance target: case1 is a vector MuseScore export (3 staves per system),
 case2 a 96 dpi scan (2 staves in the piano-only systems, 3 elsewhere) and case3 a vector OpenScore
-quartet export (4 staves per system). Detection is cached per case because rasterising 23 pages is
-the expensive part.
+quartet export (4 staves per system). A generated single-staff page covers the solo-instrument path.
+Detection is cached per case because rasterising 23 pages is the expensive part.
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import pymupdf
 import pytest
 from conftest import Case
 from lxml import etree
@@ -31,7 +32,7 @@ from musicflow.model import (
     System,
 )
 from musicflow.pdf import bind_measures, detect_layout
-from musicflow.pdf.imaging import open_document, rasterise
+from musicflow.pdf.imaging import RENDER_DPI, open_document, rasterise
 
 EXPECTED_STAVES = {"case1": 3, "case2": 3, "case3": 4}
 EXPECTED_MEASURES = {"case1": 148, "case2": 82, "case3": 314}
@@ -270,6 +271,21 @@ def test_non_pdf_raises(tmp_path: Path) -> None:
     fake.write_text("this is not a PDF", encoding="utf-8")
     with pytest.raises(InputError):
         detect_layout(fake, expected_staves=3, debug_dir=tmp_path)
+
+
+def test_single_staff_systems_stay_separate(tmp_path: Path) -> None:
+    """A solo score prints one staff per system: two such systems must not become one."""
+    space = 14 * 72 / RENDER_DPI
+    pdf = tmp_path / "single-staff.pdf"
+    with pymupdf.open() as document:
+        page = document.new_page(width=595, height=842)
+        for top in (150.0, 150.0 + 12 * space):
+            for line in range(5):
+                y = top + line * space
+                page.draw_line((72, y), (523, y), color=(0, 0, 0), width=0.6)
+        document.save(str(pdf))
+    layout = detect_layout(pdf, expected_staves=1, debug_dir=tmp_path)
+    assert [len(system.staves) for system in layout.systems] == [1, 1]
 
 
 def synthetic_layout(counts: list[int], printed: list[int | None] | None = None) -> StaffLayout:

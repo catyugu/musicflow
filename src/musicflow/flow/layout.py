@@ -8,9 +8,8 @@ breaks disabled the strip is as wide as the music needs, not as wide as the page
 Two passes give the requested size. A cheap probe layout is rasterised to measure how
 tall the staff content is; the scale that makes that height hit
 ``target_content_height`` is then used for the delivery layout. A strip wider than
-``max_strip_width`` (or than Verovio's own 100000 page-width ceiling) is re-engraved at
-a smaller scale and reported as a warning, because the content height then misses the
-target.
+Verovio's own 100000 page-width ceiling is re-engraved at a smaller scale and reported
+as a warning, because the content height then misses the target.
 """
 
 from __future__ import annotations
@@ -144,7 +143,6 @@ def build_layout(
     *,
     work_dir: Path,
     target_content_height: int,
-    max_strip_width: float,
     paper: str = "#ffffff",
 ) -> FlowLayout:
     """Engrave ``written_musicxml`` into one strip and return its note/measure geometry.
@@ -161,7 +159,6 @@ def build_layout(
     if not written_musicxml.is_file():
         raise InputError(f"written MusicXML not found: {written_musicxml}")
     work_dir.mkdir(parents=True, exist_ok=True)
-    limit = min(float(max_strip_width), MAX_STRIP_WIDTH)
 
     probe = _engrave(written_musicxml, PROBE_SCALE)
     if probe.page_count > 1:
@@ -185,7 +182,7 @@ def build_layout(
         scale,
     )
 
-    engraving = _fit_width(written_musicxml, scale, limit)
+    engraving = _fit_width(written_musicxml, scale, MAX_STRIP_WIDTH)
     (work_dir / "strip.svg").write_text(engraving.document.markup, encoding="utf-8")
 
     wanted = {note.id for note in score.notes}

@@ -7,7 +7,9 @@
   score does not write down;
 * the written route of a MIDI score, whose measures are already inferred from time signatures and
   whose jumps were expanded by whatever produced the file;
-* the score's own repeat spans, expanded here.
+* the score's own repeat spans, expanded here. Those must be disjoint: the notation offers no way
+  to say which of two nested or overlapping spans a performance honours, so such a score raises
+  ``InputError`` and the recording has to be described with a ``--route`` override.
 
 D.C./D.S./Fine/Coda and segno/coda markers are reported as unconfirmed and never invented: an
 expanded jump needs the recording to confirm where it lands, which is the aligner's job. Lines the
@@ -20,6 +22,7 @@ import json
 import logging
 from collections import Counter
 from collections.abc import Sequence
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
@@ -28,7 +31,6 @@ from musicflow.model import (
     MeasurePass,
     NoteEvent,
     PerformanceNote,
-    Repeat,
     Route,
     RouteSource,
     Score,
@@ -51,8 +53,10 @@ def build_route(score: Score, *, override: Path | None = None) -> Route:
     """Lay ``score`` out in performance order.
 
     Without repeats and without ``override`` the route is the written order, one pass per measure.
-    With repeat spans it is their expansion; with ``override`` it is the measure order listed in
-    that JSON file, which is the manual escape hatch for a recording that follows its own route.
+    With repeat spans it is their expansion, which requires the spans to be disjoint: overlapping
+    ones are an ``InputError`` naming the spans, and such a recording needs ``override``. With
+    ``override`` the route is the measure order listed in that JSON file, which is the manual escape
+    hatch for a recording that follows its own route.
 
     Whatever the reader could not represent faithfully (``Score.unconfirmed``) is carried into
     ``Route.unconfirmed``, in front of what the route itself has to confess, so that it reaches the
@@ -75,7 +79,12 @@ def _written(score: Score) -> tuple[int, ...]:
 
 
 def _repeat_measures(score: Score) -> tuple[tuple[int, ...], tuple[str, ...]]:
-    """Measure order after expanding the score's repeat spans, plus what is left unconfirmed."""
+    """Measure order after expanding the score's repeat spans, plus what is left unconfirmed.
+
+    Only spans that repeat take part, and they must be pairwise disjoint: with two nested or
+    overlapping spans the expander cannot tell which one the performance honours, so such a score
+    raises ``InputError`` naming both spans and pointing at the ``--route`` override.
+    """
     unconfirmed = list(
         dict.fromkeys(
             _JUMP_NOTES[repeat.kind].format(measure=repeat.start_measure)
@@ -89,14 +98,15 @@ def _repeat_measures(score: Score) -> tuple[tuple[int, ...], tuple[str, ...]]:
     written = _written(score)
     if not spans:
         return written, tuple(unconfirmed)
-    jump_at: dict[int, Repeat] = {}
-    for span in sorted(spans, key=lambda repeat: (repeat.end_measure, -repeat.start_measure)):
-        if span.end_measure in jump_at:
-            unconfirmed.append(
-                f"repeats ending at measure {span.end_measure} disagree; the innermost one is used"
+    by_start = sorted(spans, key=lambda repeat: (repeat.start_measure, repeat.end_measure))
+    for span, following in pairwise(by_start):
+        if following.start_measure <= span.end_measure:
+            raise InputError(
+                f"repeat spans [{span.start_measure}, {span.end_measure}] and "
+                f"[{following.start_measure}, {following.end_measure}] overlap: nested and "
+                "overlapping repeats cannot be expanded; supply a --route override file"
             )
-            continue
-        jump_at[span.end_measure] = span
+    jump_at = {span.end_measure: span for span in spans}
     order: list[int] = []
     completed: Counter[int] = Counter()
     position = written[0]

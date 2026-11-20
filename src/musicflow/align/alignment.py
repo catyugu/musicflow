@@ -13,8 +13,8 @@ The evidence chain, from coarse to fine:
 
 Attacks are the only automated anchors because they are the only positions where the recording
 states a time directly. What cannot be measured is reported, never invented: :func:`_honesty`
-turns a weak similarity, a large residual, an implausible tempo, a thin snap coverage, heavy
-monotonicity repair or a length mismatch into a line of ``Alignment.unconfirmed``.
+turns a weak similarity, a large residual, an implausible tempo, a thin snap coverage or a length
+mismatch into a line of ``Alignment.unconfirmed``.
 """
 
 from __future__ import annotations
@@ -118,7 +118,7 @@ def align(
         method=METHOD,
         unconfirmed=(),
     )
-    numbers = _numbers(alignment, route, snapped, chain.fine, features, merge_stats)
+    numbers = _numbers(alignment, route, snapped, chain.fine, features)
     unconfirmed = _honesty(alignment, numbers, merge_stats, snaps=snapped)
     alignment = Alignment(
         anchors=anchors,
@@ -168,9 +168,9 @@ def _validate_route(score: Score, route: Route) -> None:
     """Cheap guard that the route really belongs to this score, before any expensive work.
 
     The pipeline caches every step separately, so a stale ``route`` payload can be paired with a
-    freshly loaded score. Every route note must name a written note of this score, and every
-    performance pass it uses must be one of its own passes; anything else means the two artifacts
-    describe different music and aligning them would produce a confident, wrong map.
+    freshly loaded score. Every route note must name a written note of this score with the same
+    pitch and measure; anything else means the two artifacts describe different music and aligning
+    them would produce a confident, wrong map.
     """
     known = score.note_by_id()
     unknown = [note.note_id for note in route.notes if note.note_id not in known]
@@ -192,15 +192,6 @@ def _validate_route(score: Score, route: Route) -> None:
             f"route but pitch {known[first.note_id].pitch} in measure "
             f"{known[first.note_id].measure} in the score); the cached route is stale"
         )
-    passes = {(item.measure, item.pass_index) for item in route.passes}
-    stray = [note for note in route.notes if (note.measure, note.pass_index) not in passes]
-    if stray:
-        raise AnalysisError(
-            f"the performance route has {len(stray)} note(s) on a measure pass it does not "
-            f"declare (first: measure {stray[0].measure}, pass {stray[0].pass_index})"
-        )
-    if route.total_q <= 0.0:
-        raise AnalysisError("the performance route has no duration to align")
 
 
 def _numbers(
@@ -209,7 +200,6 @@ def _numbers(
     snapped: Snapped,
     fine: TimeMap,
     features: AudioFeatures,
-    merge_stats: dict[str, int],
 ) -> _Numbers:
     residual = np.abs(snapped.residual[snapped.snapped]) * 1000.0
     if residual.size:
@@ -326,9 +316,7 @@ def _payload(
         "onset_lag_ms": round(numbers.onset_lag, 3),
         "length_ratio": round(numbers.length_ratio, 4),
         "dropped_anchors": merge_stats,
-        "reviewed_anchors": [
-            {"q": item.q, "seconds": item.seconds, "tolerance": item.tolerance} for item in manual
-        ],
+        "reviewed_anchors": [{"q": item.q, "seconds": item.seconds} for item in manual],
         "route_source": route.source,
         "route_passes": len(route.passes),
         "score_notes": len(route.notes),

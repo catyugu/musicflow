@@ -96,17 +96,21 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     print(f"librosa          {librosa.__version__}")
     print(f"partitura        {partitura.__version__}")
 
+    from . import pipeline, scorexml
+
     corpus = Path(args.corpus)
     if corpus.is_dir():
         cases = sorted(p.name for p in corpus.iterdir() if p.is_dir())
         print(f"corpus           {corpus} ({', '.join(cases) or 'no cases'})")
+        requirements = (
+            ("PDF", (".pdf",)),
+            ("recording", pipeline.AUDIO_SUFFIXES),
+            ("symbolic", scorexml.MUSICXML_SUFFIXES + scorexml.MIDI_SUFFIXES),
+        )
         for case in cases:
             directory = corpus / case
-            missing = [
-                suffix
-                for suffix in (".pdf", ".mp3", ".mid", ".musicxml", ".mxl")
-                if not any(directory.glob(f"*{suffix}"))
-            ]
+            found = {path.suffix.lower() for path in directory.iterdir() if path.is_file()}
+            missing = [label for label, suffixes in requirements if found.isdisjoint(suffixes)]
             if missing:
                 print(f"  {case}: missing {', '.join(missing)}")
     else:
@@ -166,7 +170,7 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
     analysis = pipeline.analyze(inputs, workspace, spec=spec, with_flow=args.with_flow)
     payload = pipeline.summary_payload(inputs, analysis)
     report_path = workspace.root / "analysis.json"
-    pipeline.write_summary(report_path, payload)
+    workdir.write_json(report_path, payload)
     if args.json:
         print(json.dumps(payload, ensure_ascii=False, indent=1))
     else:

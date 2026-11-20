@@ -64,7 +64,6 @@ class Snapped:
     confidence: np.ndarray
     residual: np.ndarray
     relocated: int = 0
-    repaired: int = 0
 
     @property
     def coverage(self) -> float:
@@ -316,12 +315,10 @@ def _repair(result: Snapped) -> Snapped:
     snapped = result.snapped.copy()
     confidence = result.confidence.copy()
     residual = np.where(result.snapped, result.residual, 0.0)
-    repaired = 0
     for index in range(1, times.size):
         floor = times[index - 1] + MIN_GAP
         if times[index] > floor:
             continue
-        repaired += 1
         snapped[index] = False
         residual[index] = 0.0
         if result.seeds[index] > floor:
@@ -338,5 +335,4 @@ def _repair(result: Snapped) -> Snapped:
         confidence=confidence,
         residual=residual,
         relocated=result.relocated,
-        repaired=repaired,
     )

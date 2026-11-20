@@ -21,6 +21,7 @@ from typing import Any
 
 from ..errors import InputError
 from ..model import Score, StaffLayout
+from ._text import _numbers
 
 logger = logging.getLogger(__name__)
 
@@ -40,9 +41,8 @@ def bind_measures(
     count = len(measures)
     indexes = [measure.index for measure in measures]
     first_index = indexes[0]
-    indexes[-1]
     unconfirmed = list(layout.unconfirmed)
-    positions, notes = _bind_by_printed_measures(layout, first_index, count, indexes)
+    positions, notes = _bind_by_printed_measures(layout, first_index, indexes)
     unconfirmed.extend(notes)
     if positions is None:
         positions = _bind_by_barlines(layout, count)
@@ -83,7 +83,7 @@ def bind_measures(
 
 
 def _bind_by_printed_measures(
-    layout: StaffLayout, first_index: int, count: int, indexes: list[int]
+    layout: StaffLayout, first_index: int, indexes: list[int]
 ) -> tuple[list[tuple[int, int]] | None, list[str]]:
     """Bind from the engraved measure numbers, cross-checked against the barline counts."""
     systems = layout.systems
@@ -209,8 +209,3 @@ def _as_int(path: Path, value: Any) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise InputError(f"{path}: measure override values must be integers, got {value!r}")
     return int(value)
-
-
-def _numbers(values: list[int], limit: int = 8) -> str:
-    shown = ", ".join(str(value) for value in values[:limit])
-    return shown if len(values) <= limit else f"{shown}, ... ({len(values)} total)"

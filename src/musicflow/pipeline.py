@@ -11,7 +11,6 @@ input-validation paths must not pay for a stage they never run.
 
 from __future__ import annotations
 
-import json
 import logging
 import time
 from collections.abc import Iterable
@@ -21,7 +20,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from . import audio, scorexml, workdir
-from .errors import InputError, UnsupportedInputError, UsageError
+from .errors import InputError, UnsupportedInputError
 from .model import Alignment, FlowLayout, Route, Score, StaffLayout, VideoSpec
 
 logger = logging.getLogger(__name__)
@@ -29,7 +28,7 @@ logger = logging.getLogger(__name__)
 Mode = Literal["switch", "flow"]
 # Bump when a stage's behaviour changes: every cache key includes it, so stale artifacts from an
 # older algorithm can never be mistaken for current output.
-PIPELINE_VERSION = 3
+PIPELINE_VERSION = 4
 
 AUDIO_SUFFIXES = (".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".opus", ".wma")
 
@@ -84,7 +83,6 @@ class Analysis:
     layout: StaffLayout
     alignment: Alignment
     audio_duration: float
-    written: Path | None
     flow: FlowLayout | None
     align_report: dict[str, Any]
 
@@ -187,7 +185,7 @@ def _bound_step(
         files,
         {
             "layout": workdir.hash_payload(layout.to_dict()),
-            "score": score.to_dict(),
+            "score": workdir.hash_payload(score.to_dict()),
             **_tool_versions(),
         },
     )
@@ -209,7 +207,11 @@ def _align_step(
     if inputs.anchors is not None:
         files["anchors"] = inputs.anchors
     key = workdir.fingerprint(
-        files, {"route_q": round(route.total_q, 6), **_tool_versions("librosa", "numpy")}
+        files,
+        {
+            "route": workdir.hash_payload(route.to_dict()),
+            **_tool_versions("librosa", "numpy"),
+        },
     )
 
     def compute(path: Path) -> dict[str, Any]:
@@ -224,9 +226,7 @@ def _align_step(
 
     alignment = Alignment.from_dict(step.run(key, compute))
     report_path = step.path / "report.json"
-    report: dict[str, Any] = {}
-    if report_path.is_file():
-        report = workdir.read_json(report_path)
+    report: dict[str, Any] = workdir.read_json(report_path) if report_path.is_file() else {}
     logger.info(
         "align: %s, %d anchors, audio %.1f s",
         alignment.method,
@@ -243,14 +243,15 @@ def _flow_step(
     spec: VideoSpec,
 ) -> FlowLayout:
     from . import flow
+    from .render.flow import CONTENT_HEIGHT_RATIO
 
     step = workspace.step("flow")
-    target_height = int(spec.height * 0.86)
+    target_height = int(spec.height * CONTENT_HEIGHT_RATIO)
     key = workdir.fingerprint(
         {"written": written},
         {
             "target_content_height": target_height,
-            "max_strip_width": 100000.0,
+            "score": workdir.hash_payload(score.to_dict()),
             "paper": spec.background,
             **_tool_versions("verovio", "resvg-py"),
         },
@@ -262,7 +263,6 @@ def _flow_step(
             written,
             work_dir=path,
             target_content_height=target_height,
-            max_strip_width=100000.0,
             paper=spec.background,
         ).to_dict()
 
@@ -305,7 +305,6 @@ def analyze(
         layout=layout,
         alignment=alignment,
         audio_duration=audio_info.duration,
-        written=written,
         flow=flow_layout,
         align_report=report,
     )
@@ -323,17 +322,13 @@ def write_provenance(
     asks for ("save the input fingerprints and the reviewed evidence"), and it is what makes a
     delivered video traceable back to its materials.
     """
-    files = {
-        "pdf": inputs.pdf,
-        "audio": inputs.audio,
-        "symbolic": inputs.symbolic,
-    }
-    if inputs.route_override is not None:
-        files["route_override"] = inputs.route_override
-    if inputs.anchors is not None:
-        files["anchors"] = inputs.anchors
-    if inputs.staff_override is not None:
-        files["staff_override"] = inputs.staff_override
+    files = {"pdf": inputs.pdf, "audio": inputs.audio, "symbolic": inputs.symbolic}
+    optional = (
+        ("route_override", inputs.route_override),
+        ("anchors", inputs.anchors),
+        ("staff_override", inputs.staff_override),
+    )
+    files |= {name: path for name, path in optional if path is not None}
     payload = {
         "inputs": {
             name: {
@@ -381,8 +376,7 @@ def render(
     """Render one video and return its path."""
     from . import render as renderer
 
-    if mode not in ("switch", "flow"):
-        raise UsageError(f"unknown mode: {mode}")
+    assert mode in ("switch", "flow")
     analysis = analyze(inputs, workspace, spec=spec, with_flow=mode == "flow")
     step = workspace.step(f"render-{mode}")
     out = out if out.is_absolute() else Path.cwd() / out
@@ -393,6 +387,7 @@ def render(
             "out": str(out),
             "spec": spec.to_dict(),
             "preview": preview,
+            "route": workdir.hash_payload(analysis.route.to_dict()),
             "alignment": analysis.alignment.to_dict(),
             "layout": analysis.layout.to_dict(),
             "flow": analysis.flow.to_dict() if analysis.flow else None,
@@ -424,7 +419,6 @@ def render(
         # Tile paths in FlowLayout are relative to the flow step directory, where the engraver
         # wrote them, so the renderer works there; its cache metadata stays in this step.
         produced = renderer.render_flow(
-            score=analysis.score,
             route=analysis.route,
             alignment=analysis.alignment,
             flow=analysis.flow,
@@ -439,6 +433,17 @@ def render(
     return produced
 
 
+def _first(directory: Path, suffixes: Iterable[tuple[str, ...]], label: str) -> Path:
+    """First file of ``directory`` by name, within the earliest suffix group that has any."""
+    for group in suffixes:
+        candidates = sorted(
+            path for path in directory.iterdir() if path.is_file() and path.suffix.lower() in group
+        )
+        if candidates:
+            return candidates[0]
+    raise InputError(f"{directory.name}: no {label} found")
+
+
 def discover_case(directory: Path) -> tuple[Path, Path, Path]:
     """Find the PDF, recording and symbolic score of one corpus case directory.
 
@@ -446,30 +451,12 @@ def discover_case(directory: Path) -> tuple[Path, Path, Path]:
     once (the test corpus does) must be driven by the richest source, because only MusicXML carries
     the engraving semantics that ``flow`` needs. MIDI is the last resort.
     """
-    order = ((".musicxml", ".xml"), (".mxl",), (".mid", ".midi"))
-    for suffixes in order:
-        candidates = sorted(
-            path
-            for path in directory.iterdir()
-            if path.is_file() and path.suffix.lower() in suffixes
-        )
-        if candidates:
-            symbolic = candidates[0]
-            break
-    else:
-        raise InputError(f"{directory.name}: no symbolic score found")
-
-    def one(suffixes: Iterable[str], label: str) -> Path:
-        candidates = sorted(
-            path
-            for path in directory.iterdir()
-            if path.is_file() and path.suffix.lower() in suffixes
-        )
-        if not candidates:
-            raise InputError(f"{directory.name}: no {label} found")
-        return candidates[0]
-
-    return one((".pdf",), "PDF score"), one(AUDIO_SUFFIXES, "recording"), symbolic
+    symbolic = (scorexml.MUSICXML_SUFFIXES, scorexml.MIDI_SUFFIXES)
+    return (
+        _first(directory, ((".pdf",),), "PDF score"),
+        _first(directory, (AUDIO_SUFFIXES,), "recording"),
+        _first(directory, symbolic, "symbolic score"),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -567,6 +554,12 @@ def batch(
     return skipped + records
 
 
+def _implied_bpm(analysis: Analysis) -> float:
+    if analysis.audio_duration <= 0:
+        return 0.0
+    return 60.0 * analysis.route.total_q / analysis.audio_duration
+
+
 def checks(analysis: Analysis) -> list[dict[str, Any]]:
     """Cross-check the artifacts against each other: the diagnostics of doc/PLAN.md 二.5.
 
@@ -575,11 +568,14 @@ def checks(analysis: Analysis) -> list[dict[str, Any]]:
     the tempo the recording implies for the route, the number of engraved notes the flow layout
     resolved, and whether the aligner can stand behind its map.
     """
+    from .pdf.detect import MIN_MATCHING_SHARE
+
     systems = analysis.layout.systems
     expected_staves = analysis.score.staff_count
     # Printed scores drop staves that stay empty (a vocal line during a piano interlude), so fewer
     # staves than the score declares is normal; more staves than the piece has is a detection error.
-    plausible = sum(1 for system in systems if 2 <= len(system.staves) <= expected_staves)
+    floor = min(2, expected_staves)
+    plausible = sum(1 for system in systems if floor <= len(system.staves) <= expected_staves)
     overfull = [system.index for system in systems if len(system.staves) > expected_staves]
     staff_ratio = plausible / len(systems) if systems else 0.0
     partial = sum(1 for system in systems if len(system.staves) < expected_staves)
@@ -590,19 +586,15 @@ def checks(analysis: Analysis) -> list[dict[str, Any]]:
         2, round(0.02 * score_measures)
     )
 
-    implied_bpm = (
-        60.0 * analysis.route.total_q / analysis.audio_duration
-        if analysis.audio_duration > 0
-        else 0.0
-    )
+    implied_bpm = _implied_bpm(analysis)
 
     results = [
         {
             "name": "staffs_per_system",
-            "ok": staff_ratio >= 0.85 and not overfull,
+            "ok": staff_ratio >= MIN_MATCHING_SHARE and not overfull,
             "detail": (
-                f"{plausible}/{len(systems)} printed systems carry 2..{expected_staves} staves "
-                f"({partial} have fewer, which is normal when a staff stays empty); "
+                f"{plausible}/{len(systems)} printed systems carry {floor}..{expected_staves} "
+                f"staves ({partial} have fewer, which is normal when a staff stays empty); "
                 f"overfull systems: {overfull or 'none'}"
             ),
         },
@@ -644,12 +636,6 @@ def checks(analysis: Analysis) -> list[dict[str, Any]]:
 
 def summary_payload(inputs: Inputs, analysis: Analysis) -> dict[str, Any]:
     """Compact, JSON-serialisable description of an analysis, for ``musicflow analyze --json``."""
-    report = analysis.align_report
-    implied_bpm = (
-        60.0 * analysis.route.total_q / analysis.audio_duration
-        if analysis.audio_duration > 0
-        else 0.0
-    )
     return {
         "pdf": str(inputs.pdf),
         "audio": str(inputs.audio),
@@ -674,8 +660,8 @@ def summary_payload(inputs: Inputs, analysis: Analysis) -> dict[str, Any]:
         "alignment_method": analysis.alignment.method,
         "anchors": len(analysis.alignment.anchors),
         "audio_duration": round(analysis.audio_duration, 3),
-        "implied_bpm": round(implied_bpm, 2),
-        "align_report": report,
+        "implied_bpm": round(_implied_bpm(analysis), 2),
+        "align_report": analysis.align_report,
         "checks": checks(analysis),
         "flow": None
         if analysis.flow is None
@@ -685,8 +671,3 @@ def summary_payload(inputs: Inputs, analysis: Analysis) -> dict[str, Any]:
             "scale": analysis.flow.scale,
         },
     }
-
-
-def write_summary(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")

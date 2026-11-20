@@ -275,7 +275,7 @@ def test_manual_constraints_are_honoured(tmp_path: Path) -> None:
     ]
     path = tmp_path / "anchors.json"
     path.write_text(
-        json.dumps({"anchors": [{"q": q, "seconds": s, "tolerance": 0.02} for q, s in pins]}),
+        json.dumps({"anchors": [{"q": q, "seconds": s} for q, s in pins]}),
         encoding="utf-8",
     )
     alignment = align(score, route, audio, work_dir=tmp_path / "pinned", constraints=path)

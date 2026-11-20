@@ -15,7 +15,7 @@ import numpy as np
 from PIL import Image
 
 from ..errors import RenderError
-from ..model import Alignment, FlowLayout, Route, Score, VideoSpec
+from ..model import Alignment, FlowLayout, Route, VideoSpec
 from .camera import CameraTrack
 from .canvas import blank, draw_reading_line, file_signature, paste, rgb
 from .encoder import FrameSource, encode
@@ -101,7 +101,6 @@ def _frame_source(
 
 def render_flow(
     *,
-    score: Score,
     route: Route,
     alignment: Alignment,
     flow: FlowLayout,
@@ -110,14 +109,8 @@ def render_flow(
     work_dir: Path,
     preview: float | None,
     audio: Path,
-    pdf: Path | None = None,
 ) -> Path:
-    """Render the continuous-flow view and return the MP4 path.
-
-    ``score`` and ``pdf`` are part of the shared renderer signature; flow composes from the already
-    engraved strip, so neither is read here.
-    """
-    del score, pdf
+    """Render the continuous-flow view and return the MP4 path."""
     tiles = StripTiles(flow.tiles, work_dir)
     track = plan_camera(route=route, flow=flow, alignment=alignment)
     frame_at = _frame_source(track=track, tiles=tiles, flow=flow, spec=spec)

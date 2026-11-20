@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -83,6 +84,38 @@ def test_payload_hash_is_order_independent() -> None:
         {"b": [1, 2], "a": 1}
     )
     assert workdir.hash_payload({"a": 1}) != workdir.hash_payload({"a": 2})
+
+
+def test_align_step_keys_on_the_whole_route(
+    case, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A route of the same length but a different measure order is different music."""
+    symbolic = pytest.importorskip("musicflow.symbolic")
+    score = symbolic.load_score(case.musicxml)
+    route = symbolic.build_route(score)
+    calls: list[model.Route] = []
+
+    def fake(score, route, audio, *, work_dir, constraints=None):
+        calls.append(route)
+        anchors = (model.Anchor(0.0, 0.0, "start"), model.Anchor(route.total_q, 10.0, "end"))
+        return model.Alignment(anchors, 10.0, "fake")
+
+    monkeypatch.setattr("musicflow.align.align", fake)
+    passes, notes, cursor = [], [], 0.0
+    for old in reversed(route.passes):
+        passes.append(model.MeasurePass(old.measure, old.pass_index, cursor, old.length_q))
+        notes += [
+            replace(n, onset_q=n.onset_q + cursor - old.start_q)
+            for n in route.notes
+            if (n.measure, n.pass_index) == (old.measure, old.pass_index)
+        ]
+        cursor += old.length_q
+    reversed_route = model.Route(tuple(passes), tuple(notes), route.total_q, route.source)
+
+    workspace = workdir.Workspace(tmp_path / "work")
+    pipeline._align_step(_inputs(case), score, route, workspace)
+    pipeline._align_step(_inputs(case), score, reversed_route, workspace)
+    assert len(calls) == 2, "the second route was served the first route's cached alignment"
 
 
 def test_model_artifacts_round_trip() -> None:
@@ -318,7 +351,6 @@ def test_summary_payload_is_json_serialisable(case) -> None:
         layout=layout,
         alignment=alignment,
         audio_duration=10.0,
-        written=None,
         flow=None,
         align_report={},
     )

@@ -82,7 +82,6 @@ def built(case, tmp_path_factory: pytest.TempPathFactory) -> Built:
         written,
         work_dir=work_dir,
         target_content_height=TARGET_CONTENT_HEIGHT,
-        max_strip_width=MAX_STRIP_WIDTH,
     )
     elapsed = time.perf_counter() - started
     result = Built(layout=layout, score=score, work_dir=work_dir, elapsed=elapsed)

@@ -24,7 +24,7 @@ from typing import Any
 import numpy as np
 
 from ..audio import probe as probe_audio
-from ..errors import InputError, MissingToolError, RenderError
+from ..errors import MissingToolError, RenderError
 from ..model import VideoSpec
 from .canvas import parameters_digest
 
@@ -369,8 +369,8 @@ def _duration_of(path: Path, ffprobe: str) -> float:
         ]
     )
     if result.returncode != 0:
-        raise InputError(f"cannot read the duration of {path}: {_tail(result.stderr)}")
+        raise RenderError(f"cannot read the duration of {path}: {_tail(result.stderr)}")
     try:
         return float(result.stdout.strip())
     except ValueError:
-        raise InputError(f"cannot read the duration of {path}") from None
+        raise RenderError(f"cannot read the duration of {path}") from None

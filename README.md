@@ -93,8 +93,9 @@ build/<stem>/
   staffs/                  detected systems + debug/page-*.png overlays
   staffs-bound/            system to measure-range binding
   align/                   anchors, report.json, alignment.png
-  flow/                    strip.svg, tiles/strip-*.png, overview.png (flow mode only)
+  flow/                    strip.svg, tiles/strip-*.png, overview.png and the flow MP4 segments
   render-switch/           page rasters, MP4 segments
+  render-flow/             flow cache metadata; the segments are written to flow/
 ```
 
 Exit codes: `0` success, `1` a `batch` case failed, `2` bad command line, `3` bad input, `4` input
@@ -160,6 +161,9 @@ doc/                requirements (PLAN.md), corpus notes (TEST_DATA.md), design 
   and the alignment's own confidence. Note-level differences (clefs, articulations) are not detected
   automatically.
 - A 96 dpi scan (case2) is rasterised beyond its resolution for `switch`; it is legible, not sharp.
+- Detection keeps one system per staff for a single-staff score, but barline-based measure counting
+  only runs inside multi-staff systems: a scanned solo score cannot bind measures and `switch` falls
+  back to proportional system timing (a vector solo score binds through its printed measure numbers).
 - A printed score drops staves that stay empty, so a system may legally carry fewer staves than the
   score declares; detection reports the counts instead of forcing a match.
 - `doc/ACCEPTANCE.md` lists the remaining differences between the printed score and the symbolic

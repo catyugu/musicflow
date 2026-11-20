@@ -479,6 +479,23 @@ def test_unmatched_forward_repeat_is_reported(tmp_path):
     assert route.unconfirmed == score.unconfirmed
 
 
+def test_nested_repeat_spans_are_an_input_error_and_disjoint_ones_expand(tmp_path):
+    score = load_score(_synthetic(tmp_path / "repeats.musicxml", {}))
+    nested = replace(
+        score, repeats=(Repeat("repeat_span", 1, 4, 2), Repeat("repeat_span", 2, 3, 2))
+    )
+    with pytest.raises(InputError) as raised:
+        build_route(nested)
+    assert "spans [1, 4] and [2, 3] overlap" in str(raised.value)
+    assert "--route" in str(raised.value)
+    disjoint = replace(
+        score, repeats=(Repeat("repeat_span", 1, 2, 2), Repeat("repeat_span", 3, 4, 2))
+    )
+    route = build_route(disjoint)
+    assert [measure_pass.measure for measure_pass in route.passes] == [1, 2, 1, 2, 3, 4, 3, 4]
+    assert [measure_pass.pass_index for measure_pass in route.passes] == [1, 1, 2, 2, 1, 1, 2, 2]
+
+
 def test_override_keeps_the_reader_caveats(tmp_path):
     score = load_score(
         _synthetic(
