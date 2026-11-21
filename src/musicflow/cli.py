@@ -1,8 +1,4 @@
-"""Command line entry point.
-
-This is the only place that configures logging and the only place that writes to stdout/stderr;
-library modules emit log records and return values.
-"""
+"""Parse commands and present results."""
 
 from __future__ import annotations
 
@@ -77,13 +73,11 @@ def _print_report(report: dict) -> None:
     """The human summary of one run, from the merged report."""
     score, route = report["score"], report["route"]
     layout, alignment, flow = report["layout"], report["alignment"], report["flow"]
-    notes = f"{score['written_notes']} written, {route['notes']} performed ({route['source']})"
-    audio = f"{alignment['audio_duration']:.2f} s, route {route['total_q']:.1f} quarter notes"
-    print(f"parts            {len(score['parts'])} ({score['measures']} measures)")
-    print(f"notes            {notes}")
-    print(f"systems          {'not detected' if layout is None else layout['systems']}")
-    print(f"anchors          {alignment['anchors']} ({alignment['method']})")
-    print(f"audio            {audio}")
+    print(f"score            {score['parts']} parts, {score['measures']} measures")
+    print(f"route            {route['notes']} notes ({route['source']})")
+    print(f"audio            {alignment['audio_duration']:.2f} s, {alignment['anchors']} anchors")
+    if layout:
+        print(f"systems          {layout['systems']}")
     for name in ("score", "route", "layout", "alignment"):
         for line in (report[name] or {}).get("unconfirmed", []):
             print(f"unconfirmed      {name}: {line}")
@@ -114,7 +108,7 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
         print(json.dumps(report, ensure_ascii=False, indent=1))
     else:
         _print_report(report)
-    print(f"report           {report_path}")
+        print(f"report           {report_path}")
     return EXIT_OK
 
 
@@ -143,10 +137,9 @@ def _cmd_render(args: argparse.Namespace) -> int:
 def _cmd_batch(args: argparse.Namespace) -> int:
     from . import pipeline
 
-    modes = [part.strip() for part in args.modes.split(",") if part.strip()]
-    for mode in modes:
-        if mode not in ("switch", "flow"):
-            raise UsageError(f"unknown mode in --modes: {mode}")
+    modes = tuple(dict.fromkeys(part.strip() for part in args.modes.split(",") if part.strip()))
+    if not modes or set(modes) - {"switch", "flow"}:
+        raise UsageError("--modes expects switch, flow or switch,flow")
     records = pipeline.batch(
         Path(args.corpus),
         Path(args.out),

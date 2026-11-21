@@ -235,6 +235,15 @@ class Alignment(Struct, frozen=True, forbid_unknown_fields=True):
         )
 
 
+class AlignmentEvidence(Struct, frozen=True, forbid_unknown_fields=True):
+    similarity_mean: float
+    residual_ms: dict[str, float]
+    onset_lag_ms: float
+    coverage: float
+    implied_bpm: float
+    length_ratio: float
+
+
 class PageInfo(Struct, frozen=True, forbid_unknown_fields=True):
     number: int
     width: float

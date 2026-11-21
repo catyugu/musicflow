@@ -1,10 +1,4 @@
-"""Recording access through ffmpeg.
-
-The recording is the master clock, so every module that needs samples or a duration goes through
-this module. Decoding uses ffmpeg rather than a Python container library: ffmpeg is a declared
-requirement anyway (it also muxes the MP4) and it decodes every format the corpus and users may
-bring without adding codec wheels.
-"""
+"""Decode the recording through FFmpeg."""
 
 from __future__ import annotations
 

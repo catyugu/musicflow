@@ -1,8 +1,4 @@
-"""Continuous flow: one engraved strip moved past a fixed reading line.
-
-The strip tiles are already sized for the video. Each frame copies the visible window
-so the camera position sits on the reading line.
-"""
+"""Read target-resolution tiles under a fixed reading line."""
 
 from __future__ import annotations
 

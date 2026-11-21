@@ -1,11 +1,4 @@
-"""Engrave the written score as one continuous system and map notes to strip positions.
-
-The flow display mode pans along a single system, so the whole movement has to become
-one Verovio page: ``breaks: none``, no header, no footer, no staff condensing. The page
-width is fixed at its ceiling so the engraver never introduces breaks of its own; with
-breaks disabled the strip is as wide as the music needs.
-The rasteriser scales the SVG to the requested content height.
-"""
+"""Engrave a single system and locate notes in output pixels."""
 
 from __future__ import annotations
 
@@ -112,7 +105,6 @@ def build_layout(
     work_dir.mkdir(parents=True, exist_ok=True)
 
     document = _engrave(written_musicxml)
-    (work_dir / "strip.svg").write_text(document.markup, encoding="utf-8")
 
     wanted = {note.id for note in score.notes}
     positions = document.note_x(wanted)
@@ -120,16 +112,8 @@ def build_layout(
         raise AnalysisError(
             f"none of the {len(wanted)} score notes has a position in the engraving"
         )
-    missing = sorted(wanted - positions.keys())
-    if missing:
-        listing = work_dir / "missing_ids.txt"
-        listing.write_text("\n".join(missing) + "\n", encoding="utf-8")
-        logger.warning(
-            "flow: %d of %d note ids have no engraved position (listed in %s)",
-            len(missing),
-            len(wanted),
-            listing,
-        )
+    if missing := len(wanted) - len(positions):
+        logger.warning("flow: %d of %d note ids have no engraved position", missing, len(wanted))
 
     tiles, content, scale = write_tiles(
         document, work_dir=work_dir, target_height=target_content_height, paper=paper

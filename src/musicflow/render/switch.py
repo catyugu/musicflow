@@ -1,10 +1,4 @@
-"""Fixed-staff switching: the original PDF page, cut at the system being played.
-
-The frame content is the page as engraved: a raster of the page at the DPI the crop needs, the
-system's bounding box plus a small margin, scaled to 0.9 of the frame height and centred on the
-paper colour. Nothing is re-engraved, filtered or highlighted, and switch mode draws no reading
-line (design.md section 五).
-"""
+"""Show the current system cropped from the original PDF."""
 
 from __future__ import annotations
 

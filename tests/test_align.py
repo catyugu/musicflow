@@ -175,7 +175,7 @@ def test_stale_route_is_rejected_before_the_recording_is_read(tmp_path: Path) ->
     quiet = tmp_path / "never-read.mp3"
     unknown = replace(route, notes=(model.PerformanceNote("mf-999999", 1, 1, 0.0),))
     with pytest.raises(AnalysisError, match="stale"):
-        align(score, unknown, quiet, work_dir=tmp_path / "unknown")
+        align(score, unknown, quiet)
     moved = replace(route, notes=(replace(route.notes[0], measure=2), route.notes[1]))
     with pytest.raises(AnalysisError, match="stale"):
-        align(score, moved, quiet, work_dir=tmp_path / "moved")
+        align(score, moved, quiet)

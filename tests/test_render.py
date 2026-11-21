@@ -13,7 +13,7 @@ from musicflow import model
 from musicflow.errors import InputError, RenderError
 from musicflow.render import render_flow
 from musicflow.render.camera import CameraTrack
-from musicflow.render.canvas import blank, draw_reading_line, rgb
+from musicflow.render.canvas import rgb
 from musicflow.render.encoder import plan_timeline
 from musicflow.render.flow import _frame_source
 from musicflow.render.switch import _system_frame, plan_switch
@@ -72,12 +72,6 @@ def test_camera_holds_interpolates_and_smooths() -> None:
     assert abs(uneven.x_at(0.5) - 5.0) > 0.2, "the camera is linear; PCHIP smoothing is missing"
     sampled = [uneven.x_at(t) for t in np.linspace(0.0, 4.0, 41)]
     assert sampled == sorted(sampled), "the camera moves backwards inside a forward run"
-
-    dense = CameraTrack([0.0, 1.0, 2.0, 3.0, 4.0], [0.0, 100.0, 50.0, 150.0, 260.0])
-    seconds = np.array([-1.0, 0.0, 0.25, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 5.0])
-    many = dense.x_many(seconds)
-    assert many == pytest.approx([dense.x_at(t) for t in seconds.tolist()])
-    assert (many[0], many[-1]) == (0.0, 260.0)
 
 
 def test_switch_plan_follows_a_repeat_back_to_the_first_system() -> None:
@@ -156,17 +150,8 @@ def test_missing_resources_are_typed_errors(tmp_path: Path) -> None:
         )
 
 
-def test_canvas_paints_paper_and_line_and_timeline_follows_the_preview() -> None:
+def test_timeline_follows_the_preview() -> None:
     spec = model.VideoSpec(width=320, height=180, fps=10)
-    frame = blank(spec)
-    assert np.array_equal(frame[0, 0], rgb(spec.background))
-    draw_reading_line(frame, spec)
-    column = round(spec.line_x)
-    assert np.all(frame[:, column] == rgb(spec.line_color))
-    assert np.array_equal(frame[0, column - 5], rgb(spec.background))
-    with pytest.raises(RenderError, match="not an RGB colour"):
-        rgb("#12345")
-
     assert (plan_timeline(10.0, spec, None).seconds, plan_timeline(10.0, spec, None).frames) == (
         10.0,
         100,

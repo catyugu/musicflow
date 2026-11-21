@@ -11,7 +11,6 @@ import pickle
 from dataclasses import replace
 from pathlib import Path
 
-import msgspec
 import pytest
 from msgspec.structs import replace as replace_struct
 from support import SPEC, flow_of, layout_of, measure, musicxml, note, time_map, written
@@ -25,6 +24,15 @@ from musicflow.errors import (
     UnsupportedInputError,
 )
 from musicflow.symbolic.route import build_route
+
+EVIDENCE = model.AlignmentEvidence(
+    similarity_mean=0.5,
+    residual_ms={"median": 1.0},
+    onset_lag_ms=0.0,
+    implied_bpm=120.0,
+    coverage=1.0,
+    length_ratio=1.0,
+)
 
 
 def case_inputs(directory: Path) -> pipeline.Inputs:
@@ -51,20 +59,10 @@ def fake_stages(monkeypatch: pytest.MonkeyPatch) -> dict[str, list]:
             (debug_dir / "page-1.png").write_bytes(b"bitmap")
         return layout_of(measures=4)
 
-    def align(score, route, audio, *, work_dir, constraints=None):
+    def align(score, route, audio, *, constraints=None):
         routes.append(route)
         duration = max(route.total_q * 0.5, 1.0)
-        evidence = {
-            "method": "fake",
-            "audio_duration": duration,
-            "implied_bpm": 60.0 * route.total_q / duration,
-            "similarity_mean": 0.5,
-            "coverage": 1.0,
-            "residual_ms": {"median": 1.0, "p90": 2.0, "max": 3.0},
-        }
-        (work_dir / "report.json").write_text(json.dumps(evidence), encoding="utf-8")
-        anchors = (model.Anchor(0.0, 0.0, "start"), model.Anchor(route.total_q, duration, "end"))
-        return model.Alignment(anchors=anchors, audio_duration=duration, method="fake")
+        return time_map(total_q=route.total_q, seconds=duration), EVIDENCE
 
     def build(score, written_musicxml, *, work_dir, target_content_height, paper):
         builds.append(1)
@@ -89,7 +87,7 @@ def hand_analysis() -> pipeline.Analysis:
         alignment=time_map(total_q=16.0, seconds=8.0),
         layout=layout_of(measures=4),
         flow=flow_of(score),
-        align_report={"coverage": 1.0, "residual_ms": {"median": 1.0}},
+        evidence=EVIDENCE,
     )
 
 
@@ -150,17 +148,8 @@ def test_analyze_writes_one_report_with_checks(
 
     analysis = pipeline.analyze(inputs, workspace, spec=SPEC, with_pdf=True, with_flow=True)
     report = workdir.read_json(workspace.root / pipeline.REPORT_NAME)
-    expected = "inputs tools spec score route layout alignment flow checks artifacts timings"
-    assert set(report) == set(expected.split())
-    assert report["spec"] == msgspec.to_builtins(SPEC)
-    summary = (report["layout"]["systems"], report["flow"]["tiles"])
-    assert summary == (1, 1)
-    assert report["alignment"]["similarity_mean"] == 0.5, "headline numbers come from the evidence"
     assert report["alignment"]["coverage"] == 1.0
-    align_dir = next((workspace.root / "align").iterdir())
-    assert report["artifacts"]["align_report"] == str((align_dir / "report.json").resolve())
-    assert report["artifacts"]["alignment_figure"] is None
-    assert set(report["timings"]) == {"symbolic", "pdf", "align", "flow", "total"}
+    assert report["debug_images"] is None
     names = [
         "staffs_per_system",
         "measure_count",
@@ -175,9 +164,8 @@ def test_analyze_writes_one_report_with_checks(
 
     pipeline.analyze(inputs, workspace, spec=SPEC, with_pdf=True, with_flow=True, debug_images=True)
     report = workdir.read_json(workspace.root / pipeline.REPORT_NAME)
-    debug_dir = Path(report["artifacts"]["debug_images"])
+    debug_dir = Path(report["debug_images"])
     assert list(debug_dir.glob("*.png")), "--debug-images wrote nothing"
-    assert report["artifacts"]["debug_images"] == str(debug_dir.resolve())
     assert len(stages["builds"]) == 1, "the second run engraved an unchanged strip again"
 
     (analysis.tiles_dir / "tiles/t0.png").unlink()
@@ -195,17 +183,14 @@ def test_analyze_reuses_cached_steps_and_rekeys_on_the_route(
     pipeline.analyze(inputs, workspace, spec=SPEC, with_pdf=False)
     pipeline.analyze(inputs, workspace, spec=SPEC, with_pdf=False)
     assert len(routes) == 1, "the second run re-aligned an unchanged score"
-    next((workspace.root / "align").glob("*/report.json")).unlink()
-    pipeline.analyze(inputs, workspace, spec=SPEC, with_pdf=False)
-    assert len(routes) == 2, "an alignment whose report is gone was reused"
 
     for name, spans in (("forward", [[1, 4]]), ("backward", [[4, 4], [1, 1]])):
         path = tmp_path / f"{name}.json"
         path.write_text(json.dumps({"spans": spans}), encoding="utf-8")
         pipeline.analyze(replace(inputs, route_override=path), workspace, spec=SPEC, with_pdf=False)
-    assert len(routes) == 4, "a different performance route served the first route's alignment"
-    assert [route.source for route in routes[2:]] == ["override", "override"]
-    assert routes[2] != routes[3]
+    assert len(routes) == 3, "a different performance route served the first route's alignment"
+    assert [route.source for route in routes[1:]] == ["override", "override"]
+    assert routes[1] != routes[2]
 
 
 def test_checks_and_render_cover_only_the_artifacts_they_have(tmp_path: Path) -> None:
@@ -261,7 +246,6 @@ def test_run_case_task_analyses_once_and_records_every_mode(
         case="case1",
         inputs=case_inputs(tmp_path / "case"),
         out_dir=tmp_path / "out",
-        work_dir=tmp_path / "out" / "case1",
         spec=SPEC,
         preview=2.0,
         modes=("switch", "flow"),

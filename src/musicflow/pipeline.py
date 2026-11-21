@@ -1,10 +1,4 @@
-"""Pipeline orchestration: cached analysis stages, rendering, batch runs and the merged report.
-
-Only the expensive stages are cached, each keyed by the files and parameters it reads. ``route`` and
-the measure binding are computed in memory from data the run already loaded. The stage modules are
-imported inside their stage functions so that ``--help`` and input validation never pay
-for importing ``librosa``, ``verovio`` or ``partitura``. The contract is ``doc/design.md``.
-"""
+"""Analyze a work once, then render the requested views."""
 
 from __future__ import annotations
 
@@ -20,18 +14,15 @@ import msgspec
 
 from . import scorexml, workdir
 from .errors import InputError, UnsupportedInputError
-from .model import Alignment, FlowLayout, Route, Score, StaffLayout, VideoSpec
+from .model import Alignment, AlignmentEvidence, FlowLayout, Route, Score, StaffLayout, VideoSpec
 
 logger = logging.getLogger(__name__)
 
 Mode = Literal["switch", "flow"]
 # Bump when a stage's behaviour changes: every cache key includes it, so stale artifacts from an
 # older algorithm can never be mistaken for current output.
-PIPELINE_VERSION = 10
+PIPELINE_VERSION = 11
 REPORT_NAME = "report.json"
-# The alignment evidence the merged report repeats: the rest of it stays in ``align/report.json``.
-HEADLINE_KEYS = ("audio_duration", "implied_bpm", "similarity_mean", "coverage", "residual_ms")
-
 AUDIO_SUFFIXES = (".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".opus", ".wma")
 
 
@@ -78,7 +69,7 @@ class Analysis:
     alignment: Alignment
     layout: StaffLayout | None
     flow: FlowLayout | None
-    align_report: dict[str, Any]
+    evidence: AlignmentEvidence
     tiles_dir: Path | None = None
 
 
@@ -120,12 +111,7 @@ def analyze(
     with_flow: bool = False,
     debug_images: bool = False,
 ) -> Analysis:
-    """Run exactly the analysis stages the requested outputs need, reusing cached steps.
-
-    ``with_pdf`` adds the staff geometry ``switch`` displays, ``with_flow`` the engraved strip
-    ``flow`` displays, and ``debug_images`` the diagnostic bitmaps of the PDF detection. The merged
-    ``<workspace>/report.json`` is written from the result; see ``checks`` for its check section.
-    """
+    """Prepare shared timing and the layouts requested by the caller."""
     from . import align, symbolic
 
     inputs.validate()
@@ -181,15 +167,10 @@ def analyze(
         _tool_versions("librosa", "numpy"),
     )
     align_step = workspace.step("align", align_key)
-    evidence_path = align_step.path / "report.json"
-    alignment = align_step.run(
-        Alignment,
-        lambda path: align.align(
-            score, route, inputs.audio, work_dir=path, constraints=inputs.anchors
-        ),
-        present=lambda _: evidence_path.is_file(),
+    alignment, evidence = align_step.run(
+        tuple[Alignment, AlignmentEvidence],
+        lambda _: align.align(score, route, inputs.audio, constraints=inputs.anchors),
     )
-    align_report = workdir.read_json(evidence_path)
     timings["align"] = round(time.monotonic() - stage, 3)
 
     flow_layout = tiles_dir = None
@@ -222,10 +203,10 @@ def analyze(
         alignment=alignment,
         layout=layout,
         flow=flow_layout,
-        align_report=align_report,
+        evidence=evidence,
         tiles_dir=tiles_dir,
     )
-    _write_report(workspace, records, spec, analysis, timings, evidence_path, debug_dir)
+    _write_report(workspace, records, spec, analysis, timings, debug_dir)
     logger.info("analysis finished in %.1f s", timings["total"])
     return analysis
 
@@ -236,7 +217,6 @@ def _write_report(
     spec: VideoSpec,
     analysis: Analysis,
     timings: dict[str, float],
-    evidence_path: Path,
     debug_dir: Path | None,
 ) -> None:
     score = analysis.score
@@ -244,20 +224,13 @@ def _write_report(
     alignment = analysis.alignment
     layout = analysis.layout
     flow = analysis.flow
-    evidence = analysis.align_report
-    figure = evidence_path.with_name("alignment.png")
     payload = {
         "inputs": records,
-        "tools": _tool_versions(
-            "partitura", "pymupdf", "opencv-python-headless", "verovio", "resvg-py", "librosa"
-        ),
         "spec": msgspec.to_builtins(spec),
         "score": {
             "title": score.title,
             "staves": score.staff_count,
-            "parts": [
-                {"id": part.id, "name": part.name, "staves": part.staves} for part in score.parts
-            ],
+            "parts": len(score.parts),
             "measures": len(score.measures),
             "written_notes": len(score.notes),
             "unconfirmed": list(score.unconfirmed),
@@ -277,7 +250,8 @@ def _write_report(
             "unconfirmed": list(layout.unconfirmed),
         },
         "alignment": {
-            **{name: evidence.get(name) for name in HEADLINE_KEYS},
+            **msgspec.to_builtins(analysis.evidence),
+            "audio_duration": alignment.audio_duration,
             "method": alignment.method,
             "anchors": len(alignment.anchors),
             "unconfirmed": list(alignment.unconfirmed),
@@ -291,11 +265,7 @@ def _write_report(
             "scale": flow.scale,
         },
         "checks": checks(analysis),
-        "artifacts": {
-            "align_report": str(evidence_path.resolve()),
-            "alignment_figure": str(figure.resolve()) if figure.is_file() else None,
-            "debug_images": str(debug_dir.resolve()) if debug_dir else None,
-        },
+        "debug_images": str(debug_dir.resolve()) if debug_dir else None,
         "timings": timings,
     }
     path = workspace.root / REPORT_NAME
@@ -373,72 +343,53 @@ class BatchTask:
     case: str
     inputs: Inputs
     out_dir: Path
-    work_dir: Path
     spec: VideoSpec
     preview: float | None
     modes: tuple[Mode, ...]
 
 
 def run_case_task(task: BatchTask) -> list[dict[str, Any]]:
-    """Analyse one case once, render every requested mode and return one record per mode.
-
-    ``seconds`` is that mode's render time: the analysis is shared, so it is not charged twice.
-    """
     started = time.monotonic()
-    workspace = workdir.Workspace(task.work_dir)
-
-    def out_path(mode: Mode) -> Path:
-        return task.out_dir / f"{task.case}.{mode}.mp4"
 
     try:
         analysis = analyze(
             task.inputs,
-            workspace,
+            workdir.Workspace(task.out_dir / task.case),
             spec=task.spec,
             with_pdf="switch" in task.modes,
             with_flow="flow" in task.modes,
         )
     except Exception as error:
-        # One shared analysis, so the cause is the same for every mode of this case.
-        detail = f"{type(error).__name__}: {error}"
-        seconds = round(time.monotonic() - started, 1)
         return [
             {
                 "case": task.case,
                 "mode": mode,
                 "ok": False,
-                "out": str(out_path(mode)),
-                "error": detail,
-                "seconds": seconds,
+                "error": str(error),
+                "seconds": round(time.monotonic() - started, 1),
             }
             for mode in task.modes
         ]
 
-    records: list[dict[str, Any]] = []
+    records = []
     for mode in task.modes:
-        out = out_path(mode)
-        record: dict[str, Any] = {
-            "case": task.case,
-            "mode": mode,
-            "ok": False,
-            "out": str(out),
-        }
         stage = time.monotonic()
         try:
             produced = render(
                 task.inputs,
                 mode=mode,
-                out=out,
+                out=task.out_dir / f"{task.case}.{mode}.mp4",
                 spec=task.spec,
                 preview=task.preview,
                 analysis=analysis,
             )
-            record["ok"] = True
-            record["out"] = str(produced)
         except Exception as error:
-            record["error"] = f"{type(error).__name__}: {error}"
-        record["seconds"] = round(time.monotonic() - stage, 1)
-        records.append(record)
+            outcome = {"ok": False, "error": str(error)}
+        else:
+            outcome = {"ok": True, "out": str(produced)}
+        records.append(
+            dict(case=task.case, mode=mode, seconds=round(time.monotonic() - stage, 1), **outcome)
+        )
     return records
 
 
@@ -466,17 +417,7 @@ def batch(
         except InputError as error:
             skipped.append({"case": case.name, "mode": "-", "ok": False, "error": str(error)})
             continue
-        tasks.append(
-            BatchTask(
-                case=case.name,
-                inputs=inputs,
-                out_dir=out_dir,
-                work_dir=out_dir / case.name,
-                spec=spec,
-                preview=preview,
-                modes=requested,
-            )
-        )
+        tasks.append(BatchTask(case.name, inputs, out_dir, spec, preview, requested))
 
     if jobs <= 1:
         per_case = [run_case_task(task) for task in tasks]
@@ -488,28 +429,14 @@ def batch(
     return skipped + [record for records in per_case for record in records]
 
 
-def _implied_bpm(analysis: Analysis) -> float:
-    duration = analysis.alignment.audio_duration
-    return 60.0 * analysis.route.total_q / duration if duration > 0 else 0.0
-
-
 def checks(analysis: Analysis) -> list[dict[str, Any]]:
-    """Cross-check the artifacts that exist against each other: the diagnostics of doc/PLAN.md 二.5.
-
-    These are the comparisons that do not read the PDF as notation: staves per printed system,
-    barlines against written measures, the tempo the recording implies, the shares of written notes
-    the flow layout resolved, and whether the aligner stands behind its map. A check whose evidence
-    was not produced is absent rather than reported as passing.
-    """
     found: list[tuple[str, bool, str]] = []
     if analysis.layout is not None:
         from .pdf.detect import MIN_MATCHING_SHARE
 
         systems = analysis.layout.systems
         expected_staves = analysis.score.staff_count
-        # Printed scores drop staves that stay empty (a vocal line during a piano interlude), so
-        # fewer staves than the score declares is normal; more staves than the piece has is a
-        # detection error.
+        # A system may omit staves that stay silent.
         floor = min(2, expected_staves)
         plausible = sum(1 for system in systems if floor <= len(system.staves) <= expected_staves)
         overfull = [system.index for system in systems if len(system.staves) > expected_staves]
@@ -538,7 +465,7 @@ def checks(analysis: Analysis) -> list[dict[str, Any]]:
             )
         )
 
-    implied_bpm = _implied_bpm(analysis)
+    implied_bpm = analysis.evidence.implied_bpm
     tempo = f"the route implies {implied_bpm:.1f} quarter notes per minute"
     found.append(("tempo", 20.0 <= implied_bpm <= 300.0, tempo))
     unconfirmed = analysis.alignment.unconfirmed

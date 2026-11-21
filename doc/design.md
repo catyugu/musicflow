@@ -1,149 +1,47 @@
-# 设计：数据契约、模块边界与验收
+# musicflow 设计
 
-本文固定 `musicflow` 的基础设施决策：坐标系、数据结构、模块接口、产物格式、错误与缓存契约；需求与语料
-分别见 [PLAN.md](PLAN.md) 与 [TEST_DATA.md](TEST_DATA.md)。基础决策一旦在实践中失效，只重开对应的一条。
+## 分析与渲染
 
-## 一、坐标系与命名约定
-
-| 概念 | 单位 | 说明 |
+| 阶段 | 输入 | 产物 |
 | --- | --- | --- |
-| `q` / 小节 | 四分音符数 / 整数，1 起 | `Score` 用书写位置（MusicXML 文档顺序），`Route`/`Alignment` 用演奏位置（反复展开后） |
-| 时间 | 秒 | 录音时间轴。原音频是唯一主时钟，任何步骤都不改音频时长或采样率 |
-| PDF 几何 | PDF point | `StaffLayout`、`System.bbox`、`System.staves` |
-| 排谱几何 / 帧窗口 | Verovio SVG unit / 视频像素 | `FlowLayout.note_x`、`FlowLayout.strip_*`；瓦片图像 1 px = 1 unit；渲染阶段的裁切与合成 |
+| 符号谱 | MusicXML/MXL | `Score` 与附有稳定音符 ID 的 MusicXML |
+| 路线 | `Score`、可选 `--route` | `Route`，包含演奏中的小节遍次与音符位置 |
+| PDF | PDF、谱表数、可选 `--staffs` | `StaffLayout`，包含页内谱行边界与小节范围 |
+| 对齐 | 录音、`Score`、`Route`、可选 `--anchors` | `Alignment` 和覆盖率、残差等证据 |
+| 连续排版 | 标注过的 MusicXML、输出高度及纸色 | `FlowLayout` 和目标分辨率瓦片 |
+| 渲染 | 同一次分析、录音、输出参数 | H.264/AAC MP4 |
 
-音符标识 `mf-NNNNNN`（六位十进制）按 MusicXML 文档顺序给**每个** `<note>` 元素编号（含休止、装饰音、
-cue），由 `musicflow.scorexml.assign_note_ids` 写入 `<note id="...">`，Verovio 把它带到 SVG 与 timemap：
-这是流动模式把"源音符 → 横坐标"接起来的唯一桥梁。同一小节的不同演奏次数用 `pass_index`（1 起）区分，
-对齐与渲染都以 `PerformanceNote` 为准，不直接用书写音符。
+`pipeline.analyze` 根据请求准备谱面并生成 `report.json`。`pipeline.render` 消费分析产物。
+`batch` 按案例并行，每个案例只准备一次共同分析。音频以录音的实际秒数计时，单次 FFmpeg 进程
+接收视频帧并封装录音。成功后原子替换目标文件。
 
-## 二、数据结构
+## 坐标与纠正
 
-全部位于 `musicflow/model.py`，都是冻结 slots dataclass，核心不变量写进了 `__post_init__` 的
-`assert`：内部实现违约就是 bug，不当作数据错误处理。产物类型的 JSON 格式由字段声明唯一决定：
-`Payload` 用 `dataclasses.fields` 与 `typing.get_type_hints` 实现反射编解码，`to_dict()` 只写声明过的
-字段（嵌套产物递归，`tuple` 变数组），`from_dict()` 严格按类型解码——未知键、缺失键、类型不符（`int`
-字段收到小数、`float` 字段收到字符串、`Literal` 以外的取值）都报错，因此不存在半填充的旧结构。
-`VideoSpec` 是配置，只有 `to_dict()`；每个字段只归一个类型所有，`PerformanceNote` 只记演奏位置，音高、
-时值、声部与谱表一律通过 `Score.note_by_id()` 查书写音符。`Alignment.time_at(q)` 是唯一的谱位→时间入口，
-分段线性、两端钳制；渲染层不得自己再积时间或累计帧间位移，每帧状态由绝对源时间算出。
+- MusicXML 小节按书面顺序从一编号。音符按文档顺序分配 `mf-NNNNNN`。书面谱位与展开后的演奏谱位都以四分音符计量。
+- 自动路线展开书面反复。嵌套或重叠反复需要 `--route`，未展开的 D.C.、D.S. 和 Coda 等记号写入报告。
+- PDF 谱行按页和纵坐标排序。小节绑定优先采用可靠的印刷小节编号，其余区间使用检测到的小节线。
+  最终范围必须完整覆盖乐谱。需要直接校正时，通过 `--staffs` 固定一组谱行范围。
+- 对齐先估计速度和偏移，再进行带状 chroma DTW、细化和音头拟合。`--anchors` 固定人工确认的时间。
+  `Alignment` 通过单调锚点做分段线性插值，批量查询演奏谱位。
+- `switch` 使用 PDF 点坐标裁切谱行，保留原页排版。`flow` 以 Verovio 排版一次，将音符横坐标与瓦片
+  一起换算到视频像素。镜头在前行区间使用保形三次插值，在反复回跳之间线性移动。
 
-| 类型 | 语义 | 关键不变量 |
-| --- | --- | --- |
-| `Rect` / `PartInfo` | 轴对齐矩形、声部与谱表数 | `x1 >= x0`、`y1 >= y0`；`staves >= 1` |
-| `MeasureInfo` / `Repeat` | 书写小节起点与长度、书面反复/跳转指令 | `start_q` 严格递增；小节号在谱面范围内 |
-| `NoteEvent` / `Score` | 书写音符与书写谱面 | `duration_q > 0`、`pitch` 为 MIDI 音高；音符按 onset 有序、小节存在、`total_q` 为正，且是音高/时值/声部/谱表的唯一来源 |
-| `MeasurePass` / `PerformanceNote` | 演奏中的一次小节出现、一个音符位置 | `start_q` 接续前序 pass 的长度累加；音符按 onset 有序，回指 `note_id` 与 `pass_index`，不含音高与时值 |
-| `Route` | 演奏路线 | `total_q` 为正且等于各 pass 长度之和，每个音符落在已声明的 `(measure, pass_index)` 上 |
-| `Anchor` / `Alignment` | 谱位-时间对应 | 两者都严格递增，至少两个锚点 |
-| `System` / `StaffLayout` / `Tile` / `FlowLayout` | PDF 谱行、排谱长条与瓦片 | `index` 从 1 连续编号、`page` 存在；至少一个瓦片、至少一个小节区间 |
-| `VideoSpec` | 画布与配色 | 画布非空、阅读线比例在 (0,1) 内 |
+## 缓存与验证
 
-## 三、管线与产物
+`symbolic/`、`pdf/`、`align/`、`flow/` 下的产物以输入摘要、参数和版本寻址。
+每个 `cache.json` 包含缓存键和经过 msgspec 校验的载荷。依赖文件先发布，缓存最后原子替换。
+路线和小节绑定在内存中计算。当缓存格式或算法变化时递增 `PIPELINE_VERSION`。
 
-一次 `analyze` 只为昂贵步骤在 workspace 下建目录，`render` 只读它们。步骤目录里 `payload.json` 存
-`to_dict()` 结果，该步骤写下的二进制副产物与它同目录。`route` 与小节绑定不在表内：它们从已加载的数据
-在内存里算出（`symbolic.build_route`、`pdf.bind_measures`），没有目录，也没有缓存键。
+`report.json` 汇总输入、检查和阶段耗时。PDF 叠加图按需生成。合成输入覆盖单元行为，
+完整语料由 [tools/acceptance.py](../tools/acceptance.py) 验证。
 
-缓存键（`workdir.key`）= 该步骤真正读的文件内容摘要 + 影响该步骤的参数 + 工具版本。`analyze` 每次运行
-只对每个输入文件算一次 sha256（`workdir.digest_file`），同一批摘要既喂给步骤键也写进报告；键里只放该
-步骤读的依赖，且每个键都带 `PIPELINE_VERSION`：
-
-| 步骤 | 输入 → 产物 | 文件摘要与参数 |
-| --- | --- | --- |
-| `symbolic` | 符号谱 → `Score` + `written.musicxml`（注入 id 后的书写谱，供 Verovio 使用） | 符号谱；`provider`、`partitura`/`lxml` 版本 |
-| `pdf` | PDF + `Score.staff_count` → `StaffLayout`（未绑小节）；只有 `--debug-images` 才写 `debug/` 诊断位图 | PDF；`expected_staves`、`debug_images`、`pymupdf`/`opencv-python-headless` 版本 |
-| `align` | 符号谱 + 演奏路线 + 音频 → `Alignment` + `report.json` 与 `alignment.png` | 音频（给了 `--anchors` 时再加它）；`Score` 与 `Route` 载荷 hash、`librosa`/`numpy` 版本 |
-| `flow` | `written.musicxml` + 目标高度 + 纸色 → `FlowLayout` + 瓦片 PNG（仅 MusicXML/MXL） | `written.musicxml`；`Score` 载荷 hash、目标内容高度、纸色、`verovio`/`resvg-py` 版本 |
-
-`workdir.Step.run(key, compute, validate=...)` 负责命中与落盘，步骤内部不判断缓存；`validate` 拿到已存
-载荷并回答"它指名的二进制文件是否都还在"，不在就重算：`symbolic` 查 `written.musicxml`，`flow` 查每个
-瓦片，`align` 查 `report.json`。任何步骤的行为改变都必须递增 `PIPELINE_VERSION`（当前 6），否则旧产物会
-被当作仍然有效。渲染不是缓存步骤：`render-switch/` 只放分块 MP4，页面位图按需在内存里重绘，
-`render-flow/` 只放分块 MP4，`flow/` 只放排谱产物；分块续渲是唯一的渲染缓存，分块名带参数摘要，复用前用
-ffprobe 复核帧数。`encoder` 把每次编码的耗时（帧合成、喂 ffmpeg 与封装）、帧数与分块数写进模块级
-`LAST_STATS` 并打一条 INFO 日志，验收工具读它填 `acceptance.json`。
-
-### 报告产物：`<workspace>/report.json`
-
-| 键 | 内容 |
+| 退出码 | 含义 |
 | --- | --- |
-| `inputs` / `tools` / `spec` | 每个输入文件的绝对路径、字节数、sha256；各阶段依赖的版本（`pipeline` 是 `PIPELINE_VERSION`）；`VideoSpec` |
-| `score` / `route` | provider、标题、谱表数、声部、小节数、书写音符数、`unconfirmed`；来源、pass 数、音符数、`total_q`、`unconfirmed` |
-| `layout` / `flow` | 页数、谱行数、`unconfirmed`；长条尺寸、瓦片数、scale；本次没算时为 `null` |
-| `alignment` | `align/report.json` 的摘要数字（录音时长、隐含 BPM、相似度、覆盖率、残差中位数），加方法、锚点数与 `unconfirmed` |
-| `checks` / `timings` / `artifacts` | `checks()` 的结果；每个实际运行的阶段耗时加 `total`；`align_report`、`alignment_figure`、`debug_images`（仅 `--debug-images`）与按 mode 记录成片的 `videos` |
-
-`checks(analysis)` 只检查真正产出过的证据：算了布局才有 `staffs_per_system` 与 `measure_count`；
-`tempo` 与 `alignment_confidence` 恒有；有 flow 布局才有 `flow_note_coverage`。详细的对照证据留在
-`align/report.json` 与 `align/alignment.png`，合并报告只引用路径并给摘要数字，不复制统计量；`cli analyze`
-打印的摘要与 `--json` 输出都来自这个文件。
-
-## 四、模块接口
-
-包内每个模块都是库：不配置 logging、不 print、不读环境变量；唯一的入口是 `musicflow.cli`。
-
-| 模块 | 入口 | 语义 |
-| --- | --- | --- |
-| `pipeline` | `analyze` / `render` / `batch` | 按 `with_pdf`/`with_flow`/`debug_images` 运行缓存的昂贵步骤并写 `report.json`；从 `Analysis` 渲染一个模式（没给 `analysis` 时先跑该模式需要的阶段，并断言它带齐数据）；批量的单位是案例，一个 workspace、一次分析、每个模式一条记录，`jobs` 只在案例之间并行 |
-| `symbolic` | `load_score` / `build_route` | 读 MusicXML / MXL / MIDI 为 `Score`，MXL 就地解包；按书面反复展开演奏顺序，override 文件优先 |
-| `pdf` | `detect_layout` / `bind_measures` | 以光栅检测谱行、谱表与小节线，`debug_dir` 非空才写诊断位图；严格绑定小节范围：印刷小节号优先，无文本层时小节线计数必须恰好铺满全谱，否则 `AnalysisError` 要求 `--staffs` 修正 |
-| `align` / `flow` | `align` / `build_layout` | 产出谱位到录音时间的锚点与对照证据；把书写谱排成一整条 system 并栅格化成瓦片 |
-| `render` | `render_switch` / `render_flow` | 用原 PDF 位图按谱行切谱，分块写进 `work_dir`；从 `tiles_dir` 读瓦片，把长条沿阅读线平移，分块写进 `work_dir` |
-
-`preview` 是秒数（只渲前 N 秒），用于快速迭代。`switch` 消费原 PDF 位图与录音，`flow` 消费 `flow` 步骤
-写下的瓦片与录音、不读 PDF；两条路径都在调用处显式命名输入，不从别的字段推断（missing → `InputError`）。
-`flow` 的瓦片写在 `flow` 步骤目录，`Tile.path` 相对该目录，所以 `render_flow` 的 `tiles_dir` 是
-`<workspace>/flow/`，它自己的分块落进 `<workspace>/render-flow/`：排谱产物与渲染缓存不再共用目录。
-
-## 五、视频规格
-
-| 项 | 默认值 | 说明 |
-| --- | --- | --- |
-| 画布 / 帧率 | 1920×1080 / 30 | `--size WxH` 与 `--fps`；宽高必须为偶数（yuv420p） |
-| 底色 / 阅读线 | `#FAF8F1` / 竖线 x = 0.35×宽，`#287D9F`，3 px | 纸色；`switch` 不用竖线 |
-| 编码 | `libx264`、`crf 18`、`yuv420p`、`+faststart` | 音频 `aac 192k`，时长以音频为准 |
-
-`switch`：切谱时刻 = 该谱行首个发声音符的录音时间；画面是原 PDF 位图按谱行裁切后等比缩放、留白居中，
-不做重排、不加滤镜。`flow`：整个曲子排成一条连续系统（`breaks: none`），多声部自上而下，横坐标单调递增；
-镜头位置 `x(t)` 以（音符时间, 音符横坐标）为锚点做单调三次插值（PCHIP），只平滑空间运动，不改变任何音符
-时间，遇到反复导致的横坐标回跳时该段用线性插值，不做跨跳平滑。
-
-## 六、对齐与诚实边界
-
-- 对齐输出锚点序列，不是每个音符独立测时。锚点来源写进 `kind`：`start`、`onset`（局部音头证据）、
-  `manual`（已审约束）、`end`。音头指标取真实起始点；细对齐用 `ATTACK_DECAY` 的衰减窗（1 帧满权，随后
-  两帧 0.5、0.25）加权，平滑代价下限 `FINE_MIN_SMOOTH_PENALTY = 0.5`，避免换音高被当成换时间。
-- 无法可靠确定的片段写进 `Alignment.unconfirmed`，并在报告里给出残差分布；禁止把低置信度结果当成成功静默
-  输出。谱面与录音实质不符（音符数、段落、时长比例）时，`analyze` 必须在报告里列出，且不得自动改写谱面。
-- `align/report.json` 是对照证据：`method`、`audio_duration`、`score_total_q`、`implied_bpm`、
-  `similarity_mean`、`attack_count`/`snapped_attacks`/`coverage`、`residual_ms`（中位数/p90/最大值）、
-  `onset_lag_ms`、`length_ratio`、`relocated_attacks`、`dtw_path_length`、`dropped_anchors`、
-  `reviewed_anchors`、`chosen_hypothesis`、逐小节 pass 的时间与 `unconfirmed`。
-- `align/alignment.png` 两栏：左栏谱位→时间折线（锚点按 `kind` 标形状，人工锚点另色），右栏每个被接受音头
-  的残差（ms）与 ±250 ms 带；两栏都标出覆盖率与残差中位数。
-
-## 七、错误、日志与退出码
-
-退出码：`0` 成功；`1` `batch` 至少一个案例失败（逐案例状态见 stdout）；`2` 命令行用法错误（`UsageError`）；
-`3` 输入缺失/损坏/自相矛盾（`InputError`）；`4` 输入合法但模式不支持，如 MIDI-only 配 `flow`
-（`UnsupportedInputError`）；`5` 必需分析步骤无法给出可信结果，含小节绑定无法确定（`AnalysisError`）；
-`6` 合帧或编码失败（`RenderError`）；`7` 依赖的外部程序缺失（`MissingToolError`）。预期失败用异常携带
-退出码，在 `cli.main` 转成一行消息；未预期失败带着 traceback 抛出。日志只配置一次（`cli._configure_logging`），
-级别 `INFO`（`-v` 到 `DEBUG`，`-q` 到 `WARNING`），写 stderr；数据性输出（报告路径、摘要）写 stdout。
-
-## 八、测试策略
-
-测试只有一套：`uv run pytest` 全部使用合成输入（内存中构造的乐谱、布局、合成数组和内联文档），不依赖
-`test_cases/`，整套在 10 s 内跑完，只钉模块级语义与不变量，不追求分支覆盖。语料级验证只在
-`tools/acceptance.py`：每个 case 分析一次、两种模式都从这次分析渲染，判定 `report.json` 的 checks、对齐证据
-门槛（覆盖率 ≥ 0.9、残差中位数 ≤ 150 ms）与 case1/case3 的 MIDI 真值误差（去中位数 p50 ≤ 20 ms、p90 ≤ 60 ms），
-并抽样帧检查阅读线、谱面墨量、时长与帧数；成本按分析、排谱、合帧、编码四项写进 `acceptance.json`。
-
-## 九、待定
-
-1. `switch` 是否需要固定留白比例（当前按画布高度 90% 缩放、垂直居中）。
-2. MIDI-only 的小节划分：按时间签名推断。MIDI 若是"已展开反复"的演奏，其小节数与印刷谱不同（case3：
-   453 对 314），谱行无法按小节网格对齐——此处不做按比例映射，绑定直接报 `AnalysisError`（退出码 5）
-   要求 `--staffs` 修正；这类输入要么改用 MusicXML，要么人工给出每行的小节范围。
-3. 长条瓦片受 `MAX_STRIP_WIDTH`（Verovio `pageWidth` 上限 100000）约束，超出时降 scale 重排。
+| 0 | 成功 |
+| 1 | 批处理至少一个案例失败 |
+| 2 | 命令行用法错误 |
+| 3 | 输入无效 |
+| 4 | 符号谱格式不受支持 |
+| 5 | 分析失败或需要校正 |
+| 6 | 渲染或编码失败 |
+| 7 | 外部工具缺失 |

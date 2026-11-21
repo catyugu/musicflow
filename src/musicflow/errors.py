@@ -1,10 +1,4 @@
-"""Error taxonomy and process exit codes.
-
-Rules: expected failures (bad input, missing file, unsupported mode, analysis that cannot reach
-its threshold, external tool trouble) are represented by typed errors carrying an exit code and are
-turned into a message plus exit status at the CLI boundary. Unexpected failures propagate with
-their traceback.
-"""
+"""Expected failures and their CLI exit codes."""
 
 from __future__ import annotations
 
