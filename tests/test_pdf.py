@@ -38,7 +38,6 @@ def synthetic_layout(
 
 def synthetic_score(total: int) -> model.Score:
     return model.Score(
-        provider="musicxml",
         parts=(model.PartInfo("P1", "Piano", 2),),
         measures=tuple(model.MeasureInfo(i, float(i - 1), 1.0) for i in range(1, total + 1)),
         notes=tuple(

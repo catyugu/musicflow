@@ -1,6 +1,6 @@
 """Turn parsed input into a :class:`musicflow.model.Score`.
 
-The MusicXML and MIDI readers both reduce their input to the same intermediate form: a measure
+The MusicXML reader reduces its input to a measure
 grid in quarter notes and a flat list of sounding notes at written positions. This module owns the
 step from that form to the frozen model, so the invariants the rest of the pipeline relies on (one
 event per sounding note, every onset inside exactly one measure, ordered onsets) are checked once.
@@ -14,12 +14,12 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 from musicflow.errors import InputError
-from musicflow.model import MeasureInfo, NoteEvent, PartInfo, Repeat, Score, SymbolicProvider
+from musicflow.model import MeasureInfo, NoteEvent, PartInfo, Repeat, Score
 
 logger = logging.getLogger(__name__)
 
 MIN_NOTE_DURATION_Q = 0.125
-"""Duration given to a note that has none: written grace notes, zero-length MIDI events.
+"""Duration given to a note that has none: written grace notes.
 
 A grace note occupies a position but has no notated length, while ``NoteEvent`` requires a
 positive duration. An eighth of a quarter keeps it short without reaching the next notated value.
@@ -44,7 +44,6 @@ class RawNote:
 
 def assemble_score(
     *,
-    provider: SymbolicProvider,
     title: str,
     parts: Sequence[PartInfo],
     grid: Sequence[tuple[float, float]],
@@ -64,7 +63,7 @@ def assemble_score(
     events: list[NoteEvent] = []
     durationless = 0
     for raw in notes:
-        measure = measures[_measure_position(measures, starts, raw, provider)]
+        measure = measures[_measure_position(measures, starts, raw)]
         duration = raw.duration_q
         if duration <= 0:
             duration = MIN_NOTE_DURATION_Q
@@ -90,7 +89,6 @@ def assemble_score(
             "%d notes had no duration and got %s quarters", durationless, MIN_NOTE_DURATION_Q
         )
     return Score(
-        provider=provider,
         title=title,
         parts=tuple(parts),
         measures=measures,
@@ -102,7 +100,7 @@ def assemble_score(
 
 
 def _measure_position(
-    measures: Sequence[MeasureInfo], starts: Sequence[float], note: RawNote, provider: str
+    measures: Sequence[MeasureInfo], starts: Sequence[float], note: RawNote
 ) -> int:
     """Index of the one measure containing ``note``; a note outside the grid is bad input."""
     index = bisect.bisect_right(starts, note.onset_q + ONSET_EPSILON) - 1
@@ -110,7 +108,7 @@ def _measure_position(
     measure = measures[index]
     if not (measure.start_q - ONSET_EPSILON <= note.onset_q <= measure.end_q + ONSET_EPSILON):
         raise InputError(
-            f"{provider} note {note.id} at {note.onset_q} quarters is outside the measure grid: "
+            f"MusicXML note {note.id} at {note.onset_q} quarters is outside the measure grid: "
             f"measure {measure.index} spans {measure.start_q}..{measure.end_q}"
         )
     return index

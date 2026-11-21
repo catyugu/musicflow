@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import struct
 import zipfile
 from pathlib import Path
 
@@ -14,7 +13,6 @@ from musicflow.errors import InputError
 from musicflow.scorexml import parse_musicxml
 from musicflow.symbolic import build_route, load_score
 from musicflow.symbolic.assembly import MIN_NOTE_DURATION_Q
-from musicflow.symbolic.route import MIDI_MEASURE_NOTE
 
 FORWARD = '<barline location="left"><repeat direction="forward"/></barline>'
 BACKWARD = '<barline location="right"><repeat direction="backward" times="2"/></barline>'
@@ -32,7 +30,7 @@ def four_bars(tmp_path: Path) -> Path:
 def test_reader_numbers_notes_and_measures_and_unwraps_mxl(tmp_path: Path) -> None:
     written = tmp_path / "written.musicxml"
     score = load_score(four_bars(tmp_path), written_path=written)
-    assert (score.provider, score.title, score.staff_count) == ("musicxml", "", 1)
+    assert (score.title, score.staff_count) == ("", 1)
     assert [measure.length_q for measure in score.measures] == [4.0] * 4
     assert (score.total_q, len(score.notes)) == (16.0, 4)
     identifiers = [element.get("id") for element in parse_musicxml(written).iter("{*}note")]
@@ -124,18 +122,6 @@ def test_repeat_barlines_drive_the_route_and_report_what_they_cannot_expand(tmp_
     assert [measure_pass.measure for measure_pass in build_route(lone).passes] == [1, 2, 3, 4, 3, 4]
 
 
-def test_midi_reader_infers_the_measure_grid_and_says_so(tmp_path: Path) -> None:
-    path = tmp_path / "performance.mid"
-    path.write_bytes(minimal_midi())
-    score = load_score(path)
-    assert (score.provider, score.title) == ("midi", "")
-    assert (len(score.parts), len(score.measures), len(score.notes)) == (1, 1, 1)
-    assert score.total_q == 4.0
-    route = build_route(score)
-    assert route.source == "written"
-    assert route.unconfirmed == (MIDI_MEASURE_NOTE,)
-
-
 def test_missing_or_unreadable_scores_are_input_errors(tmp_path: Path) -> None:
     empty = tmp_path / "empty.musicxml"
     empty.write_bytes(b"")
@@ -159,13 +145,3 @@ def test_missing_or_unreadable_scores_are_input_errors(tmp_path: Path) -> None:
     for path in paths:
         with pytest.raises(InputError):
             load_score(path)
-
-
-def minimal_midi() -> bytes:
-    """One 4/4 measure, one quarter note at middle C: the smallest performance MIDI."""
-    events = bytes.fromhex("00ff580404021808")
-    events += bytes.fromhex("00903c64")
-    events += bytes.fromhex("8360803c40")
-    events += bytes.fromhex("00ff2f00")
-    track = b"MTrk" + struct.pack(">I", len(events)) + events
-    return b"MThd" + struct.pack(">IHHH", 6, 0, 1, 480) + track

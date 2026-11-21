@@ -91,14 +91,9 @@ def hand_analysis() -> pipeline.Analysis:
     )
 
 
-def test_inputs_validate_and_name_their_provider(tmp_path: Path) -> None:
+def test_inputs_validate(tmp_path: Path) -> None:
     inputs = case_inputs(tmp_path / "case")
     inputs.validate()
-    assert inputs.provider == "musicxml"
-    midi = tmp_path / "take.mid"
-    midi.write_bytes(b"MThd")
-    assert replace(inputs, symbolic=midi).provider == "midi"
-
     for field, path, message in (
         ("pdf", tmp_path / "absent.pdf", "PDF score not found"),
         ("audio", tmp_path / "absent.mp3", "recording not found"),
@@ -111,7 +106,7 @@ def test_inputs_validate_and_name_their_provider(tmp_path: Path) -> None:
         replace(inputs, pdf=inputs.audio).validate()
     notebook = tmp_path / "notes.txt"
     notebook.write_text("not music", encoding="utf-8")
-    with pytest.raises(UnsupportedInputError, match="MusicXML, MXL or MIDI"):
+    with pytest.raises(UnsupportedInputError, match="MusicXML or MXL"):
         replace(inputs, symbolic=notebook).validate()
 
 
@@ -161,8 +156,8 @@ def test_analyze_writes_one_report_with_checks(
     expected = "inputs tools spec score route layout alignment flow checks artifacts timings"
     assert set(report) == set(expected.split())
     assert report["spec"] == SPEC.to_dict()
-    summary = (report["score"]["provider"], report["layout"]["systems"], report["flow"]["tiles"])
-    assert summary == ("musicxml", 1, 1)
+    summary = (report["layout"]["systems"], report["flow"]["tiles"])
+    assert summary == (1, 1)
     assert report["alignment"]["similarity_mean"] == 0.5, "headline numbers come from the evidence"
     assert report["alignment"]["coverage"] == 1.0
     align_dir = workspace.step("align").path
@@ -293,9 +288,7 @@ def test_run_case_task_analyses_once_and_records_every_mode(
     assert all(not record["ok"] and "corrupt" in record["error"] for record in failed)
 
 
-def test_batch_keeps_a_skip_record_and_finds_the_richest_source(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_batch_requires_musicxml(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     with pytest.raises(InputError):
         pipeline.batch(
             tmp_path / "nope", tmp_path / "out", modes=["switch"], spec=SPEC, preview=1.0, jobs=1
@@ -310,9 +303,7 @@ def test_batch_keeps_a_skip_record_and_finds_the_richest_source(
         (directory / f"{name}.mid").write_bytes(b"MThd")
     alpha = corpus / "alpha"
     musicxml(alpha / "alpha.musicxml", [measure(1, note("C", 4), attributes=True)])
-    assert pipeline.discover_case(alpha)[2] == alpha / "alpha.musicxml", (
-        "a directory holding MusicXML, MXL and MIDI must be driven by the MusicXML"
-    )
+    assert pipeline.discover_case(alpha).symbolic == alpha / "alpha.musicxml"
     monkeypatch.setattr(pipeline, "analyze", lambda inputs, workspace, **kw: hand_analysis())
 
     def fake_render(inputs, workspace, *, mode, out, spec, preview=None, analysis=None):
@@ -324,15 +315,11 @@ def test_batch_keeps_a_skip_record_and_finds_the_richest_source(
     records = pipeline.batch(
         corpus, tmp_path / "out", modes=["switch", "flow"], spec=SPEC, preview=1.0, jobs=1
     )
-    skipped = [record for record in records if record.get("skipped")]
-    assert len(skipped) == 1
-    assert (skipped[0]["case"], skipped[0]["mode"]) == ("beta", "flow")
-    assert "MusicXML" in skipped[0]["skipped"]
-    rendered = [(r["case"], r["mode"], r["ok"]) for r in records if not r.get("skipped")]
-    assert rendered == [
+    failure, *rendered = records
+    assert failure["case"] == "beta" and "MusicXML" in failure["error"]
+    assert [(r["case"], r["mode"], r["ok"]) for r in rendered] == [
         ("alpha", "switch", True),
         ("alpha", "flow", True),
-        ("beta", "switch", True),
     ]
 
 

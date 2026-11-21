@@ -36,7 +36,6 @@ PITCH_CLASSES = 12
 def chord_score() -> model.Score:
     """One measure holding a chord at 0 and a single note at quarter 1."""
     return model.Score(
-        provider="musicxml",
         parts=(model.PartInfo("P1", "Piano", 1),),
         measures=(model.MeasureInfo(1, 0.0, 4.0),),
         notes=(

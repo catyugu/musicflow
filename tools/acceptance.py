@@ -40,7 +40,7 @@ import numpy as np
 import partitura
 from PIL import Image, ImageDraw
 
-from musicflow import pipeline, scorexml, workdir
+from musicflow import pipeline, workdir
 from musicflow.errors import MusicFlowError
 from musicflow.model import VideoSpec
 from musicflow.render import encoder
@@ -581,14 +581,8 @@ def main(argv: list[str] | None = None) -> int:
     results: list[CaseResult] = []
     verdicts: dict[str, Verdict] = {}
     for directory in cases:
-        pdf, track, symbolic = pipeline.discover_case(directory)
-        inputs = pipeline.Inputs(pdf=pdf, audio=track, symbolic=symbolic)
-        modes = list(requested)
-        if "flow" in modes and symbolic.suffix.lower() in scorexml.MIDI_SUFFIXES:
-            print(f"{directory.name:>7} flow   skipped: MIDI cannot drive flow")
-            modes.remove("flow")
-        if not modes:
-            continue
+        inputs = pipeline.discover_case(directory)
+        modes = requested
         print(f"{directory.name:>7} analysing ...", flush=True)
         try:
             workspace, analysis, report = analyse_case(directory.name, inputs, out, spec, modes)

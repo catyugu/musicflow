@@ -4,7 +4,6 @@
 
 ```powershell
 uv sync                 # setup：创建 .venv 并安装锁定依赖
-uv run musicflow doctor # 环境自检与语料检查
 uv run pytest           # test
 uv run ruff check .     # lint（格式化用 ruff format .）
 ```

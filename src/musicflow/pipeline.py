@@ -2,7 +2,7 @@
 
 Only the expensive stages are cached, each keyed by the files and parameters it reads. ``route`` and
 the measure binding are computed in memory from data the run already loaded. The stage modules are
-imported inside their stage functions so that ``--help``, ``doctor`` and input validation never pay
+imported inside their stage functions so that ``--help`` and input validation never pay
 for importing ``librosa``, ``verovio`` or ``partitura``. The contract is ``doc/design.md``.
 """
 
@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 Mode = Literal["switch", "flow"]
 # Bump when a stage's behaviour changes: every cache key includes it, so stale artifacts from an
 # older algorithm can never be mistaken for current output.
-PIPELINE_VERSION = 6
+PIPELINE_VERSION = 7
 REPORT_NAME = "report.json"
 # The alignment evidence the merged report repeats: the rest of it stays in ``align/report.json``.
 HEADLINE_KEYS = ("audio_duration", "implied_bpm", "similarity_mean", "coverage", "residual_ms")
@@ -54,11 +54,9 @@ class Inputs:
             raise InputError(f"unsupported audio format: {self.audio.suffix}")
         if not self.symbolic.is_file():
             raise InputError(f"symbolic score not found: {self.symbolic}")
-        elif (
-            self.symbolic.suffix.lower() not in scorexml.MUSICXML_SUFFIXES + scorexml.MIDI_SUFFIXES
-        ):
+        if self.symbolic.suffix.lower() not in scorexml.MUSICXML_SUFFIXES:
             raise UnsupportedInputError(
-                f"symbolic score must be MusicXML, MXL or MIDI, got {self.symbolic.suffix}"
+                f"symbolic score must be MusicXML or MXL, got {self.symbolic.suffix}"
             )
         for label, path in (
             ("route override", self.route_override),
@@ -67,11 +65,6 @@ class Inputs:
         ):
             if path is not None and not path.is_file():
                 raise InputError(f"{label} file not found: {path}")
-
-    @property
-    def provider(self) -> Literal["musicxml", "midi"]:
-        suffix = self.symbolic.suffix.lower()
-        return "midi" if suffix in scorexml.MIDI_SUFFIXES else "musicxml"
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,38 +115,20 @@ def _digests(records: dict[str, dict[str, Any]]) -> dict[str, str]:
 
 def _symbolic_step(
     inputs: Inputs, digests: dict[str, str], workspace: workdir.Workspace
-) -> tuple[Score, Path | None]:
+) -> tuple[Score, Path]:
     from . import symbolic
 
     step = workspace.step("symbolic")
-    written = step.path / "written.musicxml" if inputs.provider == "musicxml" else None
+    written = step.path / "written.musicxml"
     key = workdir.key(
         {"symbolic": digests["symbolic"]},
-        {"provider": inputs.provider, **_tool_versions("partitura", "lxml")},
+        _tool_versions("partitura", "lxml"),
     )
 
     def compute(_: Path) -> dict[str, Any]:
-        score = symbolic.load_score(inputs.symbolic, written_path=written)
-        return {
-            "score": score.to_dict(),
-            "written": written.relative_to(step.path).as_posix() if written else None,
-        }
+        return symbolic.load_score(inputs.symbolic, written_path=written).to_dict()
 
-    def present(payload: dict[str, Any]) -> bool:
-        name = payload["written"]
-        return name is None or (step.path / name).is_file()
-
-    payload = step.run(key, compute, validate=present)
-    score = Score.from_dict(payload["score"])
-    written_path = step.path / payload["written"] if payload["written"] else None
-    logger.info(
-        "symbolic: %s, %d notes, %d measures, %d staves",
-        score.provider,
-        len(score.notes),
-        len(score.measures),
-        score.staff_count,
-    )
-    return score, written_path
+    return Score.from_dict(step.run(key, compute, validate=lambda _: written.is_file())), written
 
 
 def _pdf_step(
@@ -296,10 +271,6 @@ def analyze(
     ``<workspace>/report.json`` is written from the result; see ``checks`` for its check section.
     """
     inputs.validate()
-    if with_flow and inputs.provider != "musicxml":
-        raise UnsupportedInputError(
-            "flow mode requires MusicXML or MXL: MIDI has no engraving semantics"
-        )
     started = time.monotonic()
     timings: dict[str, float] = {}
     records = _input_records(inputs)
@@ -343,7 +314,6 @@ def analyze(
 
     flow_layout = None
     if with_flow:
-        assert written is not None, "flow mode requires a written MusicXML file"
         stage = time.monotonic()
         flow_layout = _flow_step(score, score_digest, written, spec, workspace)
         timings["flow"] = round(time.monotonic() - stage, 3)
@@ -393,7 +363,6 @@ def _write_report(
         ),
         "spec": spec.to_dict(),
         "score": {
-            "provider": score.provider,
             "title": score.title,
             "staves": score.staff_count,
             "parts": [
@@ -517,29 +486,20 @@ def render(
     return produced
 
 
-def _first(directory: Path, suffixes: Iterable[tuple[str, ...]], label: str) -> Path:
-    """First file of ``directory`` by name, within the earliest suffix group that has any."""
-    for group in suffixes:
-        candidates = sorted(
-            path for path in directory.iterdir() if path.is_file() and path.suffix.lower() in group
-        )
-        if candidates:
-            return candidates[0]
-    raise InputError(f"{directory.name}: no {label} found")
+def discover_case(directory: Path) -> Inputs:
+    """Choose the first file by name for each required input."""
+    files = sorted(path for path in directory.iterdir() if path.is_file())
 
+    def first(suffixes: tuple[str, ...], label: str) -> Path:
+        for path in files:
+            if path.suffix.lower() in suffixes:
+                return path
+        raise InputError(f"{directory.name}: no {label} found")
 
-def discover_case(directory: Path) -> tuple[Path, Path, Path]:
-    """Find the PDF, recording and symbolic score of one corpus case directory.
-
-    The symbolic preference is deliberate: a directory that holds MusicXML, MXL and MIDI all at
-    once (the test corpus does) must be driven by the richest source, because only MusicXML carries
-    the engraving semantics that ``flow`` needs. MIDI is the last resort.
-    """
-    symbolic = (scorexml.MUSICXML_SUFFIXES, scorexml.MIDI_SUFFIXES)
-    return (
-        _first(directory, ((".pdf",),), "PDF score"),
-        _first(directory, (AUDIO_SUFFIXES,), "recording"),
-        _first(directory, symbolic, "symbolic score"),
+    return Inputs(
+        first((".pdf",), "PDF score"),
+        first(AUDIO_SUFFIXES, "recording"),
+        first(scorexml.MUSICXML_SUFFIXES, "MusicXML or MXL score"),
     )
 
 
@@ -640,26 +600,19 @@ def batch(
     skipped: list[dict[str, Any]] = []
     for case in cases:
         try:
-            pdf, track, symbolic = discover_case(case)
+            inputs = discover_case(case)
         except InputError as error:
             skipped.append({"case": case.name, "mode": "-", "ok": False, "error": str(error)})
-            continue
-        wanted = list(requested)
-        if "flow" in wanted and symbolic.suffix.lower() in scorexml.MIDI_SUFFIXES:
-            reason = "flow requires MusicXML or MXL"
-            skipped.append({"case": case.name, "mode": "flow", "ok": True, "skipped": reason})
-            wanted.remove("flow")
-        if not wanted:
             continue
         tasks.append(
             BatchTask(
                 case=case.name,
-                inputs=Inputs(pdf=pdf, audio=track, symbolic=symbolic),
+                inputs=inputs,
                 out_dir=out_dir,
                 work_dir=out_dir / case.name,
                 spec=spec,
                 preview=preview,
-                modes=tuple(wanted),
+                modes=requested,
             )
         )
 

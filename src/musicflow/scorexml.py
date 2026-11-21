@@ -19,7 +19,6 @@ NOTE_ID_PREFIX = "mf-"
 NOTE_ID_DIGITS = 6
 
 MUSICXML_SUFFIXES = (".musicxml", ".xml", ".mxl")
-MIDI_SUFFIXES = (".mid", ".midi")
 
 
 def note_id(number: int) -> str:

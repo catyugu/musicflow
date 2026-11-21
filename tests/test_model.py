@@ -66,7 +66,6 @@ def test_codec_refuses_any_other_shape() -> None:
         (model.MeasureInfo, {**good, "index": True}, "expected an integer"),
         (model.MeasureInfo, {**good, "start_q": True}, "expected a number"),
         (model.MeasureInfo, {**good, "start_q": "0"}, "expected a number"),
-        (model.Score, {**score, "provider": "abc"}, "is not one of"),
         (model.Score, {**score, "title": None}, "expected a string"),
         (model.Route, {**route, "total_q": [4.0]}, "expected a number"),
         (model.Route, {**route, "passes": [["not a pass"]]}, "expected a JSON object"),

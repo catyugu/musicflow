@@ -23,7 +23,6 @@ from dataclasses import dataclass, fields
 from functools import cache
 from typing import Any, Literal, Self, Union, get_args, get_origin, get_type_hints
 
-SymbolicProvider = Literal["musicxml", "midi"]
 RouteSource = Literal["written", "auto_repeats", "override"]
 AnchorKind = Literal["start", "onset", "manual", "end"]
 
@@ -237,7 +236,6 @@ class Score(Payload):
     reach the report instead of dying in a log.
     """
 
-    provider: SymbolicProvider
     parts: tuple[PartInfo, ...]
     measures: tuple[MeasureInfo, ...]
     notes: tuple[NoteEvent, ...]

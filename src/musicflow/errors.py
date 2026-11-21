@@ -36,7 +36,7 @@ class InputError(MusicFlowError):
 
 
 class UnsupportedInputError(MusicFlowError):
-    """The inputs are valid but cannot drive the requested mode (e.g. MIDI-only + flow)."""
+    """The input format is unsupported."""
 
     exit_code = EXIT_UNSUPPORTED
 
