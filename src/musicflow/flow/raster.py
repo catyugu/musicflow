@@ -1,19 +1,12 @@
-"""Rasterising the engraved strip into tiles.
-
-One tile pixel is one layout unit, so a tile is a lossless sample of the SVG at the
-scale the layout decided. Tiles are cut from band renders rather than rendered one by
-one: re-parsing a multi-megabyte Verovio page per tile dominates the runtime, while a
-band of a few tiles stays inside a bounded pixel budget.
-"""
+"""Rasterise each SVG band once, then build tiles in output pixels."""
 
 from __future__ import annotations
 
 import math
-from collections.abc import Iterator
 from io import BytesIO
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
-import numpy as np
 import resvg_py
 from PIL import Image
 
@@ -22,126 +15,73 @@ from ..model import Rect, Tile
 from .markup import SvgDocument
 
 TILE_WIDTH = 4096
-INK_THRESHOLD = 200
-
-_BAND_PIXEL_BUDGET = 24_000_000
-_OVERVIEW_PIXEL_BUDGET = 8_000_000
-_OVERVIEW_MAX_WIDTH = 12_000
-
-
-def bands(strip_width: float, strip_height: float) -> Iterator[tuple[int, int]]:
-    """Split ``[0, ceil(strip_width))`` into bands bounded by the pixel budget."""
-    total = max(1, math.ceil(strip_width))
-    tile_rows = max(1, math.ceil(strip_height))
-    tiles_per_band = max(1, _BAND_PIXEL_BUDGET // (tile_rows * TILE_WIDTH))
-    band_width = tiles_per_band * TILE_WIDTH
-    start = 0
-    while start < total:
-        width = min(band_width, total - start)
-        yield start, width
-        start += width
-
-
-def render(
-    document: SvgDocument, x0: float, width: int, height: int, *, paper: str = "#ffffff"
-) -> np.ndarray:
-    """Render a full-height strip window at one pixel per layout unit (``RGB``).
-
-    ``paper`` is the rasteriser's background. The delivery pipeline passes the video canvas colour,
-    so the engraved strip's paper and the canvas are the same colour and the frame has no visible
-    seam where the strip ends.
-    """
-    data = resvg_py.svg_to_bytes(
-        svg_string=document.window(x0, 0.0, width, height),
-        width=width,
-        height=height,
-        background=paper,
-    )
-    image = Image.open(BytesIO(bytes(data))).convert("RGB")
-    if image.size != (width, height):
-        raise AnalysisError(f"rasteriser returned {image.size}, expected {(width, height)}")
-    return np.asarray(image)
-
-
-def _ink_mask(pixels: np.ndarray) -> np.ndarray:
-    return pixels.min(axis=2) < INK_THRESHOLD
-
-
-def _bounds(mask: np.ndarray, x0: int) -> Rect | None:
-    rows = np.flatnonzero(mask.any(axis=1))
-    columns = np.flatnonzero(mask.any(axis=0))
-    if rows.size == 0:
-        return None
-    return Rect(
-        float(x0 + columns[0]),
-        float(rows[0]),
-        float(x0 + columns[-1] + 1),
-        float(rows[-1] + 1),
-    )
-
-
-def ink_bounds(
-    document: SvgDocument, *, strip_width: float, strip_height: float, paper: str = "#ffffff"
-) -> Rect | None:
-    """Ink bounding box of the whole strip, in layout units."""
-    found: Rect | None = None
-    for x0, width in bands(strip_width, strip_height):
-        pixels = render(document, x0, width, math.ceil(strip_height), paper=paper)
-        bounds = _bounds(_ink_mask(pixels), x0)
-        if bounds is not None:
-            found = bounds if found is None else found.union(bounds)
-    return found
+BAND_PIXELS = 8_000_000
 
 
 def write_tiles(
-    document: SvgDocument,
-    *,
-    work_dir: Path,
-    strip_width: float,
-    strip_height: float,
-    paper: str = "#ffffff",
-) -> tuple[tuple[Tile, ...], Rect | None]:
-    """Rasterise the strip into ``work_dir/tiles`` and report its ink bounding box."""
+    document: SvgDocument, *, work_dir: Path, target_height: int, paper: str
+) -> tuple[tuple[Tile, ...], Rect, float]:
+    """Find the ink bounds and return the cropped tiles, content box and SVG-to-pixel scale."""
+    # At this working resolution the final resample preserves thin staff lines. Band padding
+    # lets Lanczos read across boundaries, including when the output is slightly smaller.
+    sample_height = math.ceil(target_height * 1.25)
+    sample_scale = sample_height / document.height
+    sample_width = math.ceil(document.width * sample_scale)
+    guard = math.ceil(3 * sample_height / target_height) + 2
+    band_width = max(1, BAND_PIXELS // sample_height - 2 * guard)
     directory = work_dir / "tiles"
     directory.mkdir(parents=True, exist_ok=True)
-    height = math.ceil(strip_height)
-    tiles: list[Tile] = []
-    content: Rect | None = None
-    for band_x0, band_width in bands(strip_width, strip_height):
-        pixels = render(document, band_x0, band_width, height, paper=paper)
-        bounds = _bounds(_ink_mask(pixels), band_x0)
-        if bounds is not None:
-            content = bounds if content is None else content.union(bounds)
-        for offset in range(0, band_width, TILE_WIDTH):
-            tile_width = min(TILE_WIDTH, band_width - offset)
-            name = f"strip-{len(tiles):04d}.png"
-            Image.fromarray(pixels[:, offset : offset + tile_width]).save(directory / name)
-            tiles.append(
-                Tile(
-                    path=f"tiles/{name}",
-                    x0=float(band_x0 + offset),
-                    width=tile_width,
-                    height=height,
-                )
+    tiles = []
+    ink = None
+
+    with TemporaryDirectory(dir=work_dir) as temporary:
+        bands: list[tuple[Path, int, int, int]] = []
+        for start in range(0, sample_width, band_width):
+            end = min(start + band_width, sample_width)
+            origin = max(0, start - guard)
+            width = min(end + guard, sample_width) - origin
+            data = resvg_py.svg_to_bytes(
+                svg_string=document.window(origin, 0, width, sample_height, scale=sample_scale),
+                width=width,
+                height=sample_height,
             )
-    return tuple(tiles), content
+            with Image.open(BytesIO(bytes(data))) as source:
+                rgba = source.convert("RGBA")
+            bounds = rgba.crop((start - origin, 0, end - origin, sample_height)).getbbox(
+                alpha_only=True
+            )
+            if bounds:
+                x0, y0, x1, y1 = bounds
+                box = Rect(x0 + start, y0, x1 + start, y1)
+                ink = box if ink is None else ink.union(box)
+            background = Image.new("RGB", rgba.size, paper)
+            background.paste(rgba, mask=rgba.getchannel("A"))
+            path = Path(temporary) / f"{start}.png"
+            background.save(path, compress_level=1)
+            bands.append((path, origin, start, end))
 
+        if ink is None:
+            raise AnalysisError("the engraved strip has no ink")
+        ratio = target_height / ink.height
+        for path, origin, start, end in bands:
+            left, right = round(start * ratio), round(end * ratio)
+            with Image.open(path) as image:
+                for x in range(left, right, TILE_WIDTH):
+                    stop = min(x + TILE_WIDTH, right)
+                    width = stop - x
+                    tile = image.resize(
+                        (width, target_height),
+                        Image.Resampling.LANCZOS,
+                        box=(
+                            x / ratio - origin,
+                            ink.y0,
+                            min(stop / ratio - origin, image.width),
+                            ink.y1,
+                        ),
+                    )
+                    name = f"strip-{len(tiles):04d}.png"
+                    tile.save(directory / name, compress_level=1)
+                    tiles.append(Tile(f"tiles/{name}", x, width, target_height))
 
-def write_overview(
-    document: SvgDocument,
-    path: Path,
-    *,
-    strip_width: float,
-    strip_height: float,
-    paper: str = "#ffffff",
-) -> None:
-    """Write a downscaled picture of the whole strip for a human to eyeball."""
-    width = min(strip_width, _OVERVIEW_MAX_WIDTH)
-    # Both axes scale, so the raster area grows with the square of the width.
-    width = min(width, math.sqrt(_OVERVIEW_PIXEL_BUDGET * strip_width / max(1.0, strip_height)))
-    data = resvg_py.svg_to_bytes(
-        svg_string=document.markup,
-        width=max(1, int(width)),
-        background=paper,
-    )
-    Image.open(BytesIO(bytes(data))).convert("RGB").save(path)
+    content = Rect(ink.x0 * ratio, 0.0, ink.x1 * ratio, float(target_height))
+    return tuple(tiles), content, sample_scale * ratio

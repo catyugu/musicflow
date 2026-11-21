@@ -91,7 +91,7 @@ def _print_report(report: dict) -> None:
         status = "ok  " if check["ok"] else "FAIL"
         print(f"check            {status} {check['name']}: {check['detail']}")
     if flow:
-        print(f"flow             strip {flow['strip_width']:.0f} units, {flow['tiles']} tiles")
+        print(f"flow             strip {flow['strip_width']:.0f} pixels, {flow['tiles']} tiles")
     timings = ", ".join(f"{name} {seconds:.1f} s" for name, seconds in report["timings"].items())
     print(f"timings          {timings}")
 

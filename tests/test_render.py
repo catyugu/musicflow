@@ -47,7 +47,7 @@ def strip(tmp_path: Path) -> tuple[Path, model.FlowLayout]:
     tiles_dir.mkdir()
     for name, value in (("t0.png", 0), ("t1.png", 30)):
         tile = np.full((50, 100, 3), 255, dtype=np.uint8)
-        tile[20:22, 5:95] = value
+        tile[20:30, :] = value
         Image.fromarray(tile).save(tiles_dir / name)
     flow = model.FlowLayout(
         strip_width=200.0,
@@ -125,13 +125,17 @@ def test_flow_frame_moves_the_strip_past_the_reading_line(tmp_path: Path) -> Non
         "the line must sit on spec.line_x"
     )
     assert np.array_equal(first[0, column + 5], rgb(spec.background))
-    assert float(np.mean(np.all(first < 120, axis=2))) > 0.03, "the strip must show its ink"
+    assert float(np.mean(np.all(first < 120, axis=2))) > 0.015, "the strip must show its ink"
     assert np.abs(first.astype(int) - second.astype(int)).mean() > 1.0, "the strip did not move"
 
-    window = tiles.window(90, 10, 30, 30, np.asarray(rgb(spec.background), dtype=np.uint8))
-    assert window.shape == (30, 30, 3)
-    assert np.array_equal(window[10, 0], [0, 0, 0]), "a window must read the tile on its left"
-    assert np.array_equal(window[10, 29], [30, 30, 30]), "and stitch the next tile at its seam"
+    window = np.empty((50, 30, 3), dtype=np.uint8)
+    tiles.copy_window(window, 90, rgb(spec.background))
+    assert np.all(window[20:30, :10] == 0)
+    assert np.all(window[20:30, 10:] == 30)
+    tiles.copy_window(window, -20, rgb(spec.background))
+    assert np.all(window[:, :20] == rgb(spec.background))
+    tiles.copy_window(window, 190, rgb(spec.background))
+    assert np.all(window[:, 10:] == rgb(spec.background))
 
 
 def test_missing_resources_are_typed_errors(tmp_path: Path) -> None:

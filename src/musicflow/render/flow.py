@@ -1,23 +1,20 @@
 """Continuous flow: one engraved strip moved past a fixed reading line.
 
-The strip is engraved once (``musicflow.flow``) and rasterised into tiles at one pixel per layout
-unit. A frame is a ``spec.width``-wide window of that strip placed so the camera position sits on
-``spec.line_x``; the strip's content is scaled to 0.86 of the frame height and centred vertically.
+The strip tiles are already sized for the video. Each frame copies the visible window
+so the camera position sits on the reading line.
 """
 
 from __future__ import annotations
 
 import logging
-import math
 from pathlib import Path
 
 import numpy as np
-from PIL import Image
 
 from ..errors import RenderError
 from ..model import Alignment, FlowLayout, Route, VideoSpec
 from .camera import CameraTrack
-from .canvas import draw_reading_line, rgb
+from .canvas import blank, draw_reading_line, rgb
 from .encoder import FrameSource, encode, plan_timeline
 from .tiles import StripTiles
 
@@ -63,40 +60,16 @@ def plan_camera(*, route: Route, flow: FlowLayout, alignment: Alignment) -> Came
 def _frame_source(
     *, camera_x: np.ndarray, tiles: StripTiles, flow: FlowLayout, spec: VideoSpec
 ) -> FrameSource:
-    assert flow.content.height > 0, "flow content has no height"
-    scale = CONTENT_HEIGHT_RATIO * spec.height / flow.content.height
-    target_height = max(1, round(CONTENT_HEIGHT_RATIO * spec.height))
-    top = round(flow.content.y0)
-    bottom = max(top + 1, round(flow.content.y1))
+    height = round(flow.strip_height)
+    assert 0 < height <= spec.height
+    top = (spec.height - height) // 2
+    frame = blank(spec)
+    window = frame[top : top + height]
     background = rgb(spec.background)
-    content_height = float(bottom - top)
-    # A constant window width keeps the strip buffer reusable; the extra columns beyond the crop
-    # box are what the bilinear filter reads at the right edge.
-    window_width = math.ceil(spec.width / scale) + 2
-    paste_top = (spec.height - target_height) // 2
-    # One canvas for the whole render: the encoder writes each frame out before asking for the
-    # next one, so the buffer is never live in two frames at once.
-    frame = np.empty((spec.height, spec.width, 3), dtype=np.uint8)
 
     def frame_at(index: int) -> np.ndarray:
-        left = float(camera_x[index]) - spec.line_x / scale
-        columns_from = math.floor(left)
-        window = tiles.window(columns_from, top, window_width, bottom - top, background)
-        # A floating-point crop box keeps the fractional camera offset, so the strip moves in
-        # sub-pixel steps instead of snapping to whole raster columns.
-        scaled = Image.fromarray(window).resize(
-            (spec.width, target_height),
-            Image.Resampling.BILINEAR,
-            box=(
-                left - columns_from,
-                0.0,
-                left - columns_from + spec.width / scale,
-                content_height,
-            ),
-        )
-        frame[:paste_top] = background
-        frame[paste_top : paste_top + target_height] = np.asarray(scaled)
-        frame[paste_top + target_height :] = background
+        left = round(float(camera_x[index]) - spec.line_x)
+        tiles.copy_window(window, left, background)
         draw_reading_line(frame, spec)
         return frame
 
