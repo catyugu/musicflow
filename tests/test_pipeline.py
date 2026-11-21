@@ -12,6 +12,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from msgspec.structs import replace as replace_struct
 from support import SPEC, flow_of, layout_of, measure, musicxml, note, time_map, written
 
 from musicflow import cli, model, pipeline, workdir
@@ -23,6 +24,15 @@ from musicflow.errors import (
     UnsupportedInputError,
 )
 from musicflow.symbolic.route import build_route
+
+EVIDENCE = model.AlignmentEvidence(
+    similarity_mean=0.5,
+    residual_ms={"median": 1.0},
+    onset_lag_ms=0.0,
+    implied_bpm=120.0,
+    coverage=1.0,
+    length_ratio=1.0,
+)
 
 
 def case_inputs(directory: Path) -> pipeline.Inputs:
@@ -49,20 +59,10 @@ def fake_stages(monkeypatch: pytest.MonkeyPatch) -> dict[str, list]:
             (debug_dir / "page-1.png").write_bytes(b"bitmap")
         return layout_of(measures=4)
 
-    def align(score, route, audio, *, work_dir, constraints=None):
+    def align(score, route, audio, *, constraints=None):
         routes.append(route)
         duration = max(route.total_q * 0.5, 1.0)
-        evidence = {
-            "method": "fake",
-            "audio_duration": duration,
-            "implied_bpm": 60.0 * route.total_q / duration,
-            "similarity_mean": 0.5,
-            "coverage": 1.0,
-            "residual_ms": {"median": 1.0, "p90": 2.0, "max": 3.0},
-        }
-        (work_dir / "report.json").write_text(json.dumps(evidence), encoding="utf-8")
-        anchors = (model.Anchor(0.0, 0.0, "start"), model.Anchor(route.total_q, duration, "end"))
-        return model.Alignment(anchors=anchors, audio_duration=duration, method="fake")
+        return time_map(total_q=route.total_q, seconds=duration), EVIDENCE
 
     def build(score, written_musicxml, *, work_dir, target_content_height, paper):
         builds.append(1)
@@ -87,18 +87,13 @@ def hand_analysis() -> pipeline.Analysis:
         alignment=time_map(total_q=16.0, seconds=8.0),
         layout=layout_of(measures=4),
         flow=flow_of(score),
-        align_report={"coverage": 1.0, "residual_ms": {"median": 1.0}},
+        evidence=EVIDENCE,
     )
 
 
-def test_inputs_validate_and_name_their_provider(tmp_path: Path) -> None:
+def test_inputs_validate(tmp_path: Path) -> None:
     inputs = case_inputs(tmp_path / "case")
     inputs.validate()
-    assert inputs.provider == "musicxml"
-    midi = tmp_path / "take.mid"
-    midi.write_bytes(b"MThd")
-    assert replace(inputs, symbolic=midi).provider == "midi"
-
     for field, path, message in (
         ("pdf", tmp_path / "absent.pdf", "PDF score not found"),
         ("audio", tmp_path / "absent.mp3", "recording not found"),
@@ -111,7 +106,7 @@ def test_inputs_validate_and_name_their_provider(tmp_path: Path) -> None:
         replace(inputs, pdf=inputs.audio).validate()
     notebook = tmp_path / "notes.txt"
     notebook.write_text("not music", encoding="utf-8")
-    with pytest.raises(UnsupportedInputError, match="MusicXML, MXL or MIDI"):
+    with pytest.raises(UnsupportedInputError, match="MusicXML or MXL"):
         replace(inputs, symbolic=notebook).validate()
 
 
@@ -120,33 +115,28 @@ def test_workdir_keys_and_the_step_cache(tmp_path: Path) -> None:
     first.write_bytes(b"one")
     second.write_bytes(b"two")
     assert workdir.digest_file(first) != workdir.digest_file(second)
-    base = workdir.key({"a": workdir.digest_file(first)}, {"p": 1})
-    assert base == workdir.key({"a": workdir.digest_file(first)}, {"p": 1})
-    assert base != workdir.key({"a": workdir.digest_file(first)}, {"p": 2})
-    assert base != workdir.key({"a": workdir.digest_file(second)}, {"p": 1})
-    reordered = workdir.hash_payload({"b": [1, 2], "a": 1})
-    assert workdir.hash_payload({"a": 1, "b": [1, 2]}) == reordered
-    assert workdir.hash_payload({"a": 1}) != workdir.hash_payload({"a": 2})
+    assert workdir.key({"b": [1, 2], "a": 1}) == workdir.key({"a": 1, "b": [1, 2]})
 
-    calls: list[str] = []
-    step = workdir.Workspace(tmp_path / "work").step("demo")
+    calls: list[Path] = []
+    workspace = workdir.Workspace(tmp_path / "work")
+    step = workspace.step("demo", "key-a")
 
-    def compute(path: Path) -> dict[str, object]:
-        calls.append("run")
+    def compute(path: Path) -> dict[str, str]:
+        calls.append(path)
         (path / "side.bin").write_bytes(b"x")
         return {"file": "side.bin"}
 
-    def present(payload: dict[str, object]) -> bool:
-        return (step.path / str(payload["file"])).is_file()
+    def present(payload: dict) -> bool:
+        return (step.path / payload["file"]).is_file()
 
-    assert step.run("key-a", compute, validate=present) == {"file": "side.bin"}
-    assert step.run("key-a", compute, validate=present) == {"file": "side.bin"}
-    assert calls == ["run"], "an unchanged key did not reuse the payload"
-    assert step.run("key-b", compute, validate=present) == {"file": "side.bin"}
-    assert calls == ["run", "run"], "a different key served the old payload"
+    assert step.run(dict, compute, present=present) == {"file": "side.bin"}
+    assert step.run(dict, compute, present=present) == {"file": "side.bin"}
+    assert len(calls) == 1
     (step.path / "side.bin").unlink()
-    assert step.run("key-b", compute, validate=present) == {"file": "side.bin"}
-    assert calls == ["run", "run", "run"], "a payload whose side file is gone was reused"
+    assert step.run(dict, compute, present=present) == {"file": "side.bin"}
+    (step.path / "cache.json").write_text("corrupt", encoding="utf-8")
+    assert step.run(dict, compute, present=present) == {"file": "side.bin"}
+    assert len(calls) == 3
 
 
 def test_analyze_writes_one_report_with_checks(
@@ -158,18 +148,8 @@ def test_analyze_writes_one_report_with_checks(
 
     analysis = pipeline.analyze(inputs, workspace, spec=SPEC, with_pdf=True, with_flow=True)
     report = workdir.read_json(workspace.root / pipeline.REPORT_NAME)
-    expected = "inputs tools spec score route layout alignment flow checks artifacts timings"
-    assert set(report) == set(expected.split())
-    assert report["spec"] == SPEC.to_dict()
-    summary = (report["score"]["provider"], report["layout"]["systems"], report["flow"]["tiles"])
-    assert summary == ("musicxml", 1, 1)
-    assert report["alignment"]["similarity_mean"] == 0.5, "headline numbers come from the evidence"
     assert report["alignment"]["coverage"] == 1.0
-    align_dir = workspace.step("align").path
-    assert report["artifacts"]["align_report"] == str((align_dir / "report.json").resolve())
-    assert report["artifacts"]["alignment_figure"] is None
-    assert report["artifacts"]["videos"] == {}
-    assert set(report["timings"]) == {"symbolic", "pdf", "align", "flow", "total"}
+    assert report["debug_images"] is None
     names = [
         "staffs_per_system",
         "measure_count",
@@ -184,12 +164,11 @@ def test_analyze_writes_one_report_with_checks(
 
     pipeline.analyze(inputs, workspace, spec=SPEC, with_pdf=True, with_flow=True, debug_images=True)
     report = workdir.read_json(workspace.root / pipeline.REPORT_NAME)
-    debug_dir = workspace.step("pdf").path / "debug"
+    debug_dir = Path(report["debug_images"])
     assert list(debug_dir.glob("*.png")), "--debug-images wrote nothing"
-    assert report["artifacts"]["debug_images"] == str(debug_dir.resolve())
     assert len(stages["builds"]) == 1, "the second run engraved an unchanged strip again"
 
-    (workspace.step("flow").path / "tiles/t0.png").unlink()
+    (analysis.tiles_dir / "tiles/t0.png").unlink()
     pipeline.analyze(inputs, workspace, spec=SPEC, with_pdf=True, with_flow=True)
     assert len(stages["builds"]) == 2, "a cached flow layout whose tile is gone was reused"
 
@@ -204,17 +183,14 @@ def test_analyze_reuses_cached_steps_and_rekeys_on_the_route(
     pipeline.analyze(inputs, workspace, spec=SPEC, with_pdf=False)
     pipeline.analyze(inputs, workspace, spec=SPEC, with_pdf=False)
     assert len(routes) == 1, "the second run re-aligned an unchanged score"
-    (workspace.step("align").path / "report.json").unlink()
-    pipeline.analyze(inputs, workspace, spec=SPEC, with_pdf=False)
-    assert len(routes) == 2, "an alignment whose report is gone was reused"
 
     for name, spans in (("forward", [[1, 4]]), ("backward", [[4, 4], [1, 1]])):
         path = tmp_path / f"{name}.json"
         path.write_text(json.dumps({"spans": spans}), encoding="utf-8")
         pipeline.analyze(replace(inputs, route_override=path), workspace, spec=SPEC, with_pdf=False)
-    assert len(routes) == 4, "a different performance route served the first route's alignment"
-    assert [route.source for route in routes[2:]] == ["override", "override"]
-    assert routes[2].to_dict() != routes[3].to_dict()
+    assert len(routes) == 3, "a different performance route served the first route's alignment"
+    assert [route.source for route in routes[1:]] == ["override", "override"]
+    assert routes[1] != routes[2]
 
 
 def test_checks_and_render_cover_only_the_artifacts_they_have(tmp_path: Path) -> None:
@@ -227,11 +203,11 @@ def test_checks_and_render_cover_only_the_artifacts_they_have(tmp_path: Path) ->
     assert [check["name"] for check in pipeline.checks(with_layout)] == expected
     measure_check = next(c for c in pipeline.checks(with_layout) if c["name"] == "measure_count")
     assert measure_check["ok"] is True, "four detected measures against four written measures agree"
-    wrong = replace(with_layout.layout.systems[0], measure_count=9)
-    disagreed = replace(with_layout, layout=replace(with_layout.layout, systems=(wrong,)))
+    wrong = replace_struct(with_layout.layout.systems[0], measure_count=9)
+    disagreed = replace(with_layout, layout=replace_struct(with_layout.layout, systems=(wrong,)))
     assert not next(c for c in pipeline.checks(disagreed) if c["name"] == "measure_count")["ok"]
 
-    short = replace(flow_of(analysis.score), note_x=flow_of(analysis.score).note_x[:1])
+    short = replace_struct(flow_of(analysis.score), note_x=flow_of(analysis.score).note_x[:1])
     with_flow = replace(bare, layout=layout_of(measures=4), flow=short)
     coverage = next(c for c in pipeline.checks(with_flow) if c["name"] == "flow_note_coverage")
     assert coverage["ok"] is False, "one of four written notes placed must not pass"
@@ -241,7 +217,6 @@ def test_checks_and_render_cover_only_the_artifacts_they_have(tmp_path: Path) ->
         with pytest.raises(AssertionError):
             pipeline.render(
                 inputs,
-                workdir.Workspace(tmp_path / "work"),
                 mode=mode,
                 out=tmp_path / f"{mode}.mp4",
                 spec=SPEC,
@@ -258,7 +233,7 @@ def test_run_case_task_analyses_once_and_records_every_mode(
         analyses.append((kw["with_pdf"], kw["with_flow"]))
         return hand_analysis()
 
-    def fake_render(inputs, workspace, *, mode, out, spec, preview=None, analysis=None):
+    def fake_render(inputs, *, mode, out, spec, preview=None, analysis=None):
         if mode == "flow":
             raise RuntimeError("encoder exploded")
         out.parent.mkdir(parents=True, exist_ok=True)
@@ -271,7 +246,6 @@ def test_run_case_task_analyses_once_and_records_every_mode(
         case="case1",
         inputs=case_inputs(tmp_path / "case"),
         out_dir=tmp_path / "out",
-        work_dir=tmp_path / "out" / "case1",
         spec=SPEC,
         preview=2.0,
         modes=("switch", "flow"),
@@ -293,9 +267,7 @@ def test_run_case_task_analyses_once_and_records_every_mode(
     assert all(not record["ok"] and "corrupt" in record["error"] for record in failed)
 
 
-def test_batch_keeps_a_skip_record_and_finds_the_richest_source(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_batch_requires_musicxml(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     with pytest.raises(InputError):
         pipeline.batch(
             tmp_path / "nope", tmp_path / "out", modes=["switch"], spec=SPEC, preview=1.0, jobs=1
@@ -310,12 +282,10 @@ def test_batch_keeps_a_skip_record_and_finds_the_richest_source(
         (directory / f"{name}.mid").write_bytes(b"MThd")
     alpha = corpus / "alpha"
     musicxml(alpha / "alpha.musicxml", [measure(1, note("C", 4), attributes=True)])
-    assert pipeline.discover_case(alpha)[2] == alpha / "alpha.musicxml", (
-        "a directory holding MusicXML, MXL and MIDI must be driven by the MusicXML"
-    )
+    assert pipeline.discover_case(alpha).symbolic == alpha / "alpha.musicxml"
     monkeypatch.setattr(pipeline, "analyze", lambda inputs, workspace, **kw: hand_analysis())
 
-    def fake_render(inputs, workspace, *, mode, out, spec, preview=None, analysis=None):
+    def fake_render(inputs, *, mode, out, spec, preview=None, analysis=None):
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_bytes(b"mp4")
         return out
@@ -324,15 +294,11 @@ def test_batch_keeps_a_skip_record_and_finds_the_richest_source(
     records = pipeline.batch(
         corpus, tmp_path / "out", modes=["switch", "flow"], spec=SPEC, preview=1.0, jobs=1
     )
-    skipped = [record for record in records if record.get("skipped")]
-    assert len(skipped) == 1
-    assert (skipped[0]["case"], skipped[0]["mode"]) == ("beta", "flow")
-    assert "MusicXML" in skipped[0]["skipped"]
-    rendered = [(r["case"], r["mode"], r["ok"]) for r in records if not r.get("skipped")]
-    assert rendered == [
+    failure, *rendered = records
+    assert failure["case"] == "beta" and "MusicXML" in failure["error"]
+    assert [(r["case"], r["mode"], r["ok"]) for r in rendered] == [
         ("alpha", "switch", True),
         ("alpha", "flow", True),
-        ("beta", "switch", True),
     ]
 
 

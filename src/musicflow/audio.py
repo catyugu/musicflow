@@ -1,18 +1,10 @@
-"""Recording access through ffmpeg.
-
-The recording is the master clock, so every module that needs samples or a duration goes through
-this module. Decoding uses ffmpeg rather than a Python container library: ffmpeg is a declared
-requirement anyway (it also muxes the MP4) and it decodes every format the corpus and users may
-bring without adding codec wheels.
-"""
+"""Decode the recording through FFmpeg."""
 
 from __future__ import annotations
 
-import json
 import logging
 import shutil
 import subprocess
-from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -24,44 +16,11 @@ logger = logging.getLogger(__name__)
 ANALYSIS_SAMPLE_RATE = 24000
 
 
-@dataclass(frozen=True, slots=True)
-class AudioInfo:
-    duration: float
-
-
-def _tool(name: str) -> str:
+def require_tool(name: str) -> str:
     executable = shutil.which(name)
     if executable is None:
         raise MissingToolError(f"{name} is required but was not found on PATH")
     return executable
-
-
-def probe(path: Path) -> AudioInfo:
-    """Container-level facts about a recording, read with ffprobe."""
-    if not path.is_file():
-        raise InputError(f"recording not found: {path}")
-    command = [
-        _tool("ffprobe"),
-        "-v",
-        "error",
-        "-select_streams",
-        "a:0",
-        "-show_entries",
-        "stream=duration",
-        "-of",
-        "json",
-        str(path),
-    ]
-    result = subprocess.run(command, capture_output=True, text=True, check=False)
-    if result.returncode != 0:
-        raise InputError(f"cannot read audio stream of {path}: {result.stderr.strip()}")
-    streams = json.loads(result.stdout).get("streams") or []
-    if not streams:
-        raise InputError(f"{path} has no audio stream")
-    duration = float(streams[0].get("duration") or 0.0)
-    if duration <= 0.0:
-        raise InputError(f"{path} reports no duration")
-    return AudioInfo(duration=duration)
 
 
 def decode(path: Path, *, sample_rate: int = ANALYSIS_SAMPLE_RATE) -> np.ndarray:
@@ -69,7 +28,7 @@ def decode(path: Path, *, sample_rate: int = ANALYSIS_SAMPLE_RATE) -> np.ndarray
     if not path.is_file():
         raise InputError(f"recording not found: {path}")
     command = [
-        _tool("ffmpeg"),
+        require_tool("ffmpeg"),
         "-v",
         "error",
         "-i",

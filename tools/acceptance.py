@@ -1,658 +1,154 @@
-"""Acceptance harness: judge each case, render its modes, measure the produced videos.
-
-This is the V1-V4 regression driver of doc/PLAN.md and the only place where the corpus in
-``test_cases/`` is exercised: the pytest suite is a small unit suite over synthetic input. It runs
-one analysis per case, checks that analysis against the corpus verdicts, renders every requested
-mode from it, probes each produced MP4 (frame rate, frame count, duration against the recording),
-samples frames at native resolution, checks that each one carries score ink and, for flow, the
-reading line, then writes a JSON report plus a contact sheet per render.
-
-The corpus verdicts are the checks pytest used to own before the corpus left the test framework:
-
-* every ``checks`` entry of the case's ``report.json`` must hold (staffs per system, measure count,
-  tempo, alignment confidence, flow note coverage);
-* the alignment evidence (``align/report.json``) must reach the corpus accuracy gates: coverage and
-  snapped residual median everywhere, and for the cases whose MIDI renders the same performance
-  (case1, case3) the de-medianed error against the MIDI's performed onsets.
-
-The report splits the cost of a mode the way the plan asks for it: the shared analysis (the
-``timings`` of ``report.json``), its engraving stage, and the render's own frame composition and
-encoding (see ``musicflow.render.encoder.LAST_STATS``).
-
-Usage:
-
-    uv run python tools/acceptance.py --out build/acceptance
-    uv run python tools/acceptance.py --out build/acceptance --preview 20 --size 960x540
-    uv run python tools/acceptance.py --out build/acceptance --cases case1 --modes switch
-"""
+"""Full corpus acceptance. Run with uv run pytest tools/acceptance.py -s."""
 
 from __future__ import annotations
 
-import argparse
+import hashlib
 import json
 import subprocess
-import sys
-import time
-from dataclasses import dataclass, field
+from collections import defaultdict, deque
+from fractions import Fraction
 from pathlib import Path
+from tempfile import mkdtemp
 
 import numpy as np
 import partitura
-from PIL import Image, ImageDraw
+import pytest
+from scipy.signal import correlate
 
-from musicflow import pipeline, scorexml, workdir
-from musicflow.errors import MusicFlowError
+from musicflow import pipeline, workdir
+from musicflow.audio import decode
 from musicflow.model import VideoSpec
-from musicflow.render import encoder
 from musicflow.render.canvas import rgb
 
-SAMPLE_FRAMES = 6
-SHEET_WIDTH = 640
-DURATION_TOLERANCE = 0.2
-FRAME_TOLERANCE = 5
+ROOT = Path(__file__).resolve().parents[1]
+SPEC = VideoSpec()
 
-#: Accuracy gates of the corpus alignment, in milliseconds where a duration is named.
-MIN_COVERAGE = 0.9
-MAX_RESIDUAL_MS = 150.0
-MAX_MIDI_P50_MS = 20.0
-MAX_MIDI_P90_MS = 60.0
-MIN_MATCH_RATE = 0.95
-MAX_OFFSET_MS = 100.0
-#: The corpus MIDI of these cases renders the very performance its recording holds.
-MIDI_GROUND_TRUTH = ("case1", "case3")
-#: Ticks per quarter note of the corpus MIDI files; their tick position is the written quarter.
-QUARTER_TICKS = 480.0
-#: A MIDI that is not on this quarter grid, or lasts another time, is the notation at its own tempo.
-GRID_RATIO = (0.9, 1.1)
-DURATION_RATIO = (0.95, 1.05)
+# System counts and SHA-256 of (page, first measure, last measure, barline count) at fa38ba2.
+LAYOUTS = {
+    "case1": (42, "0675e7c786c688fcbb6bd0db216aeeef67d9fc47b36968433318a042479ac540"),
+    "case2": (21, "9dda347baf57dfc04da122dfc79b1d8ae6d6e01b57511cfa64ab76533f4d2a59"),
+    "case3": (39, "a42badaffb7435ca131ba0e0643301a3661361908901f078fc09d63dd34b85b4"),
+    "case4": (21, "0656d5481aa61df29446c01a6f0a671341dba68a8363b34ee09e2fbb5aa0b69f"),
+}
 
 
-@dataclass(frozen=True)
-class MidiError:
-    """Error of the aligned time map against a MIDI that renders the same performance.
-
-    ``p50`` and ``p90`` are the absolute error after removing its median, so a systematic lag is
-    visible through ``offset`` instead of hiding inside the spread. ``note`` is set instead of a
-    measurement when the MIDI provably is not this performance: such a case has no ground truth and
-    is recorded, never quietly passed.
-    """
-
-    pairs: int
-    match_rate: float
-    offset_ms: float
-    p50_ms: float
-    p90_ms: float
-    note: str = ""
-
-    def problems(self) -> list[str]:
-        if self.note:
-            return []
-        if self.pairs == 0:
-            return ["the MIDI shares no performed onset with the performance route"]
-        found: list[str] = []
-        if self.match_rate < MIN_MATCH_RATE:
-            found.append(f"only {self.match_rate:.1%} of the route's notes matched the MIDI")
-        if abs(self.offset_ms) > MAX_OFFSET_MS:
-            found.append(f"systematic offset {self.offset_ms:+.0f} ms against the MIDI")
-        if self.p50_ms > MAX_MIDI_P50_MS:
-            found.append(f"de-medianed p50 {self.p50_ms:.1f} ms against the MIDI")
-        if self.p90_ms > MAX_MIDI_P90_MS:
-            found.append(f"de-medianed p90 {self.p90_ms:.1f} ms against the MIDI")
-        return found
-
-    def to_dict(self) -> dict[str, object]:
-        return {
-            "pairs": self.pairs,
-            "match_rate": round(self.match_rate, 4),
-            "offset_ms": round(self.offset_ms, 2),
-            "p50_ms": round(self.p50_ms, 2),
-            "p90_ms": round(self.p90_ms, 2),
-            "note": self.note,
-        }
+@pytest.fixture(scope="module", params=LAYOUTS, ids=LAYOUTS)
+def case(request):
+    name = request.param
+    inputs = pipeline.discover_case(ROOT / "test_cases" / name)
+    root = ROOT / "build" / "acceptance"
+    root.mkdir(parents=True, exist_ok=True)
+    output = Path(mkdtemp(prefix=f"{name}-", dir=root))
+    analysis = pipeline.analyze(inputs, workdir.Workspace(output), spec=SPEC, with_flow=True)
+    return name, inputs, output, analysis
 
 
-@dataclass(frozen=True)
-class Verdict:
-    """What one case's analysis must satisfy before its renders count as acceptance evidence."""
-
-    checks: tuple[tuple[str, str, bool], ...]
-    coverage: float
-    residual_ms: float
-    midi: MidiError | None
-    problems: tuple[str, ...]
-
-    def summary(self) -> str:
-        passing = sum(1 for _, _, ok in self.checks if ok)
-        parts = [
-            f"checks {passing}/{len(self.checks)}",
-            f"coverage {self.coverage:.3f}",
-            f"residual {self.residual_ms:.1f} ms",
-        ]
-        if self.midi is None:
-            parts.append("midi no ground truth")
-        elif self.midi.note:
-            parts.append(f"midi n/a: {self.midi.note}")
-        else:
-            parts.append(
-                f"midi {self.midi.pairs} pairs p50 {self.midi.p50_ms:.1f} ms "
-                f"p90 {self.midi.p90_ms:.1f} ms"
-            )
-        return "  ".join(parts)
-
-    def to_dict(self) -> dict[str, object]:
-        return {
-            "checks": [
-                {"name": name, "detail": detail, "ok": ok} for name, detail, ok in self.checks
-            ],
-            "coverage": round(self.coverage, 4),
-            "residual_ms": round(self.residual_ms, 3),
-            "midi": None if self.midi is None else self.midi.to_dict(),
-            "problems": list(self.problems),
-        }
-
-
-@dataclass(frozen=True)
-class Costs:
-    """What one mode cost: the analysis it shares, its engraving, and its render.
-
-    ``analysis`` is ``report.json``'s ``timings.total`` and ``engraving`` its ``timings.flow``, so
-    both are what the pipeline already recorded; ``composing`` and ``encoding`` come from the
-    encoder statistics of this render. ``analysis`` is paid once per case, not once per mode.
-    """
-
-    analysis: float
-    engraving: float
-    composing: float
-    encoding: float
-    render: float
-    frames: int
-    segments: int
-    cached_segments: int
-
-    def to_dict(self) -> dict[str, float | int]:
-        return {
-            "analysis": round(self.analysis, 1),
-            "engraving": round(self.engraving, 1),
-            "composing": round(self.composing, 1),
-            "encoding": round(self.encoding, 1),
-            "render": round(self.render, 1),
-            "frames": self.frames,
-            "segments": self.segments,
-            "cached_segments": self.cached_segments,
-        }
-
-
-@dataclass
-class CaseResult:
-    case: str
-    mode: str = ""
-    ok: bool = False
-    error: str = ""
-    seconds: float = 0.0
-    video: str = ""
-    video_seconds: float = 0.0
-    expected_seconds: float = 0.0
-    fps: float = 0.0
-    spec_fps: float = 0.0
-    frames: int = 0
-    expected_frames: int = 0
-    has_audio: bool = False
-    ink: list[float] = field(default_factory=list)
-    line: list[float] = field(default_factory=list)
-    sheet: str = ""
-    costs: Costs | None = None
-    verdict: Verdict | None = None
-
-    def problems(self) -> list[str]:
-        """Everything the case and its video must satisfy to count as delivered evidence."""
-        if not self.ok:
-            return [self.error or "render failed"]
-        found: list[str] = [] if self.verdict is None else list(self.verdict.problems)
-        if not self.has_audio:
-            found.append("no audio stream in the MP4")
-        if abs(self.video_seconds - self.expected_seconds) > DURATION_TOLERANCE:
-            found.append(
-                f"duration {self.video_seconds:.2f} s vs audio {self.expected_seconds:.2f} s"
-            )
-        if abs(self.frames - self.expected_frames) > FRAME_TOLERANCE:
-            found.append(f"{self.frames} frames vs {self.expected_frames} expected")
-        if abs(self.fps - self.spec_fps) > 0.01:
-            found.append(f"{self.fps:g} fps vs {self.spec_fps:g}")
-        if self.ink and min(self.ink) < 0.01:
-            found.append(f"a sampled frame is blank (min ink {min(self.ink):.3f})")
-        if self.mode == "flow" and self.line and min(self.line) < 8.0:
-            found.append(f"reading line missing (min contrast {min(self.line):.1f})")
-        return found
-
-    def record(self) -> dict[str, object]:
-        problems = self.problems()
-        return {
-            "case": self.case,
-            "mode": self.mode,
-            "ok": not problems,
-            "problems": problems,
-            "seconds": round(self.seconds, 1),
-            "costs": None if self.costs is None else self.costs.to_dict(),
-            "video": self.video,
-            "video_seconds": round(self.video_seconds, 3),
-            "audio_seconds": round(self.expected_seconds, 3),
-            "fps": self.fps,
-            "frames": self.frames,
-            "expected_frames": self.expected_frames,
-            "min_ink": round(min(self.ink), 4) if self.ink else None,
-            "min_line_contrast": round(min(self.line), 2) if self.line else None,
-            "sheet": self.sheet,
-            "verdict": None if self.verdict is None else self.verdict.to_dict(),
-        }
-
-
-def probe_video(path: Path) -> tuple[float, int, float, float]:
-    """Frame rate, frame count, video duration and audio duration of the produced file."""
-    result = subprocess.run(
-        [
-            "ffprobe",
-            "-v",
-            "error",
-            "-count_frames",
-            "-show_entries",
-            "stream=codec_type,r_frame_rate,nb_read_frames,duration:format=duration",
-            "-of",
-            "json",
-            str(path),
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
+def test_analysis(case):
+    name, inputs, output, analysis = case
+    report = workdir.read_json(output / pipeline.REPORT_NAME)
+    assert report["checks"] and all(check["ok"] for check in report["checks"]), report["checks"]
+    assert analysis.layout and analysis.flow
+    bindings = tuple(
+        (s.page, s.first_measure, s.last_measure, s.measure_count) for s in analysis.layout.systems
     )
-    if result.returncode != 0:
-        raise RuntimeError(f"ffprobe failed on {path}: {result.stderr.strip()}")
-    payload = json.loads(result.stdout)
-    streams = payload.get("streams") or []
-    video = next((s for s in streams if s.get("codec_type") == "video"), {})
-    sound = next((s for s in streams if s.get("codec_type") == "audio"), {})
-    numerator, _, denominator = str(video.get("r_frame_rate", "0/1")).partition("/")
-    fps = float(numerator) / float(denominator or 1)
-    frames = int(video.get("nb_read_frames") or 0)
-    duration = float(video.get("duration") or payload.get("format", {}).get("duration") or 0.0)
-    audio_seconds = float(sound.get("duration") or payload.get("format", {}).get("duration") or 0.0)
-    return fps, frames, duration, audio_seconds
+    assert (len(bindings), hashlib.sha256(repr(bindings).encode()).hexdigest()) == LAYOUTS[name]
+    assert all(0 <= x <= analysis.flow.strip_width for _, x in analysis.flow.note_x)
 
-
-def sample_frame(video: Path, seconds: float, destination: Path) -> np.ndarray:
-    """One frame at native resolution: measuring a downscaled frame hides the reading line."""
-    subprocess.run(
-        [
-            "ffmpeg",
-            "-v",
-            "error",
-            "-ss",
-            f"{seconds:.3f}",
-            "-i",
-            str(video),
-            "-frames:v",
-            "1",
-            "-y",
-            str(destination),
-        ],
-        check=True,
-        capture_output=True,
+    evidence = analysis.evidence
+    residual = evidence.residual_ms["median"]
+    print(
+        f"{name}: {len(bindings)} systems, coverage {evidence.coverage:.3%}, "
+        f"residual {residual:.2f} ms"
     )
-    with Image.open(destination) as image:
-        return np.asarray(image.convert("RGB"), dtype=np.uint8)
+    assert evidence.coverage >= 0.90 and residual <= 150
+    if name in {"case1", "case3"}:
+        _assert_midi_accuracy(name, analysis, inputs.symbolic.with_suffix(".mid"))
 
 
-def ink_ratio(frame: np.ndarray, background: tuple[int, int, int]) -> float:
-    """Fraction of the frame that is not paper: zero on a blank canvas."""
-    distance = np.abs(frame.astype(np.int16) - np.array(background, dtype=np.int16)).sum(axis=2)
-    return float((distance > 40).mean())
-
-
-def line_contrast(frame: np.ndarray, line_x: float) -> float:
-    """How much bluer the reading line's column is than the frame as a whole.
-
-    A video-encoded thin line does not keep an exact RGB value, so presence is measured as colour
-    contrast: the paper is warm (R above B) and the line is blue (B far above R).
-    """
-    blueness = frame[:, :, 2].astype(np.int16) - frame[:, :, 0].astype(np.int16)
-    column = round(line_x)
-    band = blueness[:, max(0, column - 2) : column + 3].mean()
-    return float(band - np.median(blueness))
-
-
-def contact_sheet(frames: list[np.ndarray], path: Path, label: str, spec: VideoSpec) -> Path:
-    """Tile the sampled frames into one downscaled image for a quick visual review."""
-    if not frames:
-        raise RuntimeError("no frames to put on the contact sheet")
-    columns = 2
-    rows = (len(frames) + columns - 1) // columns
-    width = SHEET_WIDTH
-    height = round(spec.height * SHEET_WIDTH / spec.width)
-    margin, caption = 8, 24
-    sheet = Image.new(
-        "RGB",
-        (
-            columns * width + (columns + 1) * margin,
-            rows * (height + caption) + (rows + 1) * margin,
-        ),
-        (235, 232, 224),
-    )
-    draw = ImageDraw.Draw(sheet)
-    for index, frame in enumerate(frames):
-        column, row = index % columns, index // columns
-        left = margin + column * (width + margin)
-        top = margin + row * (height + caption + margin)
-        tile = Image.fromarray(frame).resize((width, height), Image.LANCZOS)
-        sheet.paste(tile, (left, top))
-        draw.text((left, top + height + 5), f"{label} #{index + 1}", fill=(40, 40, 40))
-    sheet.save(path)
-    return path
-
-
-def analyse_case(
-    case_name: str,
-    inputs: pipeline.Inputs,
-    out: Path,
-    spec: VideoSpec,
-    modes: list[str],
-) -> tuple[workdir.Workspace, pipeline.Analysis, dict]:
-    """Run the one analysis a case shares between its modes; return it with its report."""
-    workspace = workdir.Workspace(out / case_name / "work")
-    analysis = pipeline.analyze(
-        inputs,
-        workspace,
-        spec=spec,
-        with_pdf="switch" in modes,
-        with_flow="flow" in modes,
-    )
-    report = workdir.read_json(workspace.root / pipeline.REPORT_NAME)
-    return workspace, analysis, report
-
-
-def midi_error(analysis: pipeline.Analysis, midi: Path) -> MidiError:
-    """Error of the aligned time map against the performed onsets the MIDI states.
-
-    Where the corpus MIDI renders this very performance, its tick position divided by the ticks per
-    quarter *is* the written quarter position and its onset seconds are the performed times, so
-    grouping by that pair matches a route note to its MIDI note without going through the alignment
-    numbers. The grid and length ratios first decide whether the MIDI is this performance at all.
-    """
+def _assert_midi_accuracy(name, analysis, midi):
     notes = partitura.load_performance_midi(midi).note_array()
-    ticks = np.asarray(notes["onset_tick"], dtype=float)
-    pitches = np.asarray(notes["pitch"])
-    seconds = np.asarray(notes["onset_sec"], dtype=float)
-    ends = seconds + np.asarray(notes["duration_sec"], dtype=float)
-    buckets: dict[tuple[float, int], list[float]] = {}
-    for tick, pitch, second in zip(ticks, pitches, seconds, strict=True):
-        buckets.setdefault((round(tick / QUARTER_TICKS, 3), int(pitch)), []).append(float(second))
-    for values in buckets.values():
-        values.sort()
-
-    last_attack_q = max(note.onset_q for note in analysis.route.notes)
-    grid_ratio = (float(ticks.max()) / QUARTER_TICKS) / max(last_attack_q, 1e-9)
-    if not GRID_RATIO[0] <= grid_ratio <= GRID_RATIO[1]:
-        return MidiError(
-            0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            f"the MIDI is on another quarter grid ({grid_ratio:.2f}x the route), so it is not "
-            "this performance",
+    buckets = defaultdict(list)
+    for note in notes:
+        # These two fixtures encode the performance on a 480-tick written quarter grid.
+        buckets[round(float(note["onset_tick"]) / 480, 3), int(note["pitch"])].append(
+            float(note["onset_sec"])
         )
-    duration_ratio = float(ends.max()) / max(analysis.alignment.audio_duration, 1e-9)
-    if not DURATION_RATIO[0] <= duration_ratio <= DURATION_RATIO[1]:
-        return MidiError(
-            0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            f"the MIDI lasts {duration_ratio:.2f}x the recording, so it is the notation at its "
-            "own tempo, not this performance",
-        )
-
+    times = {key: deque(sorted(values)) for key, values in buckets.items()}
     written = analysis.score.note_by_id()
-    quarters: list[float] = []
-    times: list[float] = []
+    quarters, expected = [], []
     for note in analysis.route.notes:
-        values = buckets.get((round(note.onset_q, 3), written[note.note_id].pitch))
-        if values:
+        matches = times.get((round(note.onset_q, 3), written[note.note_id].pitch))
+        if matches:
             quarters.append(note.onset_q)
-            times.append(values.pop(0))
-    if not quarters:
-        return MidiError(0, 0.0, 0.0, 0.0, 0.0)
-    predicted = np.asarray([analysis.alignment.time_at(q) for q in quarters])
-    error = (predicted - np.asarray(times)) * 1000.0
-    offset = float(np.median(error))
-    centred = np.abs(error - offset)
-    return MidiError(
-        pairs=len(quarters),
-        match_rate=len(quarters) / max(len(analysis.route.notes), 1),
-        offset_ms=offset,
-        p50_ms=float(np.median(centred)),
-        p90_ms=float(np.percentile(centred, 90)),
+            expected.append(matches.popleft())
+    assert len(quarters) / len(analysis.route.notes) >= 0.95
+    error = (analysis.alignment.times_at(quarters) - expected) * 1000
+    offset = np.median(error)
+    p50, p90 = np.percentile(np.abs(error - offset), [50, 90])
+    print(f"{name}: MIDI offset {offset:.2f} ms, p50 {p50:.2f} ms, p90 {p90:.2f} ms")
+    assert abs(offset) <= 100 and p50 <= 20 and p90 <= 60
+
+
+@pytest.mark.parametrize("mode", ("switch", "flow"))
+def test_video(case, mode):
+    name, inputs, output, analysis = case
+    video = pipeline.render(
+        inputs, mode=mode, spec=SPEC, out=output / f"{mode}.mp4", analysis=analysis
     )
-
-
-def judge(
-    case_name: str,
-    report: dict,
-    analysis: pipeline.Analysis,
-    midi: Path | None,
-) -> Verdict:
-    """Judge one case's analysis: its report checks, its alignment evidence and the MIDI gates."""
-    checks = tuple(
-        (str(check.get("name")), str(check.get("detail")), bool(check.get("ok")))
-        for check in report.get("checks") or ()
+    metadata = subprocess.check_output(
+        ["ffprobe", "-v", "error", "-show_streams", "-of", "json", str(video)]
     )
-    evidence = analysis.align_report or {}
-    coverage = float(evidence.get("coverage") or 0.0)
-    residual_ms = float((evidence.get("residual_ms") or {}).get("median") or 0.0)
+    picture, sound = json.loads(metadata)["streams"]
+    duration = analysis.alignment.audio_duration
+    assert (picture["codec_type"], sound["codec_type"]) == ("video", "audio")
+    assert (picture["width"], picture["height"]) == (SPEC.width, SPEC.height)
+    assert Fraction(picture["avg_frame_rate"]) == SPEC.fps
+    assert int(picture["nb_frames"]) == round(duration * SPEC.fps)
+    assert abs(float(picture["duration"]) - duration) <= 0.1
+    assert abs(float(sound["duration"]) - duration) <= 0.1
+    _assert_audio_matches(video, inputs.audio)
 
-    problems = [f"check {name}: {detail}" for name, detail, ok in checks if not ok]
-    if not checks:
-        problems.append("the report carries no check")
-    if not evidence:
-        problems.append("the alignment evidence align/report.json is empty")
-    figure = (report.get("artifacts") or {}).get("alignment_figure")
-    if not figure or not Path(figure).is_file():
-        problems.append("the alignment figure is missing")
-    if coverage < MIN_COVERAGE:
-        problems.append(f"alignment coverage {coverage:.3f} is below {MIN_COVERAGE}")
-    if residual_ms > MAX_RESIDUAL_MS:
-        problems.append(
-            f"snapped residual median {residual_ms:.0f} ms is above {MAX_RESIDUAL_MS:.0f} ms"
+    paper = rgb(SPEC.background).astype(np.int16)
+    for fraction in (0.08, 0.25, 0.42, 0.58, 0.75, 0.92):
+        data = subprocess.check_output(
+            [
+                "ffmpeg",
+                "-v",
+                "error",
+                "-filter_threads",
+                "1",
+                "-ss",
+                f"{duration * fraction:.3f}",
+                "-i",
+                str(video),
+                "-frames:v",
+                "1",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgb24",
+                "pipe:1",
+            ]
         )
-
-    measured: MidiError | None = None
-    if case_name in MIDI_GROUND_TRUTH:
-        if midi is None or not midi.is_file():
-            problems.append(f"the MIDI ground truth {case_name}.mid is missing")
-        else:
-            measured = midi_error(analysis, midi)
-            problems.extend(f"MIDI ground truth: {line}" for line in measured.problems())
-    return Verdict(
-        checks=checks,
-        coverage=coverage,
-        residual_ms=residual_ms,
-        midi=measured,
-        problems=tuple(problems),
-    )
-
-
-def render_mode(
-    case_name: str,
-    mode: str,
-    inputs: pipeline.Inputs,
-    workspace: workdir.Workspace,
-    analysis: pipeline.Analysis,
-    report: dict,
-    out: Path,
-    spec: VideoSpec,
-    preview: float | None,
-    verdict: Verdict,
-) -> CaseResult:
-    """Render one mode from the shared analysis and measure the produced video."""
-    result = CaseResult(case=case_name, mode=mode, spec_fps=float(spec.fps), verdict=verdict)
-    video = out / f"{case_name}.{mode}.mp4"
-    started = time.perf_counter()
-    pipeline.render(
-        inputs,
-        workspace,
-        mode=mode,
-        out=video,
-        spec=spec,
-        preview=preview,
-        analysis=analysis,
-    )
-    result.seconds = time.perf_counter() - started
-    result.costs = costs_of(result.seconds, report, encoder.LAST_STATS)
-    result.video = str(video)
-    result.fps, result.frames, result.video_seconds, audio_in_file = probe_video(video)
-    result.has_audio = audio_in_file > 0.0
-    result.expected_seconds = audio_in_file if preview is None else min(preview, audio_in_file)
-    result.expected_frames = round(result.expected_seconds * spec.fps)
-
-    frames_dir = out / "frames"
-    frames_dir.mkdir(parents=True, exist_ok=True)
-    sampled: list[np.ndarray] = []
-    span = min(result.video_seconds, result.expected_seconds)
-    for index in range(SAMPLE_FRAMES):
-        seconds = span * (index + 0.5) / SAMPLE_FRAMES
-        frame = sample_frame(video, seconds, frames_dir / f"{case_name}-{mode}-{index}.png")
-        sampled.append(frame)
-        result.ink.append(ink_ratio(frame, rgb(spec.background)))
+        frame = np.frombuffer(data, dtype=np.uint8).reshape(SPEC.height, SPEC.width, 3)
+        ink = (np.abs(frame.astype(np.int16) - paper).sum(axis=2) > 40).mean()
+        assert ink > 0.005, (name, mode, fraction, ink)
         if mode == "flow":
-            result.line.append(line_contrast(frame, spec.line_x))
-    result.sheet = str(
-        contact_sheet(sampled, out / f"{case_name}.{mode}.sheet.png", f"{case_name} {mode}", spec)
-    )
-    result.ok = True
-    return result
+            blue = frame[:, :, 2].astype(np.int16) - frame[:, :, 0]
+            column = round(SPEC.line_x)
+            assert blue[:, column - 2 : column + 3].mean() - np.median(blue) > 8
 
 
-def costs_of(seconds: float, report: dict, stats: dict[str, float | int] | None) -> Costs:
-    """Split what this render cost, taking the analysis and engraving from the merged report."""
-    timings = report.get("timings") or {}
-    return Costs(
-        analysis=float(timings.get("total") or 0.0),
-        engraving=float(timings.get("flow") or 0.0),
-        composing=0.0 if stats is None else float(stats["composing"]),
-        encoding=0.0 if stats is None else float(stats["encoding"]),
-        render=seconds,
-        frames=0 if stats is None else int(stats["frames"]),
-        segments=0 if stats is None else int(stats["segments"]),
-        cached_segments=0 if stats is None else int(stats["cached_segments"]),
-    )
-
-
-def failure(case_name: str, modes: list[str], error: Exception) -> list[CaseResult]:
-    """The same failure on every mode a case asked for: one analysis serves them all."""
-    detail = f"{type(error).__name__}: {error}"
-    return [CaseResult(case=case_name, mode=mode, error=detail) for mode in modes]
-
-
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--corpus", default="test_cases")
-    parser.add_argument("--out", default="build/acceptance")
-    parser.add_argument("--cases", default="", help="comma separated subset of case names")
-    parser.add_argument("--modes", default="switch,flow")
-    parser.add_argument("--size", default="1920x1080")
-    parser.add_argument("--fps", type=int, default=30)
-    parser.add_argument("--preview", type=float, default=None)
-    args = parser.parse_args(argv)
-
-    width, height = (int(part) for part in args.size.lower().split("x"))
-    spec = VideoSpec(width=width, height=height, fps=args.fps)
-    out = Path(args.out)
-    corpus = Path(args.corpus)
-    requested = [part.strip() for part in args.modes.split(",") if part.strip()]
-    selected = {name.strip() for name in args.cases.split(",") if name.strip()}
-    cases = [
-        directory
-        for directory in sorted(corpus.iterdir())
-        if directory.is_dir() and (not selected or directory.name in selected)
-    ]
-    if not cases:
-        print(f"no cases under {corpus}", file=sys.stderr)
-        return 2
-
-    results: list[CaseResult] = []
-    verdicts: dict[str, Verdict] = {}
-    for directory in cases:
-        pdf, track, symbolic = pipeline.discover_case(directory)
-        inputs = pipeline.Inputs(pdf=pdf, audio=track, symbolic=symbolic)
-        modes = list(requested)
-        if "flow" in modes and symbolic.suffix.lower() in scorexml.MIDI_SUFFIXES:
-            print(f"{directory.name:>7} flow   skipped: MIDI cannot drive flow")
-            modes.remove("flow")
-        if not modes:
-            continue
-        print(f"{directory.name:>7} analysing ...", flush=True)
-        try:
-            workspace, analysis, report = analyse_case(directory.name, inputs, out, spec, modes)
-        except (MusicFlowError, RuntimeError, subprocess.CalledProcessError) as error:
-            results.extend(failure(directory.name, modes, error))
-            print(f"{directory.name:>7} FAILED: {type(error).__name__}: {error}")
-            continue
-        verdict = judge(directory.name, report, analysis, directory / f"{directory.name}.mid")
-        verdicts[directory.name] = verdict
-        print(
-            f"{directory.name:>7} {'verdict':<6} {verdict.summary()}"
-            + ("" if not verdict.problems else "  PROBLEMS: " + "; ".join(verdict.problems)),
-            flush=True,
-        )
-        for mode in modes:
-            print(f"{directory.name:>7} {mode:<6} rendering ...", flush=True)
-            try:
-                record = render_mode(
-                    directory.name,
-                    mode,
-                    inputs,
-                    workspace,
-                    analysis,
-                    report,
-                    out,
-                    spec,
-                    args.preview,
-                    verdict,
-                )
-            except (MusicFlowError, RuntimeError, subprocess.CalledProcessError) as error:
-                results.extend(failure(directory.name, [mode], error))
-                print(f"{directory.name:>7} {mode:<6} FAILED: {type(error).__name__}: {error}")
-                continue
-            results.append(record)
-            problems = record.problems()
-            costs = record.costs
-            print(
-                f"{directory.name:>7} {mode:<6} {record.seconds:7.1f}s  "
-                f"costs analysis {costs.analysis:5.1f}s engraving {costs.engraving:5.1f}s "
-                f"compose {costs.composing:5.1f}s encode {costs.encoding:5.1f}s  "
-                f"video {record.video_seconds:8.2f}s / audio {record.expected_seconds:8.2f}s  "
-                f"{record.frames} frames @ {record.fps:g} fps  "
-                f"ink_min {min(record.ink):.3f}"
-                + (f"  line {min(record.line):.1f}" if record.line else "")
-                + ("" if not problems else "  PROBLEMS: " + "; ".join(problems))
-            )
-
-    report_path = out / "acceptance.json"
-    payload = {
-        "spec": spec.to_dict(),
-        "preview": args.preview,
-        "results": [record.record() for record in results],
-    }
-    report_path.parent.mkdir(parents=True, exist_ok=True)
-    report_path.write_text(json.dumps(payload, indent=1), encoding="utf-8")
-
-    failures = [record for record in results if record.problems()]
-    failed_cases = sorted(name for name, verdict in verdicts.items() if verdict.problems)
-    print(f"\n{len(results) - len(failures)}/{len(results)} renders ok; report {report_path}")
-    print(f"{len(verdicts) - len(failed_cases)}/{len(verdicts)} case verdicts ok")
-    for failed in failures:
-        print(f"  failed {failed.case} {failed.mode}: {'; '.join(failed.problems())}")
-    return 0 if not failures else 1
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+def _assert_audio_matches(video, recording):
+    rate = 8000
+    original, muxed = (decode(path, sample_rate=rate) for path in (recording, video))
+    # AAC preserves the performance with small coding differences. Allow up to 30 ms seek lag.
+    lag = round(0.03 * rate)
+    for fraction in (0.17, 0.50, 0.83):
+        start = int(len(original) * fraction)
+        reference = original[start : start + rate]
+        candidate = muxed[start - lag : start + rate + lag]
+        similarity = correlate(candidate, reference, mode="valid")
+        best = int(similarity.argmax())
+        norm = np.linalg.norm(reference) * np.linalg.norm(candidate[best : best + rate])
+        assert similarity[best] > 0.94 * norm

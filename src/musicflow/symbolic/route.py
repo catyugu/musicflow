@@ -1,12 +1,10 @@
 """Performance route: which written measures are heard, in which order, how many times.
 
-``Score`` describes the page; a ``Route`` describes the performance. Three sources, in the order
+``Score`` describes the page; a ``Route`` describes the performance. Two sources, in the order
 ``build_route`` considers them:
 
 * a route override file, the documented manual escape hatch for recordings that take a road the
   score does not write down;
-* the written route of a MIDI score, whose measures are already inferred from time signatures and
-  whose jumps were expanded by whatever produced the file;
 * the score's own repeat spans, expanded here. Those must be disjoint: the notation offers no way
   to say which of two nested or overlapping spans a performance honours, so such a score raises
   ``InputError`` and the recording has to be described with a ``--route`` override.
@@ -38,8 +36,6 @@ from musicflow.model import (
 
 logger = logging.getLogger(__name__)
 
-MIDI_MEASURE_NOTE = "midi measures are inferred from time signatures"
-
 _JUMP_NOTES = {
     "da_capo": "da capo at measure {measure} is not expanded",
     "dal_segno": "dal segno at measure {measure} is not expanded",
@@ -67,8 +63,6 @@ def build_route(score: Score, *, override: Path | None = None) -> Route:
         return _route(
             score, _override_measures(score, Path(override)), "override", score.unconfirmed
         )
-    if score.provider == "midi":
-        return _route(score, _written(score), "written", (*score.unconfirmed, MIDI_MEASURE_NOTE))
     measures, reported = _repeat_measures(score)
     source: RouteSource = "written" if measures == _written(score) else "auto_repeats"
     return _route(score, measures, source, (*score.unconfirmed, *reported))

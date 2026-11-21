@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import json
-from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
 import pytest
+from msgspec.structs import replace
 from support import written
 
 from musicflow import model
@@ -36,7 +36,6 @@ PITCH_CLASSES = 12
 def chord_score() -> model.Score:
     """One measure holding a chord at 0 and a single note at quarter 1."""
     return model.Score(
-        provider="musicxml",
         parts=(model.PartInfo("P1", "Piano", 1),),
         measures=(model.MeasureInfo(1, 0.0, 4.0),),
         notes=(
@@ -176,7 +175,7 @@ def test_stale_route_is_rejected_before_the_recording_is_read(tmp_path: Path) ->
     quiet = tmp_path / "never-read.mp3"
     unknown = replace(route, notes=(model.PerformanceNote("mf-999999", 1, 1, 0.0),))
     with pytest.raises(AnalysisError, match="stale"):
-        align(score, unknown, quiet, work_dir=tmp_path / "unknown")
+        align(score, unknown, quiet)
     moved = replace(route, notes=(replace(route.notes[0], measure=2), route.notes[1]))
     with pytest.raises(AnalysisError, match="stale"):
-        align(score, moved, quiet, work_dir=tmp_path / "moved")
+        align(score, moved, quiet)

@@ -4,7 +4,6 @@
 
 ```powershell
 uv sync                 # setup：创建 .venv 并安装锁定依赖
-uv run musicflow doctor # 环境自检与语料检查
 uv run pytest           # test
 uv run ruff check .     # lint（格式化用 ruff format .）
 ```
@@ -24,12 +23,11 @@ uv run ruff check .     # lint（格式化用 ruff format .）
 
 ## 模块边界
 
-见 [doc/design.md](doc/design.md) 第四节的接口表。跨模块只经 `model.py` 的数据结构和这些函数通信；
+见 [doc/design.md](doc/design.md) 的阶段表。跨模块只经 `model.py` 的数据结构和这些函数通信；
 不要在别人的模块里加自己的逻辑，也不要为一个模块的需求去改另一个模块的产物字段（先改契约）。
 
-流水线只缓存昂贵步骤：`symbolic`、`pdf`、`align`、`flow`（见 design.md 第三节）。`route` 与小节绑定
-在内存里算，不建目录、不加缓存键；改任何一个步骤的行为都必须递增 `pipeline.PIPELINE_VERSION`。渲染
-只有分块续渲，不是缓存步骤。
+流水线只缓存昂贵步骤：`symbolic`、`pdf`、`align`、`flow`。`route` 与小节绑定
+在内存里算，不建目录、不加缓存键；改任何一个步骤的行为都必须递增 `pipeline.PIPELINE_VERSION`。渲染由单次 FFmpeg 进程完成。
 
 ## 语料
 
@@ -43,8 +41,8 @@ uv run ruff check .     # lint（格式化用 ruff format .）
 - 只写能验证语义的测试：模型编解码与不变量、路线展开与覆盖文件校验、合成布局上的小节绑定、合成数组上的
   对齐特征/DTW/snap、内联 SVG 几何、不经 ffmpeg 的合帧，以及用假步骤验证的流水线缓存/报告/batch/CLI。
   不要为覆盖率凑断言。
-- 语料级验证只在 `tools/acceptance.py`：它逐 case 复用一次分析、渲染两种模式，判定 `report.json` 的 checks、
-  对齐证据门槛与 MIDI 真值误差。提交前与验收跑它，不在编辑循环里反复跑。
+- 语料级验证使用 `uv run pytest tools/acceptance.py -s --log-cli-level=INFO`。
+  每个案例共享一次分析，在两种模式下输出整片，检查谱行绑定、对齐、MIDI 真值和成片。
 - 精度类断言用可量化判据（覆盖率、残差中位数、p50/p90、时长差、帧数），不用"看起来对"。
 
 ## 文档

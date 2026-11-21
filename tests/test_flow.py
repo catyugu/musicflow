@@ -46,8 +46,8 @@ def test_markup_reports_staff_rows_and_crops_without_rescaling() -> None:
     # The sloped path is not a staff line: only the two horizontal rows survive.
     assert page.staff_lines() == ((20.0, 25.0, 380.0), (20.0, 30.0, 380.0))
     assert page.staff_space() == pytest.approx(5.0)
-    cropped = page.window(100.0, 50.0, 640, 360)
-    assert 'viewBox="100.0 50.0 640 360"' in cropped
+    cropped = page.window(100, 50, 640, 360)
+    assert 'viewBox="100 50 640 360"' in cropped
     assert 'width="640px"' in cropped and 'height="360px"' in cropped
     assert 'class="definition-scale" x="0" y="0" width="400.0" height="200.0"' in cropped, (
         "the crop must move the camera, not rescale the engraved page"
@@ -63,3 +63,26 @@ def test_measure_spans_follow_the_resolved_note_positions() -> None:
     assert spans == ((1, 8.0, 288.0), (3, 288.0, 388.0), (4, 388.0, 500.0))
     clamped = _measure_spans(score, {"mf-000004": 5.0}, model.Rect(0.0, 0.0, 60.0, 10.0), 12.0)
     assert clamped == ((4, 0.0, 60.0),), "a pad must not start a span left of the strip"
+
+
+def test_tiles_preserve_an_ink_band_across_raster_boundaries(tmp_path, monkeypatch) -> None:
+    from PIL import Image
+
+    from musicflow.flow import raster
+
+    monkeypatch.setattr(raster, "BAND_PIXELS", 6000)
+    page = SvgDocument(
+        _PAGE.replace('<g class="staff">', '<rect width="800" height="100"/><g class="staff">')
+    )
+    tiles, content, scale = raster.write_tiles(
+        page, work_dir=tmp_path, target_height=80, paper="#ffffff"
+    )
+    assert len(tiles) > 1
+    assert content.height == 80
+    assert scale == pytest.approx(80 / 50)
+    for tile in tiles:
+        with Image.open(tmp_path / tile.path) as image:
+            assert image.size == (tile.width, 80)
+            assert all(
+                darkest == 0 and brightest < 128 for darkest, brightest in image.getextrema()
+            )

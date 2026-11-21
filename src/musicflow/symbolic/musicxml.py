@@ -58,7 +58,6 @@ def _read_annotated(annotated: Path, source: Path) -> Score:
     grid = _grid(loaded, source)
     repeats, unconfirmed = _repeats(tree, len(grid), source)
     return assemble_score(
-        provider="musicxml",
         title=_title(loaded),
         parts=parts,
         grid=grid,

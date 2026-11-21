@@ -1,10 +1,4 @@
-"""Fixed-staff switching: the original PDF page, cut at the system being played.
-
-The frame content is the page as engraved: a raster of the page at the DPI the crop needs, the
-system's bounding box plus a small margin, scaled to 0.9 of the frame height and centred on the
-paper colour. Nothing is re-engraved, filtered or highlighted, and switch mode draws no reading
-line (design.md section 五).
-"""
+"""Show the current system cropped from the original PDF."""
 
 from __future__ import annotations
 
@@ -14,14 +8,15 @@ import math
 from dataclasses import dataclass
 from pathlib import Path
 
+import cv2
 import numpy as np
 import pymupdf
 from PIL import Image
 
 from ..errors import AnalysisError, InputError, RenderError
 from ..model import Alignment, Route, Score, StaffLayout, System, VideoSpec
-from .canvas import FrameCache, blank, file_signature, paste
-from .encoder import encode
+from .canvas import FrameCache, blank, paste
+from .encoder import encode, plan_timeline
 
 logger = logging.getLogger(__name__)
 
@@ -89,20 +84,19 @@ def plan_switch(
         key = (note.measure, note.pass_index)
         first_onset[key] = min(first_onset.get(key, note.onset_q), note.onset_q)
 
-    visits: list[tuple[float, System]] = []
+    visits: list[System] = []
+    quarters: list[float] = []
     for measure_pass in route.passes:
         system = by_measure.get(measure_pass.measure)
         if system is None:
             continue
-        if visits and visits[-1][1].index == system.index:
+        if visits and visits[-1].index == system.index:
             continue
         onset = first_onset.get((measure_pass.measure, measure_pass.pass_index))
-        seconds = alignment.time_at(measure_pass.start_q if onset is None else onset)
-        if visits and seconds < visits[-1][0]:
-            seconds = visits[-1][0]
-        visits.append((seconds, system))
+        quarters.append(measure_pass.start_q if onset is None else onset)
+        visits.append(system)
 
-    visited = {system.index for _, system in visits}
+    visited = {system.index for system in visits}
     missing = [system.index for system in layout.systems if system.index not in visited]
     if missing:
         logger.warning(
@@ -112,9 +106,9 @@ def plan_switch(
         )
     if not visits:
         raise AnalysisError("switch: no printed system covers a measure of the performance")
-    times = tuple(seconds for seconds, _ in visits)
+    times = tuple(map(float, np.maximum.accumulate(alignment.times_at(quarters))))
     return SwitchPlan(
-        systems=tuple(system for _, system in visits),
+        systems=tuple(visits),
         times=times,
         fps=fps,
         first_frame=tuple(math.ceil(seconds * fps) for seconds in times),
@@ -180,7 +174,6 @@ def render_switch(
     alignment: Alignment,
     spec: VideoSpec,
     out: Path,
-    work_dir: Path,
     preview: float | None,
     audio: Path,
     pdf: Path,
@@ -199,7 +192,8 @@ def render_switch(
         def build() -> np.ndarray:
             dpi = dpis[system.page]
             image = rasters.get(system.page, lambda: _page_raster(pdf, system.page, dpi))
-            return _system_frame(image, dpi, system, spec)
+            # Consecutive frames reuse both the crop and its encoder pixel format.
+            return cv2.cvtColor(_system_frame(image, dpi, system, spec), cv2.COLOR_RGB2YUV_I420)
 
         return frames.get(system.index, build)
 
@@ -208,14 +202,7 @@ def render_switch(
         spec=spec,
         audio=audio,
         out=out,
-        work_dir=work_dir,
+        timeline=plan_timeline(alignment.audio_duration, spec, preview),
         preview=preview,
-        kind="switch",
-        parameters={
-            "mode": "switch",
-            "pdf": file_signature(pdf),
-            "systems": [[s.index, s.page, s.bbox.to_dict()] for s in plan.systems],
-            "times": list(plan.times),
-            "dpi": sorted(dpis.items()),
-        },
+        pixel_format="yuv420p",
     )

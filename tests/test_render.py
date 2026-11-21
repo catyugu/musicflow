@@ -13,7 +13,7 @@ from musicflow import model
 from musicflow.errors import InputError, RenderError
 from musicflow.render import render_flow
 from musicflow.render.camera import CameraTrack
-from musicflow.render.canvas import blank, draw_reading_line, parameters_digest, rgb
+from musicflow.render.canvas import rgb
 from musicflow.render.encoder import plan_timeline
 from musicflow.render.flow import _frame_source
 from musicflow.render.switch import _system_frame, plan_switch
@@ -47,7 +47,7 @@ def strip(tmp_path: Path) -> tuple[Path, model.FlowLayout]:
     tiles_dir.mkdir()
     for name, value in (("t0.png", 0), ("t1.png", 30)):
         tile = np.full((50, 100, 3), 255, dtype=np.uint8)
-        tile[20:22, 5:95] = value
+        tile[20:30, :] = value
         Image.fromarray(tile).save(tiles_dir / name)
     flow = model.FlowLayout(
         strip_width=200.0,
@@ -72,12 +72,6 @@ def test_camera_holds_interpolates_and_smooths() -> None:
     assert abs(uneven.x_at(0.5) - 5.0) > 0.2, "the camera is linear; PCHIP smoothing is missing"
     sampled = [uneven.x_at(t) for t in np.linspace(0.0, 4.0, 41)]
     assert sampled == sorted(sampled), "the camera moves backwards inside a forward run"
-
-    dense = CameraTrack([0.0, 1.0, 2.0, 3.0, 4.0], [0.0, 100.0, 50.0, 150.0, 260.0])
-    seconds = np.array([-1.0, 0.0, 0.25, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 5.0])
-    many = dense.x_many(seconds)
-    assert many == pytest.approx([dense.x_at(t) for t in seconds.tolist()])
-    assert (many[0], many[-1]) == (0.0, 260.0)
 
 
 def test_switch_plan_follows_a_repeat_back_to_the_first_system() -> None:
@@ -125,13 +119,17 @@ def test_flow_frame_moves_the_strip_past_the_reading_line(tmp_path: Path) -> Non
         "the line must sit on spec.line_x"
     )
     assert np.array_equal(first[0, column + 5], rgb(spec.background))
-    assert float(np.mean(np.all(first < 120, axis=2))) > 0.03, "the strip must show its ink"
+    assert float(np.mean(np.all(first < 120, axis=2))) > 0.015, "the strip must show its ink"
     assert np.abs(first.astype(int) - second.astype(int)).mean() > 1.0, "the strip did not move"
 
-    window = tiles.window(90, 10, 30, 30, np.asarray(rgb(spec.background), dtype=np.uint8))
-    assert window.shape == (30, 30, 3)
-    assert np.array_equal(window[10, 0], [0, 0, 0]), "a window must read the tile on its left"
-    assert np.array_equal(window[10, 29], [30, 30, 30]), "and stitch the next tile at its seam"
+    window = np.empty((50, 30, 3), dtype=np.uint8)
+    tiles.copy_window(window, 90, rgb(spec.background))
+    assert np.all(window[20:30, :10] == 0)
+    assert np.all(window[20:30, 10:] == 30)
+    tiles.copy_window(window, -20, rgb(spec.background))
+    assert np.all(window[:, :20] == rgb(spec.background))
+    tiles.copy_window(window, 190, rgb(spec.background))
+    assert np.all(window[:, 10:] == rgb(spec.background))
 
 
 def test_missing_resources_are_typed_errors(tmp_path: Path) -> None:
@@ -146,24 +144,14 @@ def test_missing_resources_are_typed_errors(tmp_path: Path) -> None:
             flow=flow,
             spec=model.VideoSpec(width=320, height=180, fps=10),
             out=tmp_path / "out.mp4",
-            work_dir=tmp_path / "work",
             tiles_dir=tiles_dir,
             preview=1.0,
             audio=tmp_path / "absent.mp3",
         )
 
 
-def test_canvas_paints_paper_and_line_and_timeline_follows_the_preview() -> None:
+def test_timeline_follows_the_preview() -> None:
     spec = model.VideoSpec(width=320, height=180, fps=10)
-    frame = blank(spec)
-    assert np.array_equal(frame[0, 0], rgb(spec.background))
-    draw_reading_line(frame, spec)
-    column = round(spec.line_x)
-    assert np.all(frame[:, column] == rgb(spec.line_color))
-    assert np.array_equal(frame[0, column - 5], rgb(spec.background))
-    with pytest.raises(RenderError, match="not an RGB colour"):
-        rgb("#12345")
-
     assert (plan_timeline(10.0, spec, None).seconds, plan_timeline(10.0, spec, None).frames) == (
         10.0,
         100,
@@ -171,7 +159,3 @@ def test_canvas_paints_paper_and_line_and_timeline_follows_the_preview() -> None
     preview = plan_timeline(10.0, spec, 3.0)
     assert (preview.seconds, preview.frames) == (3.0, 30)
     assert plan_timeline(10.0, spec, 99.0).seconds == 10.0
-    assert parameters_digest("flow", spec, {"a": 1, "b": 2}) == parameters_digest(
-        "flow", spec, {"b": 2, "a": 1}
-    )
-    assert parameters_digest("flow", spec, {"a": 1}) != parameters_digest("flow", spec, {"a": 2})

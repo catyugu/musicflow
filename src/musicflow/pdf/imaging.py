@@ -68,7 +68,7 @@ class PageRaster:
                 inverse[0, 0] * x + inverse[0, 1] * y + inverse[0, 2],
                 inverse[1, 0] * x + inverse[1, 1] * y + inverse[1, 2],
             )
-        return x / self.scale_x, y / self.scale_y
+        return float(x / self.scale_x), float(y / self.scale_y)
 
     def rect_to_points(self, x0: float, y0: float, x1: float, y1: float) -> tuple[float, ...]:
         """Map an axis-aligned raster rectangle to the enclosing axis-aligned point rectangle."""
@@ -190,7 +190,8 @@ def rasterise(page: pymupdf.Page, number: int) -> PageRaster:
     height_pt = float(page.rect.height)
     scale_x = pixmap.width / width_pt
     scale_y = pixmap.height / height_pt
-    skew = _estimate_skew(gray)
+    ink = _binarise(gray)
+    skew = _estimate_skew(gray) if _needs_skew_search(page, ink) else 0.0
     matrix = np.eye(2, 3, dtype=np.float64)
     if abs(skew) >= SKEW_APPLY_THRESHOLD:
         matrix = cv2.getRotationMatrix2D((pixmap.width / 2, pixmap.height / 2), skew, 1.0)
@@ -201,9 +202,9 @@ def rasterise(page: pymupdf.Page, number: int) -> PageRaster:
             flags=cv2.INTER_LINEAR,
             borderValue=255,
         )
+        ink = _binarise(gray)
     else:
         skew = 0.0
-    ink = _binarise(gray)
     return PageRaster(
         number=number,
         gray=gray,
@@ -225,6 +226,19 @@ def _binarise(gray: np.ndarray) -> np.ndarray:
     normalised = cv2.divide(gray, np.maximum(background, 1), scale=255)
     _, ink = cv2.threshold(normalised, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     return (ink > 0).astype(np.uint8)
+
+
+def _needs_skew_search(page: pymupdf.Page, ink: np.ndarray) -> bool:
+    # A large painted image marks a scan even when there is also an OCR text layer.
+    area = sum(
+        (pymupdf.Rect(item["bbox"]) & page.rect).get_area() for item in page.get_image_info()
+    )
+    if area < 0.25 * page.rect.get_area():
+        return False
+    # Several lines spanning most of the page are already usable by the horizontal detector.
+    width = max(3, round(0.75 * ink.shape[1]))
+    horizontal = cv2.erode(ink, np.ones((1, width), dtype=np.uint8))
+    return len(runs(horizontal.any(axis=1))) < 5
 
 
 def _estimate_skew(gray: np.ndarray) -> float:

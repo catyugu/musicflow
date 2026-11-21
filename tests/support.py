@@ -30,7 +30,6 @@ def written(measures: int = 4, per_measure: int = 1) -> model.Score:
                 model.NoteEvent(f"mf-{index:06d}", "P1", 1, 1, measure, onset, step, pitch)
             )
     return model.Score(
-        provider="musicxml",
         parts=(model.PartInfo("P1", "Piano", 1),),
         measures=tuple(model.MeasureInfo(i, (i - 1) * 4.0, 4.0) for i in range(1, measures + 1)),
         notes=tuple(notes),

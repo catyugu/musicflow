@@ -1,20 +1,14 @@
-"""Command line entry point.
-
-This is the only place that configures logging and the only place that writes to stdout/stderr;
-library modules emit log records and return values.
-"""
+"""Parse commands and present results."""
 
 from __future__ import annotations
 
 import argparse
 import json
 import logging
-import shutil
-import subprocess
 import sys
 from pathlib import Path
 
-from .errors import EXIT_OK, InputError, MusicFlowError, UsageError
+from .errors import EXIT_OK, MusicFlowError, UsageError
 from .model import VideoSpec
 
 logger = logging.getLogger("musicflow")
@@ -35,83 +29,6 @@ def _configure_logging(verbosity: int, quiet: bool) -> None:
         stream=sys.stderr,
         force=True,
     )
-
-
-def _tool_version(command: list[str]) -> str | None:
-    executable = shutil.which(command[0])
-    if executable is None:
-        return None
-    try:
-        result = subprocess.run(
-            [executable, *command[1:]],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    first_line = (result.stdout or result.stderr or "").splitlines()
-    return first_line[0] if first_line else "unknown"
-
-
-def _package_version() -> str:
-    from importlib.metadata import version
-
-    try:
-        return version("musicflow")
-    except Exception:
-        return "source"
-
-
-def _cmd_doctor(args: argparse.Namespace) -> int:
-    import librosa
-    import numpy
-    import partitura
-    import pymupdf
-    import resvg_py
-    import scipy
-    import verovio
-
-    print(f"python           {sys.version.split()[0]}")
-    print(f"musicflow        {_package_version()}")
-    versions = (
-        ("ffmpeg", _tool_version(["ffmpeg", "-version"])),
-        ("ffprobe", _tool_version(["ffprobe", "-version"])),
-        ("verovio", verovio.toolkit().getVersion()),
-        ("resvg-py", getattr(resvg_py, "__version__", "installed")),
-        ("pymupdf", pymupdf.__version__),
-        ("numpy", numpy.__version__),
-        ("scipy", scipy.__version__),
-        ("librosa", librosa.__version__),
-        ("partitura", partitura.__version__),
-    )
-    for label, value in versions:
-        print(f"{label:<17}{value or 'MISSING: install it and put it on PATH'}")
-
-    from . import pipeline, scorexml
-
-    corpus = Path(args.corpus)
-    if corpus.is_dir():
-        cases = sorted(p.name for p in corpus.iterdir() if p.is_dir())
-        print(f"corpus           {corpus} ({', '.join(cases) or 'no cases'})")
-        requirements = (
-            ("PDF", (".pdf",)),
-            ("recording", pipeline.AUDIO_SUFFIXES),
-            ("symbolic", scorexml.MUSICXML_SUFFIXES + scorexml.MIDI_SUFFIXES),
-        )
-        for case in cases:
-            directory = corpus / case
-            found = {path.suffix.lower() for path in directory.iterdir() if path.is_file()}
-            missing = [label for label, suffixes in requirements if found.isdisjoint(suffixes)]
-            if missing:
-                print(f"  {case}: missing {', '.join(missing)}")
-    else:
-        print(f"corpus           {corpus} (not a directory)")
-        if args.require_corpus:
-            raise InputError(f"corpus directory not found: {corpus}")
-
-    return EXIT_OK
 
 
 def _parse_size(text: str) -> tuple[int, int]:
@@ -156,14 +73,11 @@ def _print_report(report: dict) -> None:
     """The human summary of one run, from the merged report."""
     score, route = report["score"], report["route"]
     layout, alignment, flow = report["layout"], report["alignment"], report["flow"]
-    notes = f"{score['written_notes']} written, {route['notes']} performed ({route['source']})"
-    audio = f"{alignment['audio_duration']:.2f} s, route {route['total_q']:.1f} quarter notes"
-    print(f"provider         {score['provider']}")
-    print(f"parts            {len(score['parts'])} ({score['measures']} measures)")
-    print(f"notes            {notes}")
-    print(f"systems          {'not detected' if layout is None else layout['systems']}")
-    print(f"anchors          {alignment['anchors']} ({alignment['method']})")
-    print(f"audio            {audio}")
+    print(f"score            {score['parts']} parts, {score['measures']} measures")
+    print(f"route            {route['notes']} notes ({route['source']})")
+    print(f"audio            {alignment['audio_duration']:.2f} s, {alignment['anchors']} anchors")
+    if layout:
+        print(f"systems          {layout['systems']}")
     for name in ("score", "route", "layout", "alignment"):
         for line in (report[name] or {}).get("unconfirmed", []):
             print(f"unconfirmed      {name}: {line}")
@@ -171,7 +85,7 @@ def _print_report(report: dict) -> None:
         status = "ok  " if check["ok"] else "FAIL"
         print(f"check            {status} {check['name']}: {check['detail']}")
     if flow:
-        print(f"flow             strip {flow['strip_width']:.0f} units, {flow['tiles']} tiles")
+        print(f"flow             strip {flow['strip_width']:.0f} pixels, {flow['tiles']} tiles")
     timings = ", ".join(f"{name} {seconds:.1f} s" for name, seconds in report["timings"].items())
     print(f"timings          {timings}")
 
@@ -194,7 +108,7 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
         print(json.dumps(report, ensure_ascii=False, indent=1))
     else:
         _print_report(report)
-    print(f"report           {report_path}")
+        print(f"report           {report_path}")
     return EXIT_OK
 
 
@@ -204,12 +118,16 @@ def _cmd_render(args: argparse.Namespace) -> int:
     inputs = _inputs(args)
     workspace = workdir.Workspace(_workspace(args))
     out = Path(args.out) if args.out else Path("build") / f"{Path(args.pdf).stem}.{args.mode}.mp4"
+    spec = _video_spec(args)
+    analysis = pipeline.analyze(
+        inputs, workspace, spec=spec, with_pdf=args.mode == "switch", with_flow=args.mode == "flow"
+    )
     produced = pipeline.render(
         inputs,
-        workspace,
         mode=args.mode,
         out=out,
-        spec=_video_spec(args),
+        spec=spec,
+        analysis=analysis,
         preview=args.preview,
     )
     print(f"video            {produced}")
@@ -219,10 +137,9 @@ def _cmd_render(args: argparse.Namespace) -> int:
 def _cmd_batch(args: argparse.Namespace) -> int:
     from . import pipeline
 
-    modes = [part.strip() for part in args.modes.split(",") if part.strip()]
-    for mode in modes:
-        if mode not in ("switch", "flow"):
-            raise UsageError(f"unknown mode in --modes: {mode}")
+    modes = tuple(dict.fromkeys(part.strip() for part in args.modes.split(",") if part.strip()))
+    if not modes or set(modes) - {"switch", "flow"}:
+        raise UsageError("--modes expects switch, flow or switch,flow")
     records = pipeline.batch(
         Path(args.corpus),
         Path(args.out),
@@ -233,9 +150,6 @@ def _cmd_batch(args: argparse.Namespace) -> int:
     )
     failures = 0
     for record in records:
-        if record.get("skipped"):
-            print(f"skip  {record['case']:>8} {record['mode']:<7} {record['skipped']}")
-            continue
         status = "ok  " if record["ok"] else "FAIL"
         detail = record.get("out", "") if record["ok"] else record.get("error", "")
         print(
@@ -249,7 +163,8 @@ def _cmd_batch(args: argparse.Namespace) -> int:
 def _add_input_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--pdf", required=True, help="original PDF score")
     parser.add_argument("--audio", required=True, help="recording of the performance")
-    parser.add_argument("--symbolic", required=True, help="MusicXML, MXL or MIDI of the same music")
+    parser.add_argument("--symbolic", required=True, help="MusicXML or MXL of the same music")
+    parser.add_argument("--workdir", help="run directory (default: build/<pdf stem>)")
     parser.add_argument("--route", help="JSON route override (performance order per measure)")
     parser.add_argument("--anchors", help="JSON manual score-to-audio anchors")
     parser.add_argument("--staffs", help="JSON manual PDF-system to measure-range override")
@@ -272,19 +187,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-q", "--quiet", action="store_true", help="log warnings and errors only")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    doctor = subparsers.add_parser("doctor", help="check the environment and the test corpus")
-    doctor.add_argument("--corpus", default="test_cases", help="corpus directory to inspect")
-    doctor.add_argument(
-        "--require-corpus", action="store_true", help="fail when the corpus directory is missing"
-    )
-    doctor.set_defaults(handler=_cmd_doctor)
-
     analyze = subparsers.add_parser(
         "analyze", help="run the analysis stages and write diagnostics without rendering"
     )
     _add_input_arguments(analyze)
     _add_video_arguments(analyze)
-    analyze.add_argument("--workdir", help="run directory (default: build/<pdf stem>)")
     analyze.add_argument("--json", action="store_true", help="print the full analysis as JSON")
     analyze.add_argument(
         "--with-flow", action="store_true", help="also engrave the continuous flow layout"
@@ -299,7 +206,6 @@ def build_parser() -> argparse.ArgumentParser:
     _add_video_arguments(render)
     render.add_argument("--mode", required=True, choices=("switch", "flow"))
     render.add_argument("--out", help="output MP4 (default: build/<pdf stem>.<mode>.mp4)")
-    render.add_argument("--workdir", help="run directory (default: build/<pdf stem>)")
     render.add_argument(
         "--preview", type=float, default=None, help="render only the first N seconds"
     )
@@ -324,8 +230,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     _configure_logging(args.verbose, args.quiet)
     try:
-        if hasattr(args, "size"):
-            args.width, args.height = _parse_size(args.size)
+        args.width, args.height = _parse_size(args.size)
         return int(args.handler(args))
     except MusicFlowError as error:
         print(f"musicflow: {error}", file=sys.stderr)

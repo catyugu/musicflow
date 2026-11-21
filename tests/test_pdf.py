@@ -38,7 +38,6 @@ def synthetic_layout(
 
 def synthetic_score(total: int) -> model.Score:
     return model.Score(
-        provider="musicxml",
         parts=(model.PartInfo("P1", "Piano", 2),),
         measures=tuple(model.MeasureInfo(i, float(i - 1), 1.0) for i in range(1, total + 1)),
         notes=tuple(
@@ -106,3 +105,18 @@ def test_override_rejects_malformed_files(tmp_path: Path) -> None:
             bind_measures(layout, score, override=path)
     with pytest.raises(InputError):
         bind_measures(layout, score, override=tmp_path / "absent.json")
+
+
+def test_deskewed_pdf_coordinates_are_serializable() -> None:
+    import cv2
+    import msgspec
+    import numpy as np
+
+    from musicflow.pdf.imaging import PageRaster
+
+    image = np.zeros((20, 20), dtype=np.uint8)
+    raster = PageRaster(
+        1, image, image, cv2.getRotationMatrix2D((10, 10), 0.5, 1.0), 1, 1, 20, 20, 0.5
+    )
+    box = model.Rect(*raster.rect_to_points(4.0, 4.0, 16.0, 16.0))
+    assert msgspec.json.decode(msgspec.json.encode(box), type=model.Rect) == box

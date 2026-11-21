@@ -2,12 +2,8 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 from collections import OrderedDict
-from collections.abc import Callable, Hashable, Mapping
-from pathlib import Path
-from typing import Any
+from collections.abc import Callable, Hashable
 
 import numpy as np
 
@@ -74,28 +70,3 @@ class FrameCache:
         while len(self._items) > self._capacity:
             self._items.popitem(last=False)
         return value
-
-
-def file_signature(path: Path) -> list[Any]:
-    """Cheap identity of a file for the segment digest: name, size and modification time.
-
-    Segments are scratch; recomputing a full content hash on every preview iteration would cost
-    more than the re-encode it protects against. The pipeline's real cache keys, which do hash
-    content, belong to :mod:`musicflow.workdir`.
-    """
-    try:
-        stat = path.stat()
-    except OSError:
-        return [path.name, 0, 0]
-    return [path.name, stat.st_size, stat.st_mtime_ns]
-
-
-def parameters_digest(kind: str, spec: VideoSpec, parameters: Mapping[str, Any]) -> str:
-    """Segment-name digest over everything that changes the pixels of a frame."""
-    payload = json.dumps(
-        {"kind": kind, "spec": spec.to_dict(), "parameters": dict(parameters)},
-        sort_keys=True,
-        default=float,
-        ensure_ascii=True,
-    )
-    return hashlib.sha256(payload.encode()).hexdigest()[:12]

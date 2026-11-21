@@ -22,9 +22,10 @@ from __future__ import annotations
 import itertools
 import json
 import logging
-from dataclasses import replace
 from pathlib import Path
 from typing import Any
+
+from msgspec.structs import replace
 
 from ..errors import AnalysisError, InputError
 from ..model import Score, StaffLayout, System

@@ -15,14 +15,12 @@ staff has no gaps to offer, so there the ends of the stroke decide - see :func:`
 from __future__ import annotations
 
 import itertools
-import logging
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import numpy as np
 
 from .imaging import PageRaster, Staff, runs
-
-logger = logging.getLogger(__name__)
 
 #: A barline column carries ink over at least this share of the rows it crosses.
 CROSSING_COVERAGE = 0.80
@@ -261,7 +259,7 @@ def _cluster(columns: list[float], tolerance: float) -> list[float]:
     return [float(np.mean(cluster)) for cluster in merged]
 
 
-def barline_agreement(left: list[float], right: list[float], tolerance: float) -> float:
+def barline_agreement(left: Sequence[float], right: Sequence[float], tolerance: float) -> float:
     """Share of the longer list that also appears in the other one."""
     if not left or not right:
         return 0.0
@@ -269,7 +267,7 @@ def barline_agreement(left: list[float], right: list[float], tolerance: float) -
     return hits / max(len(left), len(right))
 
 
-def staff_support(raster: PageRaster, staff: Staff, columns: list[float]) -> float:
+def staff_support(raster: PageRaster, staff: Staff, columns: Sequence[float]) -> float:
     """Share of ``columns`` whose ink spans the full height of ``staff``."""
     if not columns:
         return 0.0
@@ -289,84 +287,91 @@ def staff_support(raster: PageRaster, staff: Staff, columns: list[float]) -> flo
     return hits / len(columns)
 
 
-def brace_groups(raster: PageRaster, staves: list[Staff], space: float) -> list[Group]:
-    """Split staves into groups whose barlines cross the gaps between them."""
+def _overlap(upper: Staff | Group, lower: Staff | Group) -> bool:
+    overlap = min(upper.x1, lower.x1) - max(upper.x0, lower.x0)
+    return overlap >= 0.5 * min(upper.x1 - upper.x0, lower.x1 - lower.x0)
+
+
+def group_systems(
+    raster: PageRaster, staves: list[Staff], space: float, *, single_staff: bool
+) -> list[list[Group]]:
+    """Join staves sharing barlines, then resolve neighboring groups into systems."""
+    if single_staff:
+        return [[Group((staff,))] for staff in staves]
     if not staves:
         return []
-    groups: list[list[Staff]] = [[staves[0]]]
-    for staff in staves[1:]:
-        upper = groups[-1][-1]
-        gap = staff.top - upper.bottom
-        overlap = min(upper.x1, staff.x1) - max(upper.x0, staff.x0)
-        shorter = min(upper.x1 - upper.x0, staff.x1 - staff.x0)
-        crossed = crossing_columns(raster, upper, staff, space)
-        big_enough = gap <= MAX_GAP_HEIGHTS * min(upper.height, staff.height)
-        if overlap >= 0.5 * shorter and big_enough and (len(crossed) >= 2):
-            groups[-1].append(staff)
-        else:
-            groups.append([staff])
-    return [Group(staves=tuple(group)) for group in groups]
 
-
-def group_systems(groups: list[Group], raster: PageRaster, space: float) -> list[list[Group]]:
-    """Chain groups into systems, deciding each link from barlines and whitespace together."""
-    if not groups:
-        return []
-    resolved: list[Group] = []
-    for group in groups:
-        resolved.append(
-            Group(
-                staves=group.staves,
-                barlines=(
-                    tuple(group_barlines(raster, group, space)) if len(group.staves) >= 2 else ()
-                ),
-            )
-        )
-    pairs: list[dict[str, float]] = []
-    for upper, lower in itertools.pairwise(resolved):
+    braced: list[list[Staff]] = [[staves[0]]]
+    for upper, lower in itertools.pairwise(staves):
         gap = lower.top - upper.bottom
-        height = min(upper.height, lower.height)
-        overlap = min(upper.x1, lower.x1) - max(upper.x0, lower.x0)
-        shorter = min(upper.x1 - upper.x0, lower.x1 - lower.x0)
-        tolerance = BARLINE_CLUSTER * space
-        reference = upper.barlines or lower.barlines
-        against = lower.staves if upper.barlines else upper.staves
+        if (
+            gap <= MAX_GAP_HEIGHTS * min(upper.height, lower.height)
+            and _overlap(upper, lower)
+            and len(crossing_columns(raster, upper, lower, space)) >= 2
+        ):
+            braced[-1].append(lower)
+        else:
+            braced.append([lower])
+
+    groups = [Group(tuple(staff_group)) for staff_group in braced]
+    groups = [
+        Group(group.staves, tuple(group_barlines(raster, group, space)))
+        if len(group.staves) > 1
+        else group
+        for group in groups
+    ]
+    tolerance = BARLINE_CLUSTER * space
+    ratios: list[float] = []
+    links: list[bool] = []
+    for upper, lower in itertools.pairwise(groups):
+        ratio = (lower.top - upper.bottom) / min(upper.height, lower.height)
+        ratios.append(ratio)
+        if not _overlap(upper, lower) or ratio > EXTENDED_GAP_HEIGHTS:
+            links.append(False)
+            continue
         if upper.barlines and lower.barlines:
-            agreement = barline_agreement(list(upper.barlines), list(lower.barlines), tolerance)
-        elif reference:
-            agreement = max(staff_support(raster, staff, list(reference)) for staff in against)
+            agreement = barline_agreement(upper.barlines, lower.barlines, tolerance)
+        elif upper.barlines or lower.barlines:
+            reference, against = (upper, lower) if upper.barlines else (lower, upper)
+            agreement = max(
+                staff_support(raster, staff, reference.barlines) for staff in against.staves
+            )
         else:
             agreement = 1.0
         limit = EXTENDED_GAP_HEIGHTS if agreement >= STRONG_AGREEMENT else MAX_GAP_HEIGHTS
-        fits = overlap >= 0.5 * shorter and gap <= limit * height
-        pairs.append(
-            {
-                "ratio": gap / height if height else float("inf"),
-                "agreement": agreement,
-                "fits": 1.0 if fits else 0.0,
-            }
-        )
-    links = [bool(pair["fits"]) and pair["agreement"] >= MIN_BARLINE_AGREEMENT for pair in pairs]
-    # A group joins the nearer of its two neighbours when both links are otherwise plausible.
-    changed = True
-    while changed:
-        changed = False
-        for index in range(1, len(resolved)):
-            above = links[index - 1]
-            below = index < len(links) and links[index]
-            if above and below:
-                keep_above = pairs[index - 1]["ratio"] <= pairs[index]["ratio"]
-                if keep_above:
-                    links[index] = False
-                else:
-                    links[index - 1] = False
-                changed = True
-    systems: list[list[Group]] = [[resolved[0]]]
-    for index, group in enumerate(resolved[1:]):
-        if links[index]:
+        links.append(ratio <= limit and agreement >= MIN_BARLINE_AGREEMENT)
+
+    for index in range(1, len(links)):
+        if links[index - 1] and links[index]:
+            # Keep the nearer neighbor when both links are plausible.
+            discarded = index if ratios[index - 1] <= ratios[index] else index - 1
+            links[discarded] = False
+
+    systems = [[groups[0]]]
+    for linked, group in zip(links, groups[1:], strict=True):
+        if linked:
             systems[-1].append(group)
         else:
             systems.append([group])
+
+    # A single staff left over in a multi-staff score can still belong to a nearby system.
+    index = 0
+    while index < len(systems):
+        system = systems[index]
+        if len(system) == 1 and len(system[0].staves) == 1:
+            lone = system[0]
+            above = lone.top - systems[index - 1][-1].bottom if index else float("inf")
+            below = (
+                systems[index + 1][0].top - lone.bottom
+                if index + 1 < len(systems)
+                else float("inf")
+            )
+            if min(above, below) <= MAX_GAP_HEIGHTS * lone.height:
+                upper = index - 1 if above <= below else index
+                systems[upper].extend(systems.pop(upper + 1))
+                index = 0
+                continue
+        index += 1
     return systems
 
 
@@ -555,10 +560,12 @@ def system_boxes(
     height = raster.ink.shape[0]
     gap_rows = max(3, round(BOX_GAP_SPACES * space))
     geometries: list[SystemGeometry] = []
+    system_staves = [
+        tuple(staff for group in system for staff in group.staves) for system in systems
+    ]
     unions = []
     spans = []
-    for system in systems:
-        staves = [staff for group in system for staff in group.staves]
+    for staves in system_staves:
         unions.append(
             (
                 min(staff.top for staff in staves),
@@ -572,8 +579,8 @@ def system_boxes(
             )
         )
     splits = _gap_splits(raster, unions, spans)
-    for index, system in enumerate(systems):
-        staves = [staff for group in system for staff in group.staves]
+    clear_threshold = PAPER_INK_SHARE * (float(np.percentile(raster.gray, 90)) or 255.0)
+    for index, (system, staves) in enumerate(zip(systems, system_staves, strict=True)):
         top, bottom = unions[index]
         x0, x1 = spans[index]
         columns0 = int(max(0, x0 - PAD_SIDE_SPACES * space))
@@ -606,8 +613,6 @@ def system_boxes(
         lower_limit = max(int(PAD_BOTTOM_SPACES * space) + gap_rows, bottom_limit - int(bottom))
         y0 = _grow_vertical(profile, int(np.floor(top)), -1, upper_limit, gap_rows, threshold)
         y1 = _grow_vertical(profile, int(np.ceil(bottom)), 1, lower_limit, gap_rows, threshold)
-        paper = float(np.percentile(raster.gray, 90)) or 255.0
-        clear_threshold = PAPER_INK_SHARE * paper
         left, y0, right, y1 = _clear_bounds(
             raster,
             left,
@@ -623,7 +628,7 @@ def system_boxes(
         counted = tuple(barline for barline in barlines if barline > edge)
         geometries.append(
             SystemGeometry(
-                staves=tuple(staves),
+                staves=staves,
                 x0=float(left),
                 y0=float(y0),
                 x1=float(right),

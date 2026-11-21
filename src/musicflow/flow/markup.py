@@ -217,15 +217,12 @@ class SvgDocument:
         _walk(self._element(), to_layout, _line_visitor(lines))
         return tuple(lines)
 
-    def window(self, x0: float, y0: float, width: int, height: int) -> str:
-        """Markup for the crop ``[x0, x0 + width) x [y0, y0 + height)`` at one pixel per unit.
-
-        The inner page is pinned to its own layout-unit size, so the injected root
-        ``viewBox`` moves the camera without rescaling the engraving.
-        """
+    def window(self, x: int, y: int, width: int, height: int, *, scale: float = 1.0) -> str:
+        """Crop and scale the page, addressing the window in raster pixels."""
+        view_box = " ".join(f"{value / scale:.12g}" for value in (x, y, width, height))
         root = _set_length(self._root_tag, "width", f"{width}px")
         root = _set_length(root, "height", f"{height}px")
-        root = root.replace("<svg", f'<svg viewBox="{x0} {y0} {width} {height}"', 1)
+        root = root.replace("<svg", f'<svg viewBox="{view_box}"', 1)
         inner = self._inner_tag.replace(
             'class="definition-scale"',
             f'class="definition-scale" x="0" y="0" width="{self.width}" height="{self.height}"',
