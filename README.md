@@ -28,7 +28,7 @@ Windows native, CPU only, no Docker.
 ```powershell
 uv sync                  # setup: create .venv, install pinned dependencies
 uv run musicflow doctor  # check the toolchain and the test corpus
-uv run pytest            # test
+uv run pytest            # unit suite: pure-Python and small-fixture checks, seconds
 uv run ruff check .      # lint (ruff format . to format)
 ```
 
@@ -95,7 +95,7 @@ build/<stem>/
   pdf/                     StaffLayout payload; debug/ only under --debug-images
   align/                   Alignment payload, report.json evidence, alignment.png
   flow/                    FlowLayout payload, strip.svg, overview.png, tiles/
-  render-switch/           page rasters and MP4 segments
+  render-switch/           MP4 segments and the concat list (page rasters are drawn in memory)
   render-flow/             MP4 segments (the flow tiles are read from flow/)
 ```
 
@@ -120,12 +120,26 @@ uv run python tools/acceptance.py --out build/acceptance
 uv run python tools/acceptance.py --out build/acceptance --preview 15 --size 960x540
 ```
 
+Two levels: `uv run pytest` is the unit suite (pure-Python and small-fixture checks, seconds), which
+is the edit loop; `tools/acceptance.py` is the corpus evidence — it renders every case in both modes
+at the documented parameters, measures the delivered videos, and checks the corpus verdicts (the
+report's cross-artifact checks, the alignment accuracy gates, the MIDI ground truth), so it is the
+only level that reports real per-stage costs.
+
 The acceptance harness analyses each case once, renders both modes from that analysis, then measures
 the delivered videos: frame count against `duration x fps`, duration against the recording, audio
 stream present, sampled frames carry score ink, and (for flow) the reading line is intact. It writes
 `acceptance.json` (per render the measurements, the problems and the cost split into analysis,
 engraving, frame composition and encoding) plus one contact sheet per render; `doc/ACCEPTANCE.md`
 records the last full run (CPU, 1920x1080, 30 fps).
+
+> Measured on this machine (CPU encoding, 1920x1080 at 30 fps, all four corpus cases in both modes): `switch`
+> costs 7.5-10.2 ms per frame, 6.3-8.1 ms of it inside libx264, and `flow` 97.5-100.7 ms per frame, 89-91 ms
+> of it composing the frame (cropping the strip window and resampling it). A four-minute song therefore takes
+> roughly a minute to render in `switch` (plus a minute or two of analysis) and about twelve minutes in
+> `flow`. The previous record's 3.2-3.8 ms/frame switch figures are not a usable baseline: a back-to-back A/B
+> measured 10.91 ms/frame for the pre-refactor code and 9.16 ms/frame for this one on the same 1800-frame
+> task, so this run is the switch baseline.
 
 ## Layout
 
@@ -142,7 +156,7 @@ src/musicflow/
   align/            symbolic-to-audio alignment and reviewed anchors
   flow/             Verovio engraving, SVG note positions, strip tiles
   render/           frame compositing (switch and flow), chunked ffmpeg encoding
-tests/ tools/ doc/  module and end-to-end tests, the acceptance harness, and the docs
+tests/ tools/ doc/  unit tests, the acceptance harness for the corpus evidence, and the docs
 ```
 
 ## Documentation
