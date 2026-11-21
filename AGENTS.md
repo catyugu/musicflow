@@ -38,6 +38,11 @@ uv run ruff check .     # lint（格式化用 ruff format .）
 
 ## 测试
 
+- `uv run pytest` 只跑快档：合成输入或小 fixture，单个用例约 2 s 以内、整套 60 s 以内。这是编辑循环，
+  每改一处就跑一次。
+- `uv run pytest -m slow` 只跑语料/昂贵档：PDF 检测与绑定、Verovio 刻谱、真实对齐精度门槛、真实 ffmpeg
+  渲染与端到端。它与 `tools/acceptance.py` 一起构成提交前和验收的证据，不在编辑循环里反复跑。
+  `uv run pytest -m "slow or not slow"` 跑全部。
 - 只写能验证语义的测试：模块级不变量、端到端行为、真实回归；不要为覆盖率凑断言。
 - 端到端测试用 `test_cases/case1..4`（case4 是单谱表谱面），允许跳过缺失的语料，但不得跳过存在语料上的失败。
 - 精度类断言用可量化判据（残差中位数、时长差、帧数），不用"看起来对"。

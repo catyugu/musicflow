@@ -3,6 +3,11 @@
 These tests are about what ``load_score`` and ``build_route`` decide: which notes sound, where the
 measure grid is, how the written repeats become a performance route. partitura parses whole
 documents, so scores are loaded once per file and shared; nothing here mutates them.
+
+Parsing a movement takes seconds, so everything that loads a corpus score or MIDI is ``slow``. The
+fast tier keeps the decisions that need no parsed document - the route override and the repeat
+rules, both over a score built in memory - plus the small hand-written documents that pin the
+reader's caveats.
 """
 
 from __future__ import annotations
@@ -17,7 +22,7 @@ from pathlib import Path
 import pytest
 
 from musicflow.errors import InputError
-from musicflow.model import NoteEvent, Repeat, Score
+from musicflow.model import MeasureInfo, NoteEvent, PartInfo, Repeat, Score
 from musicflow.scorexml import parse_musicxml
 
 with warnings.catch_warnings():
@@ -97,10 +102,41 @@ def _override_file(directory: Path) -> Path:
     return path
 
 
+def _inline_score(measures: int = 8, notes_per_measure: int = 2) -> Score:
+    """A written score built in memory, for the route rules that need no parsed document."""
+    length_q = 4.0
+    measure_infos = tuple(
+        MeasureInfo(index, (index - 1) * length_q, length_q) for index in range(1, measures + 1)
+    )
+    events = tuple(
+        NoteEvent(
+            f"mf-{(index - 1) * notes_per_measure + position + 1:06d}",
+            "P1",
+            1,
+            1,
+            index,
+            (index - 1) * length_q + position * length_q / notes_per_measure,
+            length_q / notes_per_measure,
+            60 + position,
+        )
+        for index in range(1, measures + 1)
+        for position in range(notes_per_measure)
+    )
+    return Score(
+        provider="musicxml",
+        parts=(PartInfo("P1", "Piano", 1),),
+        measures=measure_infos,
+        notes=events,
+        repeats=(),
+        total_q=measures * length_q,
+    )
+
+
 def _notes_in(score: Score, measure: int) -> list[NoteEvent]:
     return [note for note in score.notes if note.measure == measure]
 
 
+@pytest.mark.slow
 def test_written_score_shape(case, score):
     expected = WRITTEN[case.name]
     assert score.provider == "musicxml"
@@ -112,6 +148,7 @@ def test_written_score_shape(case, score):
     assert score.total_q == pytest.approx(score.measures[-1].end_q)
 
 
+@pytest.mark.slow
 def test_measures_hold_every_note(score):
     for note in score.notes:
         measure = score.measures[note.measure - 1]
@@ -131,6 +168,7 @@ def test_measures_hold_every_note(score):
 
 
 @pytest.mark.parametrize("container", ("musicxml", "mxl"))
+@pytest.mark.slow
 def test_written_path_holds_the_annotated_document(case, score, tmp_path, container):
     source = getattr(case, container)
     if not source.is_file():
@@ -145,6 +183,7 @@ def test_written_path_holds_the_annotated_document(case, score, tmp_path, contai
     assert {note.id for note in annotated.notes} <= set(identifiers)
 
 
+@pytest.mark.slow
 def test_ties_collapse_into_one_note(case, score, tmp_path):
     written = tmp_path / "written.musicxml"
     load_score(case.musicxml, written_path=written)
@@ -168,6 +207,7 @@ def test_ties_collapse_into_one_note(case, score, tmp_path):
 
 
 @pytest.mark.parametrize("name", sorted(WRITTEN_DURATION_Q))
+@pytest.mark.slow
 def test_merged_ties_keep_the_written_duration(name, musicxml_of):
     score = _score(musicxml_of(name))
     assert sum(note.duration_q for note in score.notes) == pytest.approx(
@@ -175,6 +215,7 @@ def test_merged_ties_keep_the_written_duration(name, musicxml_of):
     )
 
 
+@pytest.mark.slow
 def test_grace_notes_keep_their_own_position(musicxml_of, tmp_path):
     written = tmp_path / "written.musicxml"
     score = load_score(musicxml_of("case2"), written_path=written)
@@ -199,6 +240,7 @@ def test_grace_notes_keep_their_own_position(musicxml_of, tmp_path):
         assert grace.duration_q < main.duration_q
 
 
+@pytest.mark.slow
 def test_route_follows_the_written_score(case, score):
     expected = ROUTES[case.name]
     route = build_route(score)
@@ -227,7 +269,8 @@ def test_route_follows_the_written_score(case, score):
         )
 
 
-def test_route_passes_are_contiguous(case, score, tmp_path):
+def test_route_passes_are_contiguous(tmp_path):
+    score = _inline_score()
     override = _override_file(tmp_path)
     for route in (build_route(score), build_route(score, override=override)):
         cursor = 0.0
@@ -238,6 +281,7 @@ def test_route_passes_are_contiguous(case, score, tmp_path):
 
 
 @pytest.mark.parametrize("name", ["case1", "case2"])
+@pytest.mark.slow
 def test_written_route_places_each_note_at_its_written_position(name, musicxml_of):
     score = _score(musicxml_of(name))
     route = build_route(score)
@@ -248,6 +292,7 @@ def test_written_route_places_each_note_at_its_written_position(name, musicxml_o
     )
 
 
+@pytest.mark.slow
 def test_repeat_span_is_written_once_per_part(musicxml_of):
     path = musicxml_of("case3")
     score = _score(path)
@@ -261,6 +306,7 @@ def test_repeat_span_is_written_once_per_part(musicxml_of):
     assert score.repeats == (Repeat("repeat_span", 1, 139, 2),)
 
 
+@pytest.mark.slow
 def test_repeat_route_plays_the_opening_section_twice(musicxml_of):
     score = _score(musicxml_of("case3"))
     route = build_route(score)
@@ -280,6 +326,7 @@ def test_repeat_route_plays_the_opening_section_twice(musicxml_of):
     assert 1.4 < ratio < 1.5, "one repeat of 139 of 314 measures adds 44% of the length"
 
 
+@pytest.mark.slow
 def test_repeat_route_matches_the_midi_extent(musicxml_of):
     path = musicxml_of("case3")
     score = _score(path)
@@ -294,6 +341,7 @@ def test_repeat_route_matches_the_midi_extent(musicxml_of):
     assert midi.total_q == pytest.approx(route.total_q)
 
 
+@pytest.mark.slow
 def test_midi_score_is_the_flat_written_route(case, tmp_path):
     if not case.has(".mid"):
         pytest.skip(f"{case.name} is missing its MIDI file")
@@ -318,7 +366,8 @@ def test_midi_score_is_the_flat_written_route(case, tmp_path):
     assert not target.exists()
 
 
-def test_override_route_follows_the_file(case, score, tmp_path):
+def test_override_route_follows_the_file(tmp_path):
+    score = _inline_score()
     route = build_route(score, override=_override_file(tmp_path))
     lengths = {measure.index: measure.length_q for measure in score.measures}
     assert route.source == "override"
@@ -358,7 +407,8 @@ def test_override_route_follows_the_file(case, score, tmp_path):
         '{"spans": [[1, 100000]]}',
     ],
 )
-def test_override_rejects_bad_files(payload, score, tmp_path):
+def test_override_rejects_bad_files(payload, tmp_path):
+    score = _inline_score()
     path = tmp_path / "route.json"
     path.write_text(payload, encoding="utf-8")
     with pytest.raises(InputError):
@@ -367,8 +417,8 @@ def test_override_rejects_bad_files(payload, score, tmp_path):
         build_route(score, override=tmp_path / "absent.json")
 
 
-def test_unexpanded_jumps_are_reported(musicxml_of):
-    score = _score(musicxml_of("case1"))
+def test_unexpanded_jumps_are_reported():
+    score = _inline_score(measures=48)
     with_jump = replace(
         score, repeats=(Repeat("repeat_span", 3, 6, 2), Repeat("da_capo", 10, 10, 1))
     )
@@ -382,8 +432,8 @@ def test_unexpanded_jumps_are_reported(musicxml_of):
     assert all("is not" in line for line in route.unconfirmed)
 
 
-def test_repeat_count_controls_the_number_of_passes(musicxml_of):
-    score = _score(musicxml_of("case1"))
+def test_repeat_count_controls_the_number_of_passes():
+    score = _inline_score(measures=12)
     twice = build_route(replace(score, repeats=(Repeat("repeat_span", 1, 4, 2),)))
     thrice = build_route(replace(score, repeats=(Repeat("repeat_span", 1, 4, 3),)))
     assert [measure_pass.measure for measure_pass in twice.passes[:6]] == [1, 2, 3, 4, 1, 2]

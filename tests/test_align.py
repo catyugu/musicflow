@@ -13,16 +13,19 @@ Two families of checks, both semantic rather than structural:
   and are checked against invariants: residual, coverage, monotonicity, boundaries, and the control
   that the map scores at least twice as well as the same map shifted by two seconds.
 
-Two unit checks pin what the corpus cannot isolate (the attack indicator marks only the onset cell
-and its optional window decays afterwards; the shared-spectrum correlation equals the direct
-convolution it replaces). Alignments are cached per case, because case3 takes ~20 s.
+Everything that decodes a corpus recording is ``slow``; the fast tier pins what the corpus cannot
+isolate on synthetic arrays and synthetic scores: the attack indicator marks only the onset cell
+and its optional window decays afterwards, the shared-spectrum correlation equals the direct
+convolution it replaces, and the guards on the route, the reviewed anchors and the recording run
+before any decoding. The corpus alignments are cached per case in the slow tier, because case3
+takes ~20 s.
 """
 
 from __future__ import annotations
 
 import json
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +39,7 @@ from scipy.signal import fftconvolve
 
 from musicflow import audio as audio_module
 from musicflow.align import align
+from musicflow.align.constraints import Constraint, validate_bounds
 from musicflow.align.features import ATTACK_DECAY, build_score_grid
 from musicflow.align.stages import _audio_spectrum, _correlation
 from musicflow.errors import AnalysisError, InputError
@@ -164,6 +168,7 @@ def _error_against_midi(run: Run) -> tuple[np.ndarray, float, int]:
     return (predicted - np.asarray(times)) * 1000.0, rate, len(quarters)
 
 
+@pytest.mark.slow
 def test_alignment_tracks_midi_ground_truth(case, runs: RunFactory) -> None:
     run = runs(case)
     error, match_rate, pairs = _error_against_midi(run)
@@ -185,6 +190,7 @@ def test_alignment_tracks_midi_ground_truth(case, runs: RunFactory) -> None:
     assert p90 <= P90_LIMIT_MS, message
 
 
+@pytest.mark.slow
 def test_alignment_invariants(case, runs: RunFactory) -> None:
     run = runs(case)
     alignment = run.alignment
@@ -210,6 +216,7 @@ def test_alignment_invariants(case, runs: RunFactory) -> None:
         assert entry["seconds"] == pytest.approx(alignment.time_at(entry["q"]), abs=1e-6)
 
 
+@pytest.mark.slow
 def test_artifacts_are_written(case, runs: RunFactory) -> None:
     run = runs(case)
     report_path = run.work_dir / "report.json"
@@ -285,6 +292,7 @@ def _independent_similarities(run: Run) -> tuple[float, float]:
     return results[0], results[1]
 
 
+@pytest.mark.slow
 def test_map_beats_the_same_map_shifted(case, runs: RunFactory) -> None:
     run = runs(case)
     aligned, shifted = _independent_similarities(run)
@@ -294,6 +302,7 @@ def test_map_beats_the_same_map_shifted(case, runs: RunFactory) -> None:
     )
 
 
+@pytest.mark.slow
 def test_manual_constraints_are_honoured(tmp_path: Path) -> None:
     score, route, audio = _corpus_paths("case1")
     baseline = align(score, route, audio, work_dir=tmp_path / "baseline")
@@ -322,7 +331,9 @@ def test_manual_constraints_are_honoured(tmp_path: Path) -> None:
 
 
 def test_constraint_files_are_validated(tmp_path: Path) -> None:
-    score, route, audio = _corpus_paths("case1")
+    """Every malformed review file is refused before the recording is opened."""
+    score, route = _sustained_note(duration_q=2.0)
+    absent_audio = tmp_path / "never-read.mp3"
     cases = {
         "backwards.json": (
             {"anchors": [[10.0, 5.0], [40.0, 4.0]]},
@@ -330,28 +341,35 @@ def test_constraint_files_are_validated(tmp_path: Path) -> None:
         ),
         "same_q.json": ({"anchors": [[10.0, 5.0], [10.0, 6.0]]}, "strictly increasing"),
         "empty.json": ({"anchors": []}, "non-empty"),
-        "outside.json": ({"anchors": [[10.0, 5.0], [100000.0, 6.0]]}, "outside the performance"),
         "shape.json": ({"anchors": [[1.0, 2.0, 3.0]]}, "not a pair"),
     }
     for name, (payload, message) in cases.items():
         path = tmp_path / name
         path.write_text(json.dumps(payload), encoding="utf-8")
         with pytest.raises(InputError, match=message):
-            align(score, route, audio, work_dir=tmp_path / name, constraints=path)
+            align(score, route, absent_audio, work_dir=tmp_path / name, constraints=path)
     broken = tmp_path / "broken.json"
     broken.write_text("{not json", encoding="utf-8")
     with pytest.raises(InputError, match="not valid JSON"):
-        align(score, route, audio, work_dir=tmp_path / "broken", constraints=broken)
-    absent = tmp_path / "absent.json"
+        align(score, route, absent_audio, work_dir=tmp_path / "broken", constraints=broken)
+    missing = tmp_path / "absent.json"
     with pytest.raises(InputError, match="not found"):
-        align(score, route, audio, work_dir=tmp_path / "absent", constraints=absent)
+        align(score, route, absent_audio, work_dir=tmp_path / "absent", constraints=missing)
+
+
+def test_reviewed_anchors_outside_the_performance_are_rejected() -> None:
+    """A reviewed anchor may not leave the route or the recording, in quarters or in seconds."""
+    with pytest.raises(InputError, match="outside the performance route"):
+        validate_bounds((Constraint(100000.0, 6.0),), total_q=4.0, audio_duration=10.0)
+    with pytest.raises(InputError, match="outside the recording"):
+        validate_bounds((Constraint(2.0, 600.0),), total_q=4.0, audio_duration=10.0)
+    validate_bounds((Constraint(0.0, 0.0), Constraint(4.0, 10.0)), total_q=4.0, audio_duration=10.0)
 
 
 def test_missing_or_unreadable_audio_is_an_input_error(tmp_path: Path) -> None:
-    score, route, audio = _corpus_paths("case1")
+    score, route = _sustained_note(duration_q=2.0)
     with pytest.raises(InputError, match="not found"):
         align(score, route, tmp_path / "missing.mp3", work_dir=tmp_path / "a")
-    assert audio.is_file()
     notebook = tmp_path / "notes.mp3"
     notebook.write_text("not a recording", encoding="utf-8")
     with pytest.raises(InputError):
@@ -359,10 +377,20 @@ def test_missing_or_unreadable_audio_is_an_input_error(tmp_path: Path) -> None:
 
 
 def test_stale_route_is_rejected(tmp_path: Path) -> None:
-    score, _, audio = _corpus_paths("case1")
-    _, other_route, _ = _corpus_paths("case2")
+    """A cached route that names an unknown note, or moves one to another measure, is stale."""
+    score, route = _sustained_note(duration_q=2.0)
+    quiet = tmp_path / "never-read.mp3"
+    unknown = replace(route, notes=(PerformanceNote("n9", 1, 0, 1.0),))
     with pytest.raises(AnalysisError, match="stale"):
-        align(score, other_route, audio, work_dir=tmp_path / "stale")
+        align(score, unknown, quiet, work_dir=tmp_path / "unknown")
+    moved = Route(
+        passes=(MeasurePass(1, 0, 0.0, 4.0), MeasurePass(2, 0, 4.0, 4.0)),
+        notes=(PerformanceNote("n1", 2, 0, 4.0),),
+        total_q=8.0,
+        source="written",
+    )
+    with pytest.raises(AnalysisError, match="stale"):
+        align(score, moved, quiet, work_dir=tmp_path / "moved")
 
 
 def _sustained_note(duration_q: float) -> tuple[Score, Route]:

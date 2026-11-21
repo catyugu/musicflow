@@ -5,6 +5,9 @@ from that analysis: analysing once per mode paid for the alignment and the engra
 was this module's largest cost. The full-length acceptance renders live in ``tools/acceptance.py``.
 Everything asserted here is a user-visible property of the delivered MP4 or of the report, not an
 internal detail.
+
+The whole module is ``slow``: it is the corpus acceptance evidence a change has to pass before it
+is committed, not part of the edit loop.
 """
 
 from __future__ import annotations
@@ -26,6 +29,8 @@ SPEC = VideoSpec(width=480, height=270, fps=10)
 PREVIEW = 6.0
 PAPER = np.array([0xFA, 0xF8, 0xF1], dtype=np.int16)
 LINE = np.array([0x28, 0x7D, 0x9F], dtype=np.int16)
+
+pytestmark = pytest.mark.slow
 
 
 @dataclass(frozen=True)

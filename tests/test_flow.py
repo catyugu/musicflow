@@ -1,12 +1,16 @@
-"""Flow layout checks over the curated corpus.
+"""Flow layout checks: markup geometry and measure mapping in the fast tier, the corpus in ``slow``.
 
 The layout is the contract between the engraver and the flow renderer: every score note needs a
 horizontal position that lands on engraved ink, measures need contiguous spans, and the strip has
-to be cut into tiles that neither miss nor clip anything. These tests read the produced tiles back
-and check exactly that, so they fail on a broken mapping rather than on a changed number. Two of
-them guard ink that note positions alone cannot see: Verovio paints staff lines, stems, barlines,
-slurs and hairpins through a stylesheet scoped by the page id, so a rewritten id or a dropped
-stylesheet leaves only fill-based ink behind — noteheads and beams floating on blank paper.
+to be cut into tiles that neither miss nor clip anything. The corpus tests read the produced tiles
+back and check exactly that, so they fail on a broken mapping rather than on a changed number. Two
+of them guard ink that note positions alone cannot see: Verovio paints staff lines, stems,
+barlines, slurs and hairpins through a stylesheet scoped by the page id, so a rewritten id or a
+dropped stylesheet leaves only fill-based ink behind — noteheads and beams floating on blank paper.
+
+Every corpus test engraves a whole movement, so they are ``slow``; the tier below them pins the
+same geometry contract on a hand-written miniature of Verovio's page and on the pure measure
+mapping, which is what the engraving feeds.
 """
 
 from __future__ import annotations
@@ -24,9 +28,11 @@ import pytest
 from lxml import etree
 from PIL import Image
 
+from musicflow.errors import InputError
 from musicflow.flow import build_layout
+from musicflow.flow.layout import _measure_spans
 from musicflow.flow.markup import SvgDocument
-from musicflow.model import FlowLayout, Score
+from musicflow.model import FlowLayout, MeasureInfo, NoteEvent, PartInfo, Rect, Score
 from musicflow.scorexml import write_normalized_musicxml
 
 TARGET_CONTENT_HEIGHT = 700
@@ -42,6 +48,106 @@ RUNTIME_BUDGET_SECONDS = {"case1": 60.0, "case2": 90.0, "case3": 120.0}
 DEFAULT_RUNTIME_BUDGET = 120.0
 
 _SVG_NAMESPACE = "{http://www.w3.org/2000/svg}"
+
+# A miniature of Verovio's single-system page: the outer <svg> carries the layout-unit size, the
+# inner definition-scale <svg> its own viewBox, and a note is a <g class="note" id="mf-NNNNNN">
+# whose innermost glyph placement holds the horizontal position. The second note also carries an
+# accidental placement, which must not be taken for its notehead, and the third sits under a
+# translated and scaled group, so its position is only right when ancestor transforms compose.
+_PAGE = """\
+<svg xmlns="http://www.w3.org/2000/svg" width="400px" height="200px">
+  <svg class="definition-scale" viewBox="0 0 800 400">
+    <g class="staff">
+      <path d="M40 50 L760 50"/>
+      <path d="M40 60 L760 60"/>
+      <path d="M40 50 L400 70"/>
+    </g>
+    <g class="note" id="mf-000001">
+      <g class="notehead"><use transform="translate(100, 50) scale(0.5)"/></g>
+    </g>
+    <g class="note" id="mf-000002">
+      <g class="accidental"><use transform="translate(120, 20) scale(0.4)"/></g>
+      <g class="notehead"><use transform="translate(140, 50) scale(0.5)"/></g>
+    </g>
+    <g transform="translate(200, 0) scale(2)">
+      <g class="note" id="mf-000003"><g class="notehead"><use transform="translate(10, 0)"/></g></g>
+    </g>
+  </svg>
+</svg>
+"""
+
+
+def test_markup_positions_notes_in_layout_units() -> None:
+    page = SvgDocument(_PAGE)
+    positions = page.note_x({"mf-000001", "mf-000002", "mf-000003", "mf-999999"})
+    # The inner page is halved into the outer layout units; an id the page does not carry is absent.
+    assert positions == pytest.approx({"mf-000001": 50.0, "mf-000002": 70.0, "mf-000003": 110.0})
+
+
+def test_markup_reports_staff_lines_and_their_space() -> None:
+    page = SvgDocument(_PAGE)
+    # The sloped path is not a staff line: only the two horizontal rows survive the conversion.
+    assert page.staff_lines() == ((20.0, 25.0, 380.0), (20.0, 30.0, 380.0))
+    assert page.staff_space() == pytest.approx(5.0)
+
+
+def test_window_crops_the_page_without_rescaling_the_engraving() -> None:
+    cropped = SvgDocument(_PAGE).window(100.0, 50.0, 640, 360)
+    assert 'viewBox="100.0 50.0 640 360"' in cropped
+    assert 'width="640px"' in cropped and 'height="360px"' in cropped
+    assert 'class="definition-scale" x="0" y="0" width="400.0" height="200.0"' in cropped, (
+        "the crop must move the camera, not rescale the engraved page"
+    )
+
+
+def _mapped_score() -> Score:
+    """Four measures, a note pair in the first one and nothing in the second."""
+    measures = tuple(MeasureInfo(index, (index - 1) * 4.0, 4.0) for index in range(1, 5))
+    notes = (
+        NoteEvent("mf-000001", "P1", 1, 1, 1, 0.0, 4.0, 60),
+        NoteEvent("mf-000002", "P1", 1, 1, 1, 2.0, 2.0, 64),
+        NoteEvent("mf-000003", "P1", 1, 1, 3, 8.0, 4.0, 67),
+        NoteEvent("mf-000004", "P1", 1, 1, 4, 12.0, 4.0, 72),
+    )
+    return Score(
+        provider="musicxml",
+        parts=(PartInfo("P1", "Piano", 1),),
+        measures=measures,
+        notes=notes,
+        repeats=(),
+        total_q=16.0,
+    )
+
+
+def test_measure_spans_follow_the_resolved_note_positions() -> None:
+    span_of, span_off = 300.0, 400.0
+    spans = _measure_spans(
+        _mapped_score(),
+        {
+            "mf-000001": 30.0,
+            "mf-000002": 20.0,
+            "mf-000003": span_of,
+            "mf-000004": span_off,
+            "mf-000009": 900.0,
+        },
+        Rect(0.0, 10.0, 500.0, 200.0),
+        12.0,
+    )
+    # A measure starts left of its leftmost note by the pad, ends where the next one starts, and
+    # the last one runs to the strip content edge; measure 2 has no resolved note and is absent.
+    assert spans == ((1, 8.0, 288.0), (3, 288.0, 388.0), (4, 388.0, 500.0))
+    clamped = _measure_spans(_mapped_score(), {"mf-000004": 5.0}, Rect(0.0, 0.0, 60.0, 10.0), 12.0)
+    assert clamped == ((4, 0.0, 60.0),), "a pad must not start a span left of the strip"
+
+
+def test_missing_written_musicxml_is_an_input_error(tmp_path: Path) -> None:
+    with pytest.raises(InputError, match="not found"):
+        build_layout(
+            _mapped_score(),
+            tmp_path / "absent.musicxml",
+            work_dir=tmp_path / "flow",
+            target_content_height=TARGET_CONTENT_HEIGHT,
+        )
 
 
 @dataclass(frozen=True)
@@ -140,6 +246,7 @@ def _stem_ids(markup: str) -> set[str]:
     return stems
 
 
+@pytest.mark.slow
 def test_note_positions_cover_the_score(built: Built) -> None:
     positions = built.layout.note_positions
     wanted = {note.id for note in built.score.notes}
@@ -151,6 +258,7 @@ def test_note_positions_cover_the_score(built: Built) -> None:
     )
 
 
+@pytest.mark.slow
 def test_note_positions_advance_with_written_onset(built: Built) -> None:
     positions = built.layout.note_positions
     ordered = [
@@ -170,6 +278,7 @@ def test_note_positions_advance_with_written_onset(built: Built) -> None:
     )
 
 
+@pytest.mark.slow
 def test_measure_spans_are_ordered_and_disjoint(built: Built) -> None:
     spans = built.layout.measure_x
     assert spans, "no measure has an engraved span"
@@ -189,6 +298,7 @@ def test_measure_spans_are_ordered_and_disjoint(built: Built) -> None:
     )
 
 
+@pytest.mark.slow
 def test_tiles_cover_the_strip(built: Built) -> None:
     layout = built.layout
     height = math.ceil(layout.strip_height)
@@ -213,6 +323,7 @@ def test_tiles_cover_the_strip(built: Built) -> None:
     assert max(widths) <= 4096, f"tile wider than the fixed tile width: {sorted(widths)}"
 
 
+@pytest.mark.slow
 def test_note_positions_land_on_ink(built: Built, tiles: list[np.ndarray]) -> None:
     positions = built.layout.note_positions
     notes = [note for note in built.score.notes if note.id in positions]
@@ -238,6 +349,7 @@ def test_note_positions_land_on_ink(built: Built, tiles: list[np.ndarray]) -> No
     )
 
 
+@pytest.mark.slow
 def test_staff_lines_are_engraved(
     built: Built, document: SvgDocument, tiles: list[np.ndarray]
 ) -> None:
@@ -269,6 +381,7 @@ def test_staff_lines_are_engraved(
     assert not unpainted, "; ".join(unpainted[:5])
 
 
+@pytest.mark.slow
 def test_note_stems_are_engraved(
     built: Built, document: SvgDocument, tiles: list[np.ndarray]
 ) -> None:
@@ -306,6 +419,7 @@ def test_note_stems_are_engraved(
     )
 
 
+@pytest.mark.slow
 def test_stylesheet_selectors_resolve(built: Built) -> None:
     markup = built.strip_svg.read_text(encoding="utf-8")
     styles = re.findall(r"<style[^>]*>(.*?)</style>", markup, re.S)
@@ -323,6 +437,7 @@ def test_stylesheet_selectors_resolve(built: Built) -> None:
     )
 
 
+@pytest.mark.slow
 def test_tile_seams_do_not_clip_ink(built: Built, tiles: list[np.ndarray]) -> None:
     layout = built.layout
     boundaries = [int(tile.x0) for tile in layout.tiles[1:]]
@@ -349,6 +464,7 @@ def test_tile_seams_do_not_clip_ink(built: Built, tiles: list[np.ndarray]) -> No
         )
 
 
+@pytest.mark.slow
 def test_content_matches_the_target_height(built: Built) -> None:
     content = built.layout.content
     assert content.width > 0 and content.height > 0
@@ -364,6 +480,7 @@ def test_content_matches_the_target_height(built: Built) -> None:
         )
 
 
+@pytest.mark.slow
 def test_diagnostics_are_written(built: Built) -> None:
     svg = built.strip_svg
     overview = built.overview
@@ -378,6 +495,7 @@ def test_diagnostics_are_written(built: Built) -> None:
     )
 
 
+@pytest.mark.slow
 def test_runtime_stays_within_budget(case, built: Built) -> None:
     budget = RUNTIME_BUDGET_SECONDS.get(case.name, DEFAULT_RUNTIME_BUDGET)
     assert built.elapsed <= budget, (

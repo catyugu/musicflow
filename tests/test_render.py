@@ -5,6 +5,11 @@ symbolic/PDF/flow producers: the flow strip is a generated image, the alignment 
 the switch layouts are bounding boxes on the real case1 page. Checks that could pass for cosmetic
 reasons are written as measurable quantities: mean absolute frame difference, ink coverage, ffprobe
 durations and frame counts, and segment mtimes.
+
+The camera and switch-plan checks plus every failure path are the fast tier. The renders that
+show a page or the strip on screen are ``slow``, except the shortest one: the segment-frame check
+runs a sub-two-second encode because frame ordering across a segment boundary has no cheaper
+witness.
 """
 
 from __future__ import annotations
@@ -169,6 +174,7 @@ def flow_render(strip: tuple[Path, FlowLayout], tmp_path: Path) -> dict:
     }
 
 
+@pytest.mark.slow
 def test_flow_moves_the_strip_past_the_reading_line(tmp_path: Path, flow_render: dict) -> None:
     spec = flow_render["spec"]
     out = tmp_path / "flow.mp4"
@@ -249,6 +255,7 @@ def switch_render(tmp_path: Path) -> dict:
     }
 
 
+@pytest.mark.slow
 def test_switch_shows_the_next_system_at_its_first_sounding_measure(
     tmp_path: Path, switch_render: dict
 ) -> None:
@@ -321,6 +328,7 @@ def test_unbound_system_is_an_analysis_error() -> None:
         plan_switch(score=score, route=route, layout=layout, alignment=alignment, fps=10)
 
 
+@pytest.mark.slow
 def test_output_duration_matches_the_recording(tmp_path: Path, flow_render: dict) -> None:
     audio = flow_render["audio"]
     out = tmp_path / "full.mp4"
@@ -334,6 +342,7 @@ def test_output_duration_matches_the_recording(tmp_path: Path, flow_render: dict
     assert produced.frames == 60, "a 6 s piece at 10 fps does not have 60 frames"
 
 
+@pytest.mark.slow
 def test_second_render_reuses_segments_and_frames_depend_only_on_time(
     tmp_path: Path, flow_render: dict
 ) -> None:

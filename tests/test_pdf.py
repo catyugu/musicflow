@@ -1,9 +1,12 @@
-"""End-to-end checks of PDF staff-system detection on the curated corpus.
+"""PDF staff-system detection: the curated corpus in ``slow``, synthetic pages in the fast tier.
 
 The corpus is the acceptance target: case1 is a vector MuseScore export (3 staves per system),
 case2 a 96 dpi scan (2 staves in the piano-only systems, 3 elsewhere), case3 a vector OpenScore
 quartet export (4 staves per system) and case4 a vector solo-cello score (1 staff per system).
-Detection is cached per case because rasterising 25 pages is the expensive part.
+Detection is cached per case because rasterising 25 pages is the expensive part, and every test
+that needs it is ``slow``. The fast tier draws its own single-system pages and synthetic layouts,
+where barline geometry, staff grouping, override validation, strict binding and the diagnostics
+gate can be checked without a corpus.
 """
 
 from __future__ import annotations
@@ -120,6 +123,7 @@ def crop_of(case: Case, system: System) -> tuple[np.ndarray, float]:
     return crop, space_px
 
 
+@pytest.mark.slow
 def test_systems_have_sane_geometry(layout: StaffLayout, case: Case) -> None:
     assert layout.systems, f"{case.name}: no systems detected"
     pages = {page.number: page for page in layout.pages}
@@ -140,6 +144,7 @@ def test_systems_have_sane_geometry(layout: StaffLayout, case: Case) -> None:
         assert system.measure_count == len(system.barlines)
 
 
+@pytest.mark.slow
 def test_systems_do_not_overlap(layout: StaffLayout, case: Case) -> None:
     for upper, lower in zip(layout.systems, layout.systems[1:], strict=False):
         if upper.page != lower.page:
@@ -149,6 +154,7 @@ def test_systems_do_not_overlap(layout: StaffLayout, case: Case) -> None:
         )
 
 
+@pytest.mark.slow
 def test_staff_counts(layout: StaffLayout, case: Case) -> None:
     expected = EXPECTED_STAVES[case.name]
     counts = [len(system.staves) for system in layout.systems]
@@ -164,6 +170,7 @@ def test_staff_counts(layout: StaffLayout, case: Case) -> None:
     assert not page_systems, f"{case.name}: pages without a system: {sorted(page_systems)}"
 
 
+@pytest.mark.slow
 def test_measure_counts_match_the_score(layout: StaffLayout, case: Case) -> None:
     score = score_of(case.musicxml)
     total = sum(system.measure_count for system in layout.systems)
@@ -172,6 +179,7 @@ def test_measure_counts_match_the_score(layout: StaffLayout, case: Case) -> None
     )
 
 
+@pytest.mark.slow
 def test_binding_covers_the_score(layout: StaffLayout, case: Case) -> None:
     score = score_of(case.musicxml)
     bound = bind_measures(layout, score)
@@ -186,6 +194,7 @@ def test_binding_covers_the_score(layout: StaffLayout, case: Case) -> None:
     assert cursor == last + 1
 
 
+@pytest.mark.slow
 def test_printed_measures_are_used_on_vector_pages(layout: StaffLayout, case: Case) -> None:
     printed = [system.printed_measure for system in layout.systems]
     if case.name == "case2":
@@ -200,12 +209,14 @@ def test_printed_measures_are_used_on_vector_pages(layout: StaffLayout, case: Ca
             assert system.first_measure == system.printed_measure
 
 
+@pytest.mark.slow
 def test_printed_measure_agrees_with_barlines(layout: StaffLayout, case: Case) -> None:
     bound = bind_measures(layout, score_of(case.musicxml))
     disagreement = [line for line in bound.unconfirmed if "printed numbering covers" in line]
     assert not disagreement, f"{case.name}: printed numbering and barlines disagree: {disagreement}"
 
 
+@pytest.mark.slow
 def test_crop_holds_exactly_its_own_staves(case: Case, layout: StaffLayout) -> None:
     expected = EXPECTED_STAVES[case.name]
     bad = []
@@ -219,6 +230,7 @@ def test_crop_holds_exactly_its_own_staves(case: Case, layout: StaffLayout) -> N
     assert not bad, f"{case.name}: crops with the wrong number of staff lines: {bad}"
 
 
+@pytest.mark.slow
 def test_crop_border_is_clear(case: Case, layout: StaffLayout) -> None:
     """A cut note, dynamic or brace leaves ink on the crop's outermost pixels."""
     failures = []
@@ -243,6 +255,7 @@ def test_crop_border_is_clear(case: Case, layout: StaffLayout) -> None:
     )
 
 
+@pytest.mark.slow
 def test_detection_is_deterministic(case: Case, layout: StaffLayout, tmp_path: Path) -> None:
     again = detect_layout(case.pdf, expected_staves=EXPECTED_STAVES[case.name], debug_dir=tmp_path)
     assert again.to_dict() == layout.to_dict(), f"{case.name}: detection is not reproducible"
@@ -370,6 +383,7 @@ def scanned_copy(case: Case, target: Path, dpi: int = 150) -> Path:
     return target
 
 
+@pytest.mark.slow
 def test_solo_scan_counts_its_measures_from_the_barlines(solo: Case, tmp_path: Path) -> None:
     """Without a text layer the barlines are the only thing that names the measures.
 

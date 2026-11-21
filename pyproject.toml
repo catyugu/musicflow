@@ -42,4 +42,7 @@ ignore = ["B905"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q"
+addopts = '-q -m "not slow" --strict-markers'
+markers = [
+    "slow: corpus-scale or costly check; run with `pytest -m slow`, not in the edit loop",
+]

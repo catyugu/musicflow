@@ -211,6 +211,7 @@ def test_keys_track_digests_parameters_and_payload_order(tmp_path: Path) -> None
     assert workdir.hash_payload({"a": 1}) != workdir.hash_payload({"a": 2})
 
 
+@pytest.mark.slow
 def test_changed_route_override_invalidates_the_alignment(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -242,6 +243,7 @@ def test_changed_route_override_invalidates_the_alignment(
     assert calls[0].to_dict() != calls[1].to_dict()
 
 
+@pytest.mark.slow
 def test_analyze_writes_one_merged_report(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     case = _one_case()
     pytest.importorskip("musicflow.symbolic")
@@ -288,6 +290,7 @@ def test_analyze_writes_one_merged_report(monkeypatch: pytest.MonkeyPatch, tmp_p
     assert json.loads(json.dumps(report))["route"]["source"]
 
 
+@pytest.mark.slow
 def test_a_cached_step_whose_side_file_is_gone_is_recomputed(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -335,6 +338,7 @@ def test_a_cached_step_whose_side_file_is_gone_is_recomputed(
     assert tile.is_file(), "the recompute did not rewrite the deleted tile"
 
 
+@pytest.mark.slow
 def test_debug_images_are_written_only_on_request(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -370,6 +374,7 @@ def test_render_asserts_the_analysis_carries_what_the_mode_needs(tmp_path: Path)
         )
 
 
+@pytest.mark.slow
 def test_switch_render_does_not_need_the_flow_package(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -493,6 +498,7 @@ def test_discover_case_finds_the_three_inputs(case) -> None:
     assert symbolic == case.musicxml
 
 
+@pytest.mark.slow
 def test_batch_contract_for_a_midi_case_and_a_missing_corpus(case, tmp_path: Path) -> None:
     """A MIDI-only case keeps a skip record for flow; a missing corpus is an InputError."""
     with pytest.raises(InputError):
