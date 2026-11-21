@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 Mode = Literal["switch", "flow"]
 # Bump when a stage's behaviour changes: every cache key includes it, so stale artifacts from an
 # older algorithm can never be mistaken for current output.
-PIPELINE_VERSION = 9
+PIPELINE_VERSION = 10
 REPORT_NAME = "report.json"
 # The alignment evidence the merged report repeats: the rest of it stays in ``align/report.json``.
 HEADLINE_KEYS = ("audio_duration", "implied_bpm", "similarity_mean", "coverage", "residual_ms")

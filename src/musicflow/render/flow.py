@@ -26,33 +26,31 @@ CONTENT_HEIGHT_RATIO = 0.86
 def plan_camera(*, route: Route, flow: FlowLayout, alignment: Alignment) -> CameraTrack:
     """Camera anchors from the sounding notes: one ``(time, x)`` pair per note position."""
     positions = flow.note_positions
-    measured: dict[float, list[float]] = {}
+    measure_x = {measure: (start + end) / 2 for measure, start, end in flow.measure_x}
+    targets: list[tuple[float, float]] = []
     sounding: set[int] = set()
+    fallback: dict[int, float] = {}
     for note in route.notes:
         x = positions.get(note.note_id)
-        if x is None:
-            continue
-        sounding.add(note.measure)
-        measured.setdefault(alignment.time_at(note.onset_q), []).append(x)
-
-    measure_x = {measure: (start, end) for measure, start, end in flow.measure_x}
-    silent: dict[int, float] = {}
-    for note in route.notes:
-        if note.measure in sounding or note.measure in silent or note.measure not in measure_x:
-            continue
-        silent[note.measure] = note.onset_q
-    for measure, onset in silent.items():
-        start, end = measure_x[measure]
-        measured.setdefault(alignment.time_at(onset), []).append((start + end) / 2.0)
-
-    if not measured:
+        if x is not None:
+            targets.append((note.onset_q, x))
+            sounding.add(note.measure)
+        elif note.measure in measure_x:
+            fallback.setdefault(note.measure, note.onset_q)
+    missing = fallback.keys() - sounding
+    targets.extend((fallback[measure], measure_x[measure]) for measure in sorted(missing))
+    if not targets:
         raise RenderError("flow layout gives no position for any sounding note")
+    quarters, positions_x = zip(*targets, strict=True)
+    measured: dict[float, list[float]] = {}
+    for seconds, x in zip(alignment.times_at(quarters), positions_x, strict=True):
+        measured.setdefault(float(seconds), []).append(x)
     times = sorted(measured)
     logger.debug(
         "flow: %d camera anchors over %.1f s, %d measures without note positions",
         len(times),
         times[-1] - times[0],
-        len(silent),
+        len(missing),
     )
     return CameraTrack(times, [sum(measured[t]) / len(measured[t]) for t in times])
 

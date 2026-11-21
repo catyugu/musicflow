@@ -93,7 +93,7 @@ def test_time_map_interpolates_and_clamps() -> None:
     alignment = time_map(total_q=8.0, seconds=10.0)
     assert (alignment.time_at(-1.0), alignment.time_at(99.0)) == (0.0, 10.0)
     assert alignment.time_at(4.0) == pytest.approx(5.0)
-    assert alignment.time_at(2.0) == pytest.approx(2.5)
+    assert alignment.times_at([99.0, 2.0, -1.0, 4.0]) == pytest.approx([10.0, 2.5, 0.0, 5.0])
     score = written(measures=2, per_measure=2)
     assert score.staff_count == 1
     assert sorted(score.note_by_id()) == [note.id for note in score.notes]

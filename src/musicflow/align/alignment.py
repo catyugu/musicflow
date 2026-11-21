@@ -286,14 +286,15 @@ def _payload(
     elapsed: float,
     manual: tuple[Constraint, ...],
 ) -> dict[str, Any]:
+    times = alignment.times_at([measure.start_q for measure in route.passes])
     measures = [
         {
             "measure": measure_pass.measure,
             "pass_index": measure_pass.pass_index,
             "q": round(measure_pass.start_q, 6),
-            "seconds": round(alignment.time_at(measure_pass.start_q), 6),
+            "seconds": round(float(seconds), 6),
         }
-        for measure_pass in route.passes
+        for measure_pass, seconds in zip(route.passes, times, strict=True)
     ]
     onset_anchors = sum(1 for anchor in alignment.anchors if anchor.kind == "onset")
     manual_anchors = sum(1 for anchor in alignment.anchors if anchor.kind == "manual")

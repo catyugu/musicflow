@@ -29,7 +29,7 @@ from ..errors import AnalysisError
 from ..model import PageInfo, Rect, StaffLayout, System
 from .debug import write_page_overlay
 from .imaging import PageRaster, detect_staves, open_document, rasterise
-from .systems import Group, SystemGeometry, brace_groups, group_systems, system_boxes
+from .systems import SystemGeometry, group_systems, system_boxes
 
 logger = logging.getLogger(__name__)
 
@@ -87,11 +87,9 @@ def detect_layout(pdf: Path, *, expected_staves: int | None, debug_dir: Path | N
                     f"page {number}: ignored {detection.dropped_staves} horizontal candidate(s)"
                     " too short to belong to a system"
                 )
-            if expected_staves == 1:
-                chains = [[Group(staves=(staff,))] for staff in detection.staves]
-            else:
-                groups = brace_groups(raster, detection.staves, detection.space)
-                chains = _absorb_singletons(group_systems(groups, raster, detection.space))
+            chains = group_systems(
+                raster, detection.staves, detection.space, single_staff=expected_staves == 1
+            )
             geometries = system_boxes(raster, chains, detection.space)
             labels = printed_candidates(document[number - 1], raster, geometries, detection.space)
             if debug_dir is not None:
@@ -236,52 +234,6 @@ def _assign_printed(
         return systems, notes
     systems = [replace(system, printed_measure=assigned.get(system.index)) for system in systems]
     return systems, notes
-
-
-def _absorb_singletons(systems: list[list[Group]]) -> list[list[Group]]:
-    """Attach a lone staff to the nearer neighbour.
-
-    In a multi-staff score a one-staff system is a grouping failure.
-    """
-    if len(systems) < 2:
-        return systems
-    result = [list(system) for system in systems]
-    changed = True
-    while changed and len(result) > 1:
-        changed = False
-        for index, system in enumerate(result):
-            if _staff_count(system) != 1:
-                continue
-            previous = result[index - 1] if index else None
-            following = result[index + 1] if index + 1 < len(result) else None
-            above = system[0].top - previous[-1].bottom if previous else None
-            below = following[0].top - system[-1].bottom if following else None
-            height = max(staff.height for group in system for staff in group.staves)
-            limit = 2.6 * height
-            if above is not None and below is not None:
-                use_previous = above <= below
-            elif above is not None:
-                use_previous = True
-            elif below is not None:
-                use_previous = False
-            else:
-                continue
-            gap = above if use_previous else below
-            if gap is None or gap > limit:
-                continue
-            if use_previous:
-                result[index - 1].extend(system)
-                del result[index]
-            else:
-                result[index].extend(following)
-                del result[index + 1]
-            changed = True
-            break
-    return result
-
-
-def _staff_count(system: list[Group]) -> int:
-    return sum(len(group.staves) for group in system)
 
 
 def _to_system(geometry: SystemGeometry, raster: PageRaster, index: int) -> System:

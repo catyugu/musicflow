@@ -388,7 +388,7 @@ def midi_error(analysis: pipeline.Analysis, midi: Path) -> MidiError:
             times.append(values.pop(0))
     if not quarters:
         return MidiError(0, 0.0, 0.0, 0.0, 0.0)
-    predicted = np.asarray([analysis.alignment.time_at(q) for q in quarters])
+    predicted = analysis.alignment.times_at(quarters)
     error = (predicted - np.asarray(times)) * 1000.0
     offset = float(np.median(error))
     centred = np.abs(error - offset)

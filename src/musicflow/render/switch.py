@@ -90,20 +90,19 @@ def plan_switch(
         key = (note.measure, note.pass_index)
         first_onset[key] = min(first_onset.get(key, note.onset_q), note.onset_q)
 
-    visits: list[tuple[float, System]] = []
+    visits: list[System] = []
+    quarters: list[float] = []
     for measure_pass in route.passes:
         system = by_measure.get(measure_pass.measure)
         if system is None:
             continue
-        if visits and visits[-1][1].index == system.index:
+        if visits and visits[-1].index == system.index:
             continue
         onset = first_onset.get((measure_pass.measure, measure_pass.pass_index))
-        seconds = alignment.time_at(measure_pass.start_q if onset is None else onset)
-        if visits and seconds < visits[-1][0]:
-            seconds = visits[-1][0]
-        visits.append((seconds, system))
+        quarters.append(measure_pass.start_q if onset is None else onset)
+        visits.append(system)
 
-    visited = {system.index for _, system in visits}
+    visited = {system.index for system in visits}
     missing = [system.index for system in layout.systems if system.index not in visited]
     if missing:
         logger.warning(
@@ -113,9 +112,9 @@ def plan_switch(
         )
     if not visits:
         raise AnalysisError("switch: no printed system covers a measure of the performance")
-    times = tuple(seconds for seconds, _ in visits)
+    times = tuple(map(float, np.maximum.accumulate(alignment.times_at(quarters))))
     return SwitchPlan(
-        systems=tuple(system for _, system in visits),
+        systems=tuple(visits),
         times=times,
         fps=fps,
         first_frame=tuple(math.ceil(seconds * fps) for seconds in times),

@@ -17,10 +17,11 @@ Conventions used by every module:
 
 from __future__ import annotations
 
-import bisect
 from typing import Literal
 
+import numpy as np
 from msgspec import Struct
+from numpy.typing import ArrayLike
 
 RouteSource = Literal["written", "auto_repeats", "override"]
 AnchorKind = Literal["start", "onset", "manual", "end"]
@@ -221,21 +222,17 @@ class Alignment(Struct, frozen=True, forbid_unknown_fields=True):
         assert ts == sorted(set(ts)), "anchors are not strictly increasing in time"
         assert self.audio_duration > 0, "audio duration is not positive"
 
-    def _q_list(self) -> list[float]:
-        return [a.q for a in self.anchors]
-
     def time_at(self, q: float) -> float:
-        """Recording time of performance position ``q``; clamped to the anchor range."""
-        qs = self._q_list()
-        if q <= qs[0]:
-            return self.anchors[0].seconds
-        if q >= qs[-1]:
-            return self.anchors[-1].seconds
-        index = bisect.bisect_right(qs, q) - 1
-        left, right = self.anchors[index], self.anchors[index + 1]
-        span = right.q - left.q
-        ratio = 0.0 if span == 0 else (q - left.q) / span
-        return left.seconds + ratio * (right.seconds - left.seconds)
+        """Recording time of one performance position."""
+        return float(self.times_at(q))
+
+    def times_at(self, quarters: ArrayLike) -> np.ndarray:
+        """Interpolate performance positions together, clamping to the anchor range."""
+        return np.interp(
+            quarters,
+            [anchor.q for anchor in self.anchors],
+            [anchor.seconds for anchor in self.anchors],
+        )
 
 
 class PageInfo(Struct, frozen=True, forbid_unknown_fields=True):
