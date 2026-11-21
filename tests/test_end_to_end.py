@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from functools import cache
 from pathlib import Path
 
 import numpy as np
@@ -39,9 +40,6 @@ class Preview:
     workspace: workdir.Workspace
 
 
-_PREPARED: dict[str, Preview] = {}
-
-
 def _inputs(case: Case, **overrides: Path | None) -> pipeline.Inputs:
     """The pipeline inputs of one case, with any material input or review file replaced."""
     paths = {"pdf": case.pdf, "audio": case.audio, "symbolic": case.musicxml}
@@ -56,15 +54,13 @@ def _case(name: str) -> Case:
     pytest.skip(f"the corpus is missing {name}")
 
 
+@cache
 def preview_of(case: Case, build_dir: Path) -> Preview:
     """Analyse one case once and render both previews from that analysis, memoised per case.
 
-    The fixture gives the parametrised tests one prepared case each; the case1-only tests below
-    call this directly because they need that case's analysis without the parametrisation.
+    The fixture gives the parametrised tests a prepared case; the case1-only tests call this
+    directly because they need that case's analysis without the parametrisation.
     """
-    prepared = _PREPARED.get(case.name)
-    if prepared is not None:
-        return prepared
     inputs = _inputs(case)
     workspace = workdir.Workspace(build_dir / case.name / "preview")
     analysis = pipeline.analyze(inputs, workspace, spec=SPEC, with_pdf=True, with_flow=True)
@@ -81,7 +77,7 @@ def preview_of(case: Case, build_dir: Path) -> Preview:
         )
         for mode in ("switch", "flow")
     }
-    prepared = Preview(
+    return Preview(
         inputs=inputs,
         analysis=analysis,
         report=report,
@@ -89,8 +85,6 @@ def preview_of(case: Case, build_dir: Path) -> Preview:
         flow=videos["flow"],
         workspace=workspace,
     )
-    _PREPARED[case.name] = prepared
-    return prepared
 
 
 @pytest.fixture(scope="session")

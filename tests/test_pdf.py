@@ -41,9 +41,9 @@ EXPECTED_MEASURES = {"case1": 148, "case2": 82, "case3": 314, "case4": 42}
 #: only 17/21 systems carry the full staff count; the vector cases carry it everywhere.
 MIN_MATCHING_STAVES = {"case1": 0.95, "case2": 0.75, "case3": 0.95, "case4": 1.0}
 #: A crop border is only blank when the gap to the next system holds a few empty rows. The 96 dpi
-#: scan packs its systems tighter than that and is rotated by 0.66 degrees while boxes stay
-#: axis-aligned in PDF points, so part of its borders necessarily hold ink; the vector pages have
-#: room. A swallowed neighbour is caught by the staff-line count instead.
+#: scan packs its systems tighter and is rotated by 0.66 degrees while boxes stay axis-aligned in
+#: PDF points, so part of its borders hold ink; a swallowed neighbour is caught by the staff-line
+#: count instead.
 MIN_CLEAR_BORDER_SHARE = {"case1": 0.85, "case2": 0.5, "case3": 0.85, "case4": 0.85}
 
 _DETECTION: dict[str, StaffLayout] = {}
@@ -73,20 +73,7 @@ def written_measure_count(path: Path) -> int:
 
 def score_of(path: Path) -> Score:
     """A minimal written score with the corpus measure count, enough for measure binding."""
-    total = written_measure_count(path)
-    measures = tuple(MeasureInfo(index, float(index - 1), 1.0) for index in range(1, total + 1))
-    notes = tuple(
-        NoteEvent(f"mf-{index:06d}", "part", 1, 1, index, float(index - 1), 1.0, 60)
-        for index in range(1, total + 1)
-    )
-    return Score(
-        provider="musicxml",
-        parts=(PartInfo("part", "part", 1),),
-        measures=measures,
-        notes=notes,
-        repeats=(),
-        total_q=float(total),
-    )
+    return synthetic_score(written_measure_count(path))
 
 
 def long_run_bands(crop: np.ndarray, space_px: float) -> int:
@@ -261,12 +248,9 @@ def test_detection_is_deterministic(case: Case, layout: StaffLayout, tmp_path: P
     assert again.to_dict() == layout.to_dict(), f"{case.name}: detection is not reproducible"
 
 
-def test_missing_file_raises(tmp_path: Path) -> None:
+def test_missing_or_unreadable_pdf_is_an_input_error(tmp_path: Path) -> None:
     with pytest.raises(InputError):
         detect_layout(tmp_path / "absent.pdf", expected_staves=3, debug_dir=tmp_path)
-
-
-def test_non_pdf_raises(tmp_path: Path) -> None:
     fake = tmp_path / "not-a-score.pdf"
     fake.write_text("this is not a PDF", encoding="utf-8")
     with pytest.raises(InputError):
@@ -520,11 +504,8 @@ def test_override_rejects_bad_files(tmp_path: Path, payload: str) -> None:
     path.write_text(payload, encoding="utf-8")
     with pytest.raises(InputError):
         bind_measures(layout, synthetic_score(6), override=path)
-
-
-def test_override_missing_file_raises(tmp_path: Path) -> None:
     with pytest.raises(InputError):
-        bind_measures(synthetic_layout([2, 2]), synthetic_score(4), override=tmp_path / "no.json")
+        bind_measures(layout, synthetic_score(6), override=tmp_path / "no.json")
 
 
 def test_uncertainties_are_reported() -> None:

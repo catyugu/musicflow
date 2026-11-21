@@ -2,26 +2,20 @@
 
 Two families of checks, both semantic rather than structural:
 
-* the corpus MIDI carries the same performance as case1's and case3's audio, so the map can be
-  scored against real note times. Two numbers are asserted, because each alone can lie: the raw
-  median error (bounded, so a systematic shift stays visible and small) and the de-medianed error
-  (which asks whether the map tracks every note, with no drift and no local slips). The constant
-  part is a property of the corpus audio: its onset evidence trails the symbolic timeline by
-  ~50 ms, measured four ways (chroma transition centroid, onset-novelty cross-correlation against
-  the MIDI impulse train, nearest onset peak, note-off cross-correlation). A case whose MIDI is
-  provably not this performance - another quarter grid, or another tempo - is skipped with the
-  reason, never quietly passed.
-* case2 and case4 are real recordings of a differently notated MIDI, so they have no ground truth.
-  They are checked against invariants instead: residual, coverage, monotonicity, boundaries, and the
-  control that the produced map scores at least twice as well as the same map shifted by two
-  seconds.
+* the corpus MIDI carries the same performance as case1's and case3's audio, so the map is scored
+  against real note times. Both the raw median error (bounded, so a systematic shift stays visible
+  and small) and the de-medianed error are asserted, because each alone can lie: the corpus audio's
+  onset evidence trails the symbolic timeline by ~50 ms, measured four ways (chroma transition
+  centroid, onset-novelty cross-correlation against the MIDI impulse train, nearest onset peak,
+  note-off cross-correlation). A case whose MIDI is provably not this performance - another quarter
+  grid or tempo - is skipped with the reason, never quietly passed.
+* case2 and case4 are real recordings of a differently notated MIDI, so they have no ground truth
+  and are checked against invariants: residual, coverage, monotonicity, boundaries, and the control
+  that the map scores at least twice as well as the same map shifted by two seconds.
 
-Two unit checks pin what the corpus cannot isolate: the attack indicator marks one cell per onset
-rather than the whole span of a sustained note (and its optional window decays over the following
-rows), and the shared-spectrum correlation equals the direct convolution it replaces.
-
-Alignments are cached per case in a module-scoped fixture: case3 takes ~20 s and no test needs it
-twice.
+Two unit checks pin what the corpus cannot isolate (the attack indicator marks only the onset cell
+and its optional window decays afterwards; the shared-spectrum correlation equals the direct
+convolution it replaces). Alignments are cached per case, because case3 takes ~20 s.
 """
 
 from __future__ import annotations
@@ -248,8 +242,8 @@ def test_artifacts_are_written(case, runs: RunFactory) -> None:
 def _independent_similarities(run: Run) -> tuple[float, float]:
     """Mean chroma cosine of the map against the recording, and of the same map shifted by 2 s.
 
-    Deliberately computed here with its own feature extraction, so the control does not depend on
-    the numbers the aligner reports about itself.
+    Computed here with its own feature extraction, so the control does not depend on the numbers
+    the aligner reports about itself.
     """
     samples = audio_module.decode(CORPUS / run.case_name / f"{run.case_name}.mp3")
     rate = audio_module.ANALYSIS_SAMPLE_RATE

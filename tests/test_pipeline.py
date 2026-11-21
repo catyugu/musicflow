@@ -24,15 +24,9 @@ SPEC = model.VideoSpec(width=480, height=270, fps=10)
 
 
 def _inputs(case, **overrides: Path | None) -> pipeline.Inputs:
-    base = {
-        "pdf": case.pdf,
-        "audio": case.audio,
-        "symbolic": case.musicxml,
-        "route_override": None,
-        "anchors": None,
-    }
-    base.update(overrides)
-    return pipeline.Inputs(**base)  # type: ignore[arg-type]
+    """The pipeline inputs of one case, with any material input or review file replaced."""
+    paths = {"pdf": case.pdf, "audio": case.audio, "symbolic": case.musicxml}
+    return pipeline.Inputs(**{**paths, "route_override": None, "anchors": None, **overrides})
 
 
 def _one_case():
@@ -149,24 +143,19 @@ def _task(case, tmp_path: Path, *, modes=("switch", "flow"), preview=None) -> pi
     )
 
 
-def _argv(case, tmp_path: Path, *extra: str) -> list[str]:
-    """A complete ``analyze`` command line over one case, plus the caller's extra arguments."""
-    return [
-        "analyze",
-        "--pdf",
-        str(case.pdf),
-        "--audio",
-        str(case.audio),
-        "--symbolic",
-        str(case.musicxml),
-        "--workdir",
-        str(tmp_path / "work"),
-        *extra,
-    ]
+def _argv(case, tmp_path: Path, *extra: str, workdir: str = "work", **paths: Path) -> list[str]:
+    """A complete ``analyze`` command line over one case, with any input or the workdir replaced."""
+    named = {"pdf": case.pdf, "audio": case.audio, "symbolic": case.musicxml} | paths
+    command = ["analyze"]
+    for name, path in named.items():
+        command += [f"--{name}", str(path)]
+    return [*command, "--workdir", str(tmp_path / workdir), *extra]
 
 
-def test_inputs_validate_rejects_missing_and_wrong_formats(case, tmp_path: Path) -> None:
+def test_inputs_validate_and_name_their_provider(case, tmp_path: Path) -> None:
     _inputs(case).validate()
+    assert _inputs(case).provider == "musicxml"
+    assert _inputs(case, symbolic=case.midi).provider == "midi"
 
     with pytest.raises(InputError):
         _inputs(case, pdf=tmp_path / "missing.pdf").validate()
@@ -177,11 +166,6 @@ def test_inputs_validate_rejects_missing_and_wrong_formats(case, tmp_path: Path)
     notebook.write_text("not music", encoding="utf-8")
     with pytest.raises(UnsupportedInputError):
         _inputs(case, symbolic=notebook).validate()
-
-
-def test_provider_follows_symbolic_suffix(case) -> None:
-    assert _inputs(case).provider == "musicxml"
-    assert _inputs(case, symbolic=case.midi).provider == "midi"
 
 
 def test_step_cache_reuses_payloads_and_drops_missing_side_files(tmp_path: Path) -> None:
@@ -304,12 +288,13 @@ def test_analyze_writes_one_merged_report(monkeypatch: pytest.MonkeyPatch, tmp_p
     assert json.loads(json.dumps(report))["route"]["source"]
 
 
-def test_deleted_alignment_report_forces_a_recompute(
+def test_a_cached_step_whose_side_file_is_gone_is_recomputed(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The evidence file is a side file: losing it must re-align instead of pointing at nothing."""
+    """The align report and the flow tiles are side files: losing one must recompute, not reuse."""
     case = _one_case()
     pytest.importorskip("musicflow.symbolic")
+    flow = pytest.importorskip("musicflow.flow")
     calls: list[model.Route] = []
     _patch_align(monkeypatch, calls)
     workspace = workdir.Workspace(tmp_path / "work")
@@ -324,6 +309,30 @@ def test_deleted_alignment_report_forces_a_recompute(
     assert len(calls) == 2, "a cached alignment without its report was reused"
     report = json.loads((workspace.root / pipeline.REPORT_NAME).read_text(encoding="utf-8"))
     assert report["artifacts"]["align_report"] == str(align_report.resolve())
+
+    inputs = _inputs(case)
+    score, written = pipeline._symbolic_step(
+        inputs, pipeline._digests(pipeline._input_records(inputs)), workspace
+    )
+    assert written is not None
+    score_digest = workdir.hash_payload(score.to_dict())
+    builds: list[int] = []
+    build = flow.build_layout
+
+    def counting(*args, **kwargs):
+        builds.append(1)
+        return build(*args, **kwargs)
+
+    monkeypatch.setattr(flow, "build_layout", counting)
+    first = pipeline._flow_step(score, score_digest, written, SPEC, workspace)
+    assert pipeline._flow_step(score, score_digest, written, SPEC, workspace) == first
+    assert len(builds) == 1, "the cached flow layout was not reused"
+
+    tile = workspace.step("flow").path / first.tiles[0].path
+    tile.unlink()
+    assert pipeline._flow_step(score, score_digest, written, SPEC, workspace) == first
+    assert len(builds) == 2, "a deleted flow tile was served from the stale cache"
+    assert tile.is_file(), "the recompute did not rewrite the deleted tile"
 
 
 def test_debug_images_are_written_only_on_request(
@@ -401,40 +410,6 @@ def test_switch_render_does_not_need_the_flow_package(
     assert report["artifacts"]["videos"] == {"switch": str(video)}
 
 
-def test_deleted_flow_tile_forces_a_recompute(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """A cached flow payload whose tile file is gone must be recomputed, not reused."""
-    case = _one_case()
-    pytest.importorskip("musicflow.symbolic")
-    flow = pytest.importorskip("musicflow.flow")
-    inputs = _inputs(case)
-    workspace = workdir.Workspace(tmp_path / "work")
-    score, written = pipeline._symbolic_step(
-        inputs, pipeline._digests(pipeline._input_records(inputs)), workspace
-    )
-    assert written is not None
-    score_digest = workdir.hash_payload(score.to_dict())
-
-    calls: list[int] = []
-    build = flow.build_layout
-
-    def counting(*args, **kwargs):
-        calls.append(1)
-        return build(*args, **kwargs)
-
-    monkeypatch.setattr(flow, "build_layout", counting)
-    first = pipeline._flow_step(score, score_digest, written, SPEC, workspace)
-    assert pipeline._flow_step(score, score_digest, written, SPEC, workspace) == first
-    assert len(calls) == 1, "the cached flow layout was not reused"
-
-    tile = workspace.step("flow").path / first.tiles[0].path
-    tile.unlink()
-    assert pipeline._flow_step(score, score_digest, written, SPEC, workspace) == first
-    assert len(calls) == 2, "a deleted flow tile was served from the stale cache"
-    assert tile.is_file(), "the recompute did not rewrite the deleted tile"
-
-
 def test_checks_only_cover_the_artifacts_that_exist() -> None:
     bare = _hand_analysis()
     assert [check["name"] for check in pipeline.checks(bare)] == [
@@ -483,12 +458,11 @@ def test_model_artifacts_round_trip() -> None:
         model.Rect(1.0, 0.0, 0.0, 1.0)
 
 
-def test_cli_size_parsing() -> None:
+@pytest.mark.parametrize("size", ("1920", "1921x1080"))
+def test_cli_size_parsing(size: str) -> None:
     assert cli._parse_size("1920x1080") == (1920, 1080)
     with pytest.raises(UsageError):
-        cli._parse_size("1920")
-    with pytest.raises(UsageError):
-        cli._parse_size("1921x1080")
+        cli._parse_size(size)
 
 
 def test_cli_doctor_succeeds(capsys: pytest.CaptureFixture[str]) -> None:
@@ -500,41 +474,14 @@ def test_cli_doctor_succeeds(capsys: pytest.CaptureFixture[str]) -> None:
 
 def test_cli_reports_missing_input_bad_size_and_flow_on_midi(case, tmp_path: Path, capsys) -> None:
     """The three expected CLI failures each reach their exit code with a one-line message."""
-    code = cli.main(
-        [
-            "analyze",
-            "--pdf",
-            str(tmp_path / "missing.pdf"),
-            "--audio",
-            str(case.audio),
-            "--symbolic",
-            str(case.musicxml),
-            "--workdir",
-            str(tmp_path / "work"),
-        ]
-    )
-    assert code == EXIT_INPUT
+    assert cli.main(_argv(case, tmp_path, pdf=tmp_path / "missing.pdf")) == EXIT_INPUT
     assert "not found" in capsys.readouterr().err
-
     assert cli.main(_argv(case, tmp_path, "--size", "1000x1001")) == EXIT_USAGE
 
     if not case.has(".mid"):
         pytest.skip("no MIDI in this case")
-    code = cli.main(
-        [
-            "analyze",
-            "--pdf",
-            str(case.pdf),
-            "--audio",
-            str(case.audio),
-            "--symbolic",
-            str(case.midi),
-            "--with-flow",
-            "--workdir",
-            str(tmp_path / "work-midi"),
-        ]
-    )
-    assert code == EXIT_UNSUPPORTED
+    midi = _argv(case, tmp_path, "--with-flow", workdir="work-midi", symbolic=case.midi)
+    assert cli.main(midi) == EXIT_UNSUPPORTED
     assert "MusicXML" in capsys.readouterr().err
 
 
@@ -546,7 +493,18 @@ def test_discover_case_finds_the_three_inputs(case) -> None:
     assert symbolic == case.musicxml
 
 
-def test_batch_skips_flow_for_midi_only_cases(case, tmp_path: Path) -> None:
+def test_batch_contract_for_a_midi_case_and_a_missing_corpus(case, tmp_path: Path) -> None:
+    """A MIDI-only case keeps a skip record for flow; a missing corpus is an InputError."""
+    with pytest.raises(InputError):
+        pipeline.batch(
+            tmp_path / "nope",
+            tmp_path / "out",
+            modes=["switch"],
+            spec=SPEC,
+            preview=1.0,
+            jobs=1,
+        )
+
     corpus = tmp_path / "corpus"
     midi_case = corpus / case.name
     midi_case.mkdir(parents=True)
@@ -558,18 +516,6 @@ def test_batch_skips_flow_for_midi_only_cases(case, tmp_path: Path) -> None:
     assert len(records) == 1
     assert records[0]["ok"] is True
     assert "MusicXML" in records[0]["skipped"]
-
-
-def test_batch_rejects_missing_corpus(tmp_path: Path) -> None:
-    with pytest.raises(InputError):
-        pipeline.batch(
-            tmp_path / "nope",
-            tmp_path / "out",
-            modes=["switch"],
-            spec=model.VideoSpec(),
-            preview=1.0,
-            jobs=1,
-        )
 
 
 def test_run_case_task_analyses_once_and_records_every_mode(

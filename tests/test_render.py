@@ -2,10 +2,9 @@
 
 Fixtures come from ``musicflow.model`` plus the real corpus, so this module does not depend on the
 symbolic/PDF/flow producers: the flow strip is a generated image, the alignment is synthetic, and
-the switch layouts are bounding boxes on the real case1 page.
-
-Checks that could pass for cosmetic reasons are written as measurable quantities: mean absolute
-difference between frames, ink coverage, ffprobe durations and frame counts, and segment mtimes.
+the switch layouts are bounding boxes on the real case1 page. Checks that could pass for cosmetic
+reasons are written as measurable quantities: mean absolute frame difference, ink coverage, ffprobe
+durations and frame counts, and segment mtimes.
 """
 
 from __future__ import annotations
@@ -227,34 +226,34 @@ def _system(
     )
 
 
-def test_switch_shows_the_next_system_at_its_first_sounding_measure(tmp_path: Path) -> None:
+@pytest.fixture
+def switch_render(tmp_path: Path) -> dict:
+    """The arguments a switch render of the real case1 page shares: a 4 s synthetic timeline."""
     pdf = CASE1 / "case1.pdf"
     if not pdf.is_file():
         pytest.skip(f"corpus PDF missing: {pdf}")
     score, route = _score()
-    alignment = _alignment(route.total_q, 4.0)  # quarter 8, i.e. measure 5, at 2.0 s
-    layout = _layout(
-        _system(1, 118, 278, measures=4, first=1, last=4),
-        _system(2, 470, 640, measures=4, first=5, last=8),
-    )
-    work = tmp_path / "work"
-    work.mkdir()
-    spec = VideoSpec(width=640, height=360, fps=10)
-    out = tmp_path / "switch.mp4"
-    excerpt = _audio_excerpt(tmp_path, 4.0)
+    return {
+        "score": score,
+        "route": route,
+        "layout": _layout(
+            _system(1, 118, 278, measures=4, first=1, last=4),
+            _system(2, 470, 640, measures=4, first=5, last=8),
+        ),
+        # quarter 8, i.e. measure 5, at 2.0 s
+        "alignment": _alignment(route.total_q, 4.0),
+        "spec": VideoSpec(width=640, height=360, fps=10),
+        "work_dir": tmp_path / "work",
+        "audio": _audio_excerpt(tmp_path, 4.0),
+        "pdf": pdf,
+    }
 
-    render_switch(
-        score=score,
-        route=route,
-        layout=layout,
-        alignment=alignment,
-        spec=spec,
-        out=out,
-        work_dir=work,
-        preview=None,
-        audio=excerpt,
-        pdf=pdf,
-    )
+
+def test_switch_shows_the_next_system_at_its_first_sounding_measure(
+    tmp_path: Path, switch_render: dict
+) -> None:
+    out = tmp_path / "switch.mp4"
+    render_switch(**switch_render, out=out, preview=None)
 
     sampler = Media(out)
     early = sampler.frame_at(1.0, tmp_path / "early.png")
@@ -270,7 +269,8 @@ def test_switch_shows_the_next_system_at_its_first_sounding_measure(tmp_path: Pa
     for name, frame in (("1.0 s", early), ("3.0 s", late)):
         ink = float(np.mean(np.all(frame < 200, axis=2)))
         assert ink > 0.005, f"frame at {name} has almost no page content: {ink:.4f}"
-    assert abs(sampler.probe().duration - Media(excerpt).probe().duration) <= 0.1
+    audio = switch_render["audio"]
+    assert abs(sampler.probe().duration - Media(audio).probe().duration) <= 0.1
 
 
 def test_switch_plan_follows_a_repeat_back_to_the_first_system() -> None:
@@ -460,23 +460,12 @@ def test_unwritable_output_is_a_render_error(tmp_path: Path, flow_render: dict) 
         render_flow(**flow_render, out=blocker / "video.mp4", preview=1.0)
 
 
-def test_missing_pdf_is_an_input_error(tmp_path: Path) -> None:
-    work = tmp_path / "work"
-    work.mkdir()
-    score, route = _score()
-    layout = _layout(_system(1, 118, 278, measures=8, first=1, last=8, staves=()))
+def test_missing_pdf_is_an_input_error(tmp_path: Path, switch_render: dict) -> None:
     with pytest.raises(InputError, match="PDF not found"):
         render_switch(
-            score=score,
-            route=route,
-            layout=layout,
-            alignment=_alignment(route.total_q, 4.0),
-            spec=VideoSpec(width=640, height=360, fps=10),
+            **(switch_render | {"pdf": tmp_path / "absent.pdf"}),
             out=tmp_path / "switch.mp4",
-            work_dir=work,
             preview=1.0,
-            audio=_audio_excerpt(tmp_path, 4.0),
-            pdf=tmp_path / "absent.pdf",
         )
 
 

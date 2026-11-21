@@ -2,11 +2,8 @@
 
 Each case directory holds one work: a PDF score, a recording and the same music as MIDI, plain
 MusicXML and compressed MusicXML. Tests that need a case take the ``case`` fixture, which yields a
-:class:`Case` for every case present on disk. ``Media`` probes a produced file and samples decoded
-frames from it, so no module repeats its own ffprobe/ffmpeg calls.
-
-case4 is the one single-staff work, the case that exercises the solo-instrument paths: one staff per
-system, no grand staff to find measures in.
+:class:`Case` for every case present on disk; case4 is the one single-staff work. ``Media`` probes a
+produced file and samples decoded frames from it, so no module repeats its own ffprobe/ffmpeg calls.
 """
 
 from __future__ import annotations
@@ -15,6 +12,7 @@ import json
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from typing import NamedTuple
 
 import numpy as np
 import pytest
@@ -23,6 +21,9 @@ from PIL import Image
 CORPUS = Path(__file__).resolve().parents[1] / "test_cases"
 CASE_NAMES = ("case1", "case2", "case3", "case4")
 SOLO_CASE = "case4"
+
+_PROBE_ARGS = ("ffprobe", "-v", "error", "-select_streams", "v:0", "-count_frames")
+_PROBE_FIELDS = "stream=r_frame_rate,nb_read_frames,width,height:format=duration"
 
 
 @dataclass(frozen=True)
@@ -61,8 +62,7 @@ def available_cases() -> list[Case]:
     return [Case(name, CORPUS / name) for name in CASE_NAMES if (CORPUS / name).is_dir()]
 
 
-@dataclass(frozen=True)
-class StreamInfo:
+class StreamInfo(NamedTuple):
     """What ffprobe reports about one file: video geometry, frame count and duration."""
 
     fps: float
@@ -81,32 +81,16 @@ class Media:
 
     def __init__(self, path: Path) -> None:
         self.path = path
-        self._info: StreamInfo | None = None
 
     def probe(self) -> StreamInfo:
-        """Geometry, frame count and duration, probed once per file."""
-        if self._info is None:
-            self._info = _probe(self.path)
-        return self._info
+        """Geometry, frame count and duration of this file."""
+        return _probe(self.path)
 
     def frame_at(self, seconds: float, destination: Path) -> np.ndarray:
         """One decoded RGB frame at ``seconds``."""
+        command = ["ffmpeg", "-v", "error", "-ss", f"{seconds:.3f}", "-i", str(self.path)]
         subprocess.run(
-            [
-                "ffmpeg",
-                "-v",
-                "error",
-                "-ss",
-                f"{seconds:.3f}",
-                "-i",
-                str(self.path),
-                "-frames:v",
-                "1",
-                "-y",
-                str(destination),
-            ],
-            check=True,
-            capture_output=True,
+            [*command, "-frames:v", "1", "-y", str(destination)], check=True, capture_output=True
         )
         with Image.open(destination) as image:
             return np.asarray(image.convert("RGB"), dtype=np.int16)
@@ -114,19 +98,7 @@ class Media:
 
 def _probe(path: Path) -> StreamInfo:
     result = subprocess.run(
-        [
-            "ffprobe",
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-count_frames",
-            "-show_entries",
-            "stream=r_frame_rate,nb_read_frames,width,height:format=duration",
-            "-of",
-            "json",
-            str(path),
-        ],
+        [*_PROBE_ARGS, "-show_entries", _PROBE_FIELDS, "-of", "json", str(path)],
         capture_output=True,
         text=True,
         check=False,

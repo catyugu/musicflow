@@ -1,15 +1,12 @@
 """Flow layout checks over the curated corpus.
 
-The layout is the contract between the engraver and the flow renderer: every score note
-needs a horizontal position that actually lands on engraved ink, measures need
-contiguous spans, and the strip has to be cut into tiles that neither miss nor clip
-anything. These tests read the produced tiles back and check exactly that, so they fail
-on a broken mapping rather than on a changed number.
-
-Two of them guard ink that note positions alone cannot see: Verovio paints staff lines,
-stems, barlines, slurs and hairpins through a stylesheet scoped by the page id, so a
-rewritten id or a dropped stylesheet leaves only fill-based ink behind — noteheads and
-beams floating on blank paper.
+The layout is the contract between the engraver and the flow renderer: every score note needs a
+horizontal position that lands on engraved ink, measures need contiguous spans, and the strip has
+to be cut into tiles that neither miss nor clip anything. These tests read the produced tiles back
+and check exactly that, so they fail on a broken mapping rather than on a changed number. Two of
+them guard ink that note positions alone cannot see: Verovio paints staff lines, stems, barlines,
+slurs and hairpins through a stylesheet scoped by the page id, so a rewritten id or a dropped
+stylesheet leaves only fill-based ink behind — noteheads and beams floating on blank paper.
 """
 
 from __future__ import annotations
@@ -110,10 +107,6 @@ def tiles(built: Built) -> list[np.ndarray]:
     ]
 
 
-def _positions(built: Built) -> dict[str, float]:
-    return built.layout.note_positions
-
-
 def _slab(built: Built, tiles: list[np.ndarray], x0: int, x1: int) -> np.ndarray:
     """Strip columns ``[x0, x1)``, stitched across tile borders."""
     if x1 <= x0:
@@ -148,7 +141,7 @@ def _stem_ids(markup: str) -> set[str]:
 
 
 def test_note_positions_cover_the_score(built: Built) -> None:
-    positions = _positions(built)
+    positions = built.layout.note_positions
     wanted = {note.id for note in built.score.notes}
     covered = wanted & set(positions)
     coverage = len(covered) / len(wanted)
@@ -159,7 +152,7 @@ def test_note_positions_cover_the_score(built: Built) -> None:
 
 
 def test_note_positions_advance_with_written_onset(built: Built) -> None:
-    positions = _positions(built)
+    positions = built.layout.note_positions
     ordered = [
         (positions[note.id], note.onset_q) for note in built.score.notes if note.id in positions
     ]
@@ -221,7 +214,7 @@ def test_tiles_cover_the_strip(built: Built) -> None:
 
 
 def test_note_positions_land_on_ink(built: Built, tiles: list[np.ndarray]) -> None:
-    positions = _positions(built)
+    positions = built.layout.note_positions
     notes = [note for note in built.score.notes if note.id in positions]
     stride = max(1, len(notes) // NOTE_SAMPLE)
     sample = notes[::stride]
@@ -281,7 +274,7 @@ def test_note_stems_are_engraved(
 ) -> None:
     staff_space = document.staff_space()
     assert staff_space, "cannot measure the staff space"
-    positions = _positions(built)
+    positions = built.layout.note_positions
     stems = _stem_ids(built.strip_svg.read_text(encoding="utf-8"))
     candidates = [note for note in built.score.notes if note.id in stems and note.id in positions]
     assert candidates, "no note with a stem was resolved"

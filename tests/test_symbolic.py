@@ -46,9 +46,8 @@ ROUTES = {
     "case4": {"source": "written", "passes": 42, "notes": 704, "total_q": 168.0},
 }
 
-# MIDI event counts, measure counts and quarter lengths. case1 and case3 keep their time
-# signatures and land on the same grid as the written score; case2 has none, so 4/4 is assumed
-# (62 measures of 4/4 instead of 82 of 3/4), which is the documented best effort.
+# MIDI event and measure counts: case1 and case3 land on the written grid; case2 has no time
+# signature, so 4/4 is assumed (62 measures of 4/4 instead of 82), the documented best effort.
 MIDI = {
     "case1": {"notes": 2500, "measures": 148, "total_q": 502.0},
     "case2": {"notes": 1637, "measures": 62, "total_q": 248.0},
@@ -56,9 +55,8 @@ MIDI = {
     "case4": {"notes": 704, "measures": 42, "total_q": 168.0},
 }
 
-# Sum of the durations the document writes for its pitched notes. case2 is a performance-derived
-# document whose written durations do not add up to partitura's timeline (a chord note is cut at
-# the next performed onset), so the identity is only asserted where the notation is strict.
+# Sum of the durations the document writes for its pitched notes; case2 is a performance-derived
+# document whose durations do not add up to partitura's timeline, so it is not asserted there.
 WRITTEN_DURATION_Q = {"case1": 1799.0, "case3": 3513.0, "case4": 188.0}
 
 MANUAL_SPANS = [[1, 2], [1, 2], [3, 4]]
@@ -123,9 +121,6 @@ def test_measures_hold_every_note(score):
         assert 0 <= note.pitch <= 127
         assert note.staff >= 1
         assert note.voice >= 1
-
-
-def test_note_identifiers_are_unique_and_ordered(score):
     onsets = [note.onset_q for note in score.notes]
     assert onsets == sorted(onsets)
     identifiers = [note.id for note in score.notes]
@@ -135,31 +130,19 @@ def test_note_identifiers_are_unique_and_ordered(score):
     )
 
 
-def test_written_path_holds_the_annotated_document(case, score, tmp_path):
+@pytest.mark.parametrize("container", ("musicxml", "mxl"))
+def test_written_path_holds_the_annotated_document(case, score, tmp_path, container):
+    source = getattr(case, container)
+    if not source.is_file():
+        pytest.skip(f"{case.name} is missing its {container} container")
     written = tmp_path / "written.musicxml"
-    annotated = load_score(case.musicxml, written_path=written)
+    annotated = load_score(source, written_path=written)
     assert annotated.to_dict() == score.to_dict()
     identifiers = [element.get("id") for element in parse_musicxml(written).iter("{*}note")]
     expected = WRITTEN[case.name]["note_elements"]
     assert len(identifiers) == expected
     assert identifiers == [f"mf-{number:06d}" for number in range(1, expected + 1)]
     assert {note.id for note in annotated.notes} <= set(identifiers)
-
-
-def test_written_path_from_a_compressed_container(case, score, tmp_path):
-    if not case.has(".mxl"):
-        pytest.skip(f"{case.name} is missing its MXL container")
-    written = tmp_path / "written.musicxml"
-    annotated = load_score(case.mxl, written_path=written)
-    assert annotated.to_dict() == score.to_dict()
-    identifiers = [element.get("id") for element in parse_musicxml(written).iter("{*}note")]
-    assert len(identifiers) == WRITTEN[case.name]["note_elements"]
-
-
-def test_compressed_container_gives_the_same_score(case, score):
-    if not case.has(".mxl"):
-        pytest.skip(f"{case.name} is missing its MXL container")
-    assert _score(case.mxl).to_dict() == score.to_dict()
 
 
 def test_ties_collapse_into_one_note(case, score, tmp_path):
@@ -311,7 +294,7 @@ def test_repeat_route_matches_the_midi_extent(musicxml_of):
     assert midi.total_q == pytest.approx(route.total_q)
 
 
-def test_midi_score_is_the_flat_written_route(case):
+def test_midi_score_is_the_flat_written_route(case, tmp_path):
     if not case.has(".mid"):
         pytest.skip(f"{case.name} is missing its MIDI file")
     midi = _score(case.midi)
@@ -329,11 +312,7 @@ def test_midi_score_is_the_flat_written_route(case):
     assert route.unconfirmed == (MIDI_MEASURE_NOTE,)
     assert [measure_pass.pass_index for measure_pass in route.passes] == [1] * len(midi.measures)
     assert route.total_q == pytest.approx(midi.total_q)
-
-
-def test_midi_ignores_the_written_path(case, tmp_path):
-    if not case.has(".mid"):
-        pytest.skip(f"{case.name} is missing its MIDI file")
+    # A performance MIDI has no MusicXML form to annotate, so the written path stays untouched.
     target = tmp_path / "written.musicxml"
     assert load_score(case.midi, written_path=target).provider == "midi"
     assert not target.exists()
@@ -384,9 +363,6 @@ def test_override_rejects_bad_files(payload, score, tmp_path):
     path.write_text(payload, encoding="utf-8")
     with pytest.raises(InputError):
         build_route(score, override=path)
-
-
-def test_override_missing_file_is_an_input_error(score, tmp_path):
     with pytest.raises(InputError):
         build_route(score, override=tmp_path / "absent.json")
 
@@ -468,12 +444,19 @@ def test_first_and_second_endings_are_reported(tmp_path):
     assert route.unconfirmed == score.unconfirmed
 
 
-def test_unmatched_forward_repeat_is_reported(tmp_path):
-    path = _synthetic(
-        tmp_path / "lone_forward.musicxml",
-        {3: '<barline location="left"><repeat direction="forward"/></barline>'},
+@pytest.fixture
+def lone_forward(tmp_path):
+    """A score whose forward repeat has no backward one, for the reader caveats."""
+    return load_score(
+        _synthetic(
+            tmp_path / "lone_forward.musicxml",
+            {3: '<barline location="left"><repeat direction="forward"/></barline>'},
+        )
     )
-    score = load_score(path)
+
+
+def test_unmatched_forward_repeat_is_reported(lone_forward):
+    score = lone_forward
     assert score.repeats == (Repeat("repeat_span", 3, 4, 2),)
     assert score.unconfirmed == (
         "forward repeat at measure 3 has no backward repeat: repeated to the last measure",
@@ -501,13 +484,8 @@ def test_nested_repeat_spans_are_an_input_error_and_disjoint_ones_expand(tmp_pat
     assert [measure_pass.pass_index for measure_pass in route.passes] == [1, 1, 2, 2, 1, 1, 2, 2]
 
 
-def test_override_keeps_the_reader_caveats(tmp_path):
-    score = load_score(
-        _synthetic(
-            tmp_path / "lone_forward.musicxml",
-            {3: '<barline location="left"><repeat direction="forward"/></barline>'},
-        )
-    )
+def test_override_keeps_the_reader_caveats(lone_forward, tmp_path):
+    score = lone_forward
     override = tmp_path / "route.json"
     override.write_text(json.dumps({"spans": [[1, 2], [3, 4]]}), encoding="utf-8")
     route = build_route(score, override=override)
@@ -541,8 +519,6 @@ def test_missing_and_unreadable_inputs_are_input_errors(tmp_path, corpus):
     with pytest.raises(InputError):
         load_score(no_notes)
 
-
-def test_truncated_midi_is_an_input_error(tmp_path, corpus):
     source = corpus / "case1" / "case1.mid"
     if not source.is_file():
         pytest.skip("case1 is not in the corpus")
