@@ -87,7 +87,7 @@ def built(case, tmp_path_factory: pytest.TempPathFactory) -> Built:
     result = Built(layout=layout, score=score, work_dir=work_dir, elapsed=elapsed)
     summary = (
         f"{case.name}: strip {layout.strip_width:.0f}x{layout.strip_height:.0f}, "
-        f"scale {layout.scale:.0f}, content {layout.content.to_list()}, "
+        f"scale {layout.scale:.0f}, content {layout.content.to_dict()}, "
         f"{len(layout.tiles)} tiles, {len(layout.measure_x)} measures, "
         f"layout {elapsed:.1f}s, overview {result.overview}"
     )

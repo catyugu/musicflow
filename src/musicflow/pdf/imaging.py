@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import itertools
 import logging
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -108,10 +109,6 @@ class StaffLine:
     def centre(self) -> float:
         return (self.y0 + self.y1) / 2
 
-    @property
-    def width(self) -> float:
-        return self.x1 - self.x0
-
 
 @dataclass(frozen=True, slots=True)
 class Staff:
@@ -133,14 +130,6 @@ class Staff:
     def height(self) -> float:
         return self.bottom - self.top
 
-    @property
-    def top_centre(self) -> float:
-        return self.lines[0].centre
-
-    @property
-    def bottom_centre(self) -> float:
-        return self.lines[-1].centre
-
 
 @dataclass(slots=True)
 class StaffDetection:
@@ -149,6 +138,22 @@ class StaffDetection:
     staves: list[Staff] = field(default_factory=list)
     space: float = 0.0
     dropped_staves: int = 0
+
+
+def runs(flags: Iterable[bool]) -> list[tuple[int, int]]:
+    """Inclusive bounds of every run of True in ``flags``."""
+    bounds: list[tuple[int, int]] = []
+    start: int | None = None
+    index = -1
+    for index, flag in enumerate(flags):
+        if flag and start is None:
+            start = index
+        elif not flag and start is not None:
+            bounds.append((start, index - 1))
+            start = None
+    if start is not None:
+        bounds.append((start, index))
+    return bounds
 
 
 def open_document(pdf: Path) -> pymupdf.Document:
@@ -260,18 +265,8 @@ def find_lines(raster: PageRaster, space: float | None = None) -> list[StaffLine
         logger.debug("page %d: no horizontal runs", raster.number)
         return []
     threshold = BAND_INK_FRACTION * peak
-    bands: list[tuple[int, int]] = []
-    start: int | None = None
-    for y, value in enumerate(counts):
-        if value >= threshold and start is None:
-            start = y
-        elif value < threshold and start is not None:
-            bands.append((start, y - 1))
-            start = None
-    if start is not None:
-        bands.append((start, len(counts) - 1))
     lines: list[StaffLine] = []
-    for y0, y1 in bands:
+    for y0, y1 in runs(counts >= threshold):
         rows = opened[y0 : y1 + 1]
         columns = np.flatnonzero(rows.any(axis=0))
         if columns.size == 0:

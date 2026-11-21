@@ -151,16 +151,10 @@ def _route(
         for note in notes_by_measure.get(index, ()):
             notes.append(
                 PerformanceNote(
-                    id=f"{note.id}@{pass_index}",
                     note_id=note.id,
                     measure=index,
                     pass_index=pass_index,
                     onset_q=cursor + (note.onset_q - measure.start_q),
-                    duration_q=note.duration_q,
-                    pitch=note.pitch,
-                    part=note.part,
-                    staff=note.staff,
-                    voice=note.voice,
                 )
             )
         cursor += measure.length_q

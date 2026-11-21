@@ -6,29 +6,30 @@ barlines and measure counts; every coordinate is converted back to PDF points be
 module, so downstream code never sees raster units. Joining staves into systems only applies to a
 score that prints more than one staff per system; a single-staff score gives each staff its own
 system.
+
+Printed measure numbers are read from the PDF text layer: a vector export engraves the measure
+number at the start of most systems, a scan has no text layer at all. The number is the strongest
+binding evidence available, because it names the measure directly instead of counting barlines that
+may be split, doubled or missing. Diagnostic images are written only when :func:`detect_layout` is
+given a directory.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 import time
 from collections import Counter
 from dataclasses import replace
 from pathlib import Path
 
+import pymupdf
+
 from ..errors import AnalysisError
 from ..model import PageInfo, Rect, StaffLayout, System
-from ._text import _numbers
-from .debug import write_page_overlay, write_system_crops
+from .debug import write_page_overlay
 from .imaging import PageRaster, detect_staves, open_document, rasterise
-from .labels import printed_candidates
-from .systems import (
-    Group,
-    SystemGeometry,
-    brace_groups,
-    group_systems,
-    system_boxes,
-)
+from .systems import Group, SystemGeometry, brace_groups, group_systems, system_boxes
 
 logger = logging.getLogger(__name__)
 
@@ -37,19 +38,29 @@ MIN_MATCHING_SHARE = 0.85
 #: How far a printed measure number may sit from the position the barlines imply.
 MAX_PRINTED_DRIFT = 8
 
+#: A printed measure number is a plain integer up to four digits.
+NUMBER = re.compile(r"^\d{1,4}$")
+#: How far above the top staff line the number may sit, in staff spaces.
+ABOVE_SPACES = 6.0
+#: The number must clear the staff by at least this many staff spaces.
+CLEARANCE_SPACES = 0.15
+#: How far right of the staff's left edge the number may start, as a share of the system width.
+INDENT_SHARE = 0.2
 
-def detect_layout(pdf: Path, *, expected_staves: int | None, debug_dir: Path) -> StaffLayout:
-    """Detect the staff systems of ``pdf`` and write diagnostic images into ``debug_dir``.
+
+def detect_layout(pdf: Path, *, expected_staves: int | None, debug_dir: Path | None) -> StaffLayout:
+    """Detect the staff systems of ``pdf``.
 
     ``expected_staves`` is the staff count of the piece from its symbolic score. ``1`` selects the
     single-staff path, where each detected staff is its own system; any other value is used as a
     validation prior only. A systematic mismatch is reported in :attr:`StaffLayout.unconfirmed`
     instead of being silently accepted.
+
+    ``debug_dir`` selects the diagnostic images: ``None`` writes no image and creates no directory,
+    so an ordinary run pays nothing for them.
     """
     assert expected_staves is None or expected_staves >= 1, "expected_staves must be positive"
     started = time.perf_counter()
-    debug_dir = Path(debug_dir)
-    debug_dir.mkdir(parents=True, exist_ok=True)
     source = Path(pdf)
     document = open_document(source)
     pages: list[PageInfo] = []
@@ -67,7 +78,8 @@ def detect_layout(pdf: Path, *, expected_staves: int | None, debug_dir: Path) ->
             detection = detect_staves(raster)
             if not detection.staves:
                 unconfirmed.append(f"page {number}: no staff detected")
-                write_page_overlay(raster, [], debug_dir)
+                if debug_dir is not None:
+                    write_page_overlay(raster, [], debug_dir)
                 logger.info("page %d: no staff", number)
                 continue
             if detection.dropped_staves:
@@ -82,8 +94,8 @@ def detect_layout(pdf: Path, *, expected_staves: int | None, debug_dir: Path) ->
                 chains = _absorb_singletons(group_systems(groups, raster, detection.space))
             geometries = system_boxes(raster, chains, detection.space)
             labels = printed_candidates(document[number - 1], raster, geometries, detection.space)
-            write_page_overlay(raster, geometries, debug_dir)
-            write_system_crops(raster, geometries, len(systems) + 1, debug_dir)
+            if debug_dir is not None:
+                write_page_overlay(raster, geometries, debug_dir)
             for offset, geometry in enumerate(geometries):
                 if geometry.x1 <= geometry.x0 or geometry.y1 <= geometry.y0:
                     unconfirmed.append(
@@ -113,7 +125,8 @@ def detect_layout(pdf: Path, *, expected_staves: int | None, debug_dir: Path) ->
     empty = [system.index for system in systems if system.measure_count == 0]
     if empty:
         unconfirmed.append(
-            f"systems without detected barlines, measure count unknown: {_numbers(empty)}"
+            "systems without detected barlines, measure count unknown:"
+            f" {', '.join(str(index) for index in empty)}"
         )
     unconfirmed.extend(_staff_count_report(systems, expected_staves))
     elapsed = time.perf_counter() - started
@@ -127,6 +140,58 @@ def detect_layout(pdf: Path, *, expected_staves: int | None, debug_dir: Path) ->
         elapsed,
     )
     return StaffLayout(pages=tuple(pages), systems=tuple(systems), unconfirmed=tuple(unconfirmed))
+
+
+def page_words(page: pymupdf.Page) -> list[tuple[float, float, float, float, str]]:
+    """Text words of a page with their bounding boxes, or nothing if the page has no text layer."""
+    try:
+        words = page.get_text("words")
+    except Exception as error:  # a page without a usable text layer is not an error here
+        logger.debug("page %s: no text layer (%s)", page.number, error)
+        return []
+    return [(float(w[0]), float(w[1]), float(w[2]), float(w[3]), str(w[4])) for w in words]
+
+
+def printed_candidates(
+    page: pymupdf.Page, raster: PageRaster, systems: list[SystemGeometry], space: float
+) -> dict[int, list[int]]:
+    """Integer labels above the left edge of each system, most plausible first.
+
+    Everything that survives is a candidate: a system may have several, because a tempo mark or a
+    staff label can look like a number from geometry alone. The sequence check in
+    :func:`_assign_printed` decides which candidate, if any, is a measure number.
+    """
+    words = page_words(page)
+    if not words:
+        return {}
+    numbers = [word for word in words if NUMBER.match(word[4])]
+    if not numbers:
+        return {}
+    space_pt = space / raster.scale_y if raster.scale_y else space
+    found: dict[int, list[int]] = {}
+    for offset, geometry in enumerate(systems):
+        top_staff = geometry.staves[0]
+        left_pt, top_pt = raster.to_points(top_staff.x0, top_staff.lines[0].centre)
+        right_pt, _ = raster.to_points(top_staff.x1, top_staff.lines[0].centre)
+        width = max(right_pt - left_pt, 1.0)
+        low = top_pt - ABOVE_SPACES * space_pt
+        high = top_pt - CLEARANCE_SPACES * space_pt
+        hits: list[tuple[float, int]] = []
+        for x0, y0, _x1, y1, text in numbers:
+            middle = (y0 + y1) / 2
+            if not low <= middle <= high:
+                continue
+            if not (left_pt - 2 * space_pt) <= x0 <= left_pt + INDENT_SHARE * width:
+                continue
+            hits.append((abs(middle - high), int(text)))
+        if hits:
+            hits.sort()
+            ordered: list[int] = []
+            for _, value in hits:
+                if value not in ordered:
+                    ordered.append(value)
+            found[offset] = ordered
+    return found
 
 
 def _assign_printed(

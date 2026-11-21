@@ -20,7 +20,7 @@ import pytest
 from conftest import Case
 from lxml import etree
 
-from musicflow.errors import InputError
+from musicflow.errors import AnalysisError, InputError
 from musicflow.model import (
     MeasureInfo,
     NoteEvent,
@@ -49,19 +49,18 @@ MIN_CLEAR_BORDER_SHARE = {"case1": 0.85, "case2": 0.5, "case3": 0.85, "case4": 0
 _DETECTION: dict[str, StaffLayout] = {}
 
 
-def detection(case: Case, tmp_path_factory: pytest.TempPathFactory) -> StaffLayout:
+def detection(case: Case) -> StaffLayout:
     """Detected layout of a case, computed once per session."""
     if case.name not in _DETECTION:
-        debug_dir = tmp_path_factory.mktemp(f"pdf-debug-{case.name}")
         _DETECTION[case.name] = detect_layout(
-            case.pdf, expected_staves=EXPECTED_STAVES[case.name], debug_dir=debug_dir
+            case.pdf, expected_staves=EXPECTED_STAVES[case.name], debug_dir=None
         )
     return _DETECTION[case.name]
 
 
 @pytest.fixture(scope="module")
-def layout(case: Case, tmp_path_factory: pytest.TempPathFactory) -> StaffLayout:
-    return detection(case, tmp_path_factory)
+def layout(case: Case) -> StaffLayout:
+    return detection(case)
 
 
 def written_measure_count(path: Path) -> int:
@@ -198,8 +197,6 @@ def test_binding_covers_the_score(layout: StaffLayout, case: Case) -> None:
         assert system.last_measure is not None and system.last_measure >= system.first_measure
         cursor = system.last_measure + 1
     assert cursor == last + 1
-    rescale = [line for line in bound.unconfirmed if "rescaled" in line]
-    assert not rescale, f"{case.name}: binding was rescaled: {rescale}"
 
 
 def test_printed_measures_are_used_on_vector_pages(layout: StaffLayout, case: Case) -> None:
@@ -323,6 +320,22 @@ def solo_page(path: Path, space: float, *extra: tuple[float, float]) -> Path:
     return path
 
 
+def test_diagnostics_are_written_only_on_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An ordinary run passes no directory, and then no image and no directory is created."""
+    space = 14 * 72 / RENDER_DPI
+    pdf = solo_page(tmp_path / "solo.pdf", space)
+    monkeypatch.chdir(tmp_path)
+    quiet = detect_layout(pdf, expected_staves=1, debug_dir=None)
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["solo.pdf"], (
+        "a run without a debug directory must not write anything"
+    )
+    noisy = detect_layout(pdf, expected_staves=1, debug_dir=tmp_path / "debug")
+    assert sorted(path.name for path in (tmp_path / "debug").glob("*.png"))
+    assert noisy.to_dict() == quiet.to_dict(), "diagnostics must not change the detection"
+
+
 def test_a_chord_stem_is_not_a_barline(tmp_path: Path) -> None:
     """A solo system has no gap between staves to test a column against.
 
@@ -396,7 +409,6 @@ def test_solo_scan_counts_its_measures_from_the_barlines(solo: Case, tmp_path: P
         assert system.last_measure == cursor + system.measure_count - 1
         cursor = system.last_measure + 1
     assert cursor == len(score.measures) + 1
-    assert not [line for line in bound.unconfirmed if "rescaled" in line]
 
 
 def synthetic_layout(counts: list[int], printed: list[int | None] | None = None) -> StaffLayout:
@@ -433,14 +445,40 @@ def synthetic_score(total: int) -> Score:
     )
 
 
-def test_binding_rescales_and_says_so() -> None:
+def test_barline_total_mismatch_is_not_bound() -> None:
+    """Nine barlines cannot become eight measures: the last system would silently stretch."""
     layout = synthetic_layout([3, 3, 3])
-    bound = bind_measures(layout, synthetic_score(8))
-    assert [system.measure_count for system in bound.systems] == [3, 3, 3]
-    assert bound.systems[0].first_measure == 1
-    assert bound.systems[-1].last_measure == 8
-    rescale = [line for line in bound.unconfirmed if "rescaled" in line]
-    assert len(rescale) == 1 and "9" in rescale[0] and "8" in rescale[0]
+    with pytest.raises(AnalysisError) as error:
+        bind_measures(layout, synthetic_score(8))
+    message = str(error.value)
+    assert "9 measures" in message and "8" in message
+    assert "--staffs" in message
+
+
+def test_a_system_without_barlines_cannot_be_bound() -> None:
+    """No barline evidence names no measures, and a human must read them off the page."""
+    layout = synthetic_layout([2, 0, 2])
+    with pytest.raises(AnalysisError) as error:
+        bind_measures(layout, synthetic_score(4))
+    assert "system 2 covers no measures" in str(error.value)
+
+
+def test_override_repairs_a_layout_without_barline_evidence(tmp_path: Path) -> None:
+    """The zero-barline system holds the one measure only a human can see."""
+    layout = synthetic_layout([2, 0, 2])
+    path = tmp_path / "override.json"
+    path.write_text(json.dumps({"systems": [[2, 3, 3]]}), encoding="utf-8")
+    bound = bind_measures(layout, synthetic_score(5), override=path)
+    assert [(s.first_measure, s.last_measure) for s in bound.systems] == [(1, 2), (3, 3), (4, 5)]
+    assert any("overridden" in line for line in bound.unconfirmed)
+
+
+def test_printed_numbers_must_tile_the_score() -> None:
+    """A first page missing from the PDF leaves measures uncovered, so the binding is refused."""
+    layout = synthetic_layout([2, 2, 2], printed=[3, 5, 7])
+    with pytest.raises(AnalysisError) as error:
+        bind_measures(layout, synthetic_score(12))
+    assert "system 1 starts at 3, expected 1" in str(error.value)
 
 
 def test_binding_prefers_printed_numbers() -> None:
@@ -456,11 +494,10 @@ def test_binding_prefers_printed_numbers() -> None:
 
 def test_override_binds_listed_systems(tmp_path: Path) -> None:
     layout = synthetic_layout([2, 2, 2])
-    score = synthetic_score(12)
     path = tmp_path / "override.json"
-    path.write_text(json.dumps({"systems": [[2, 5, 9]]}), encoding="utf-8")
-    bound = bind_measures(layout, score, override=path)
-    assert (bound.systems[1].first_measure, bound.systems[1].last_measure) == (5, 9)
+    path.write_text(json.dumps({"systems": [[2, 3, 4]]}), encoding="utf-8")
+    bound = bind_measures(layout, synthetic_score(6), override=path)
+    assert (bound.systems[1].first_measure, bound.systems[1].last_measure) == (3, 4)
     assert any("overridden" in line for line in bound.unconfirmed)
 
 
@@ -472,9 +509,9 @@ def test_override_binds_listed_systems(tmp_path: Path) -> None:
         json.dumps({"systems": [[9, 1, 2]]}),
         json.dumps({"systems": [[1, 0, 2]]}),
         json.dumps({"systems": [[1, 3, 2]]}),
-        json.dumps({"systems": [[1, 1, 4], [2, 3, 6]]}),
-        json.dumps({"systems": [[1, 1.5, 4]]}),
-        json.dumps({"systems": [[1, 1, 4], [1, 5, 6]]}),
+        json.dumps({"systems": [[1, 1, 3], [2, 2, 4]]}),
+        json.dumps({"systems": [[1, 1.5, 3]]}),
+        json.dumps({"systems": [[1, 1, 3], [1, 4, 6]]}),
     ],
 )
 def test_override_rejects_bad_files(tmp_path: Path, payload: str) -> None:
@@ -482,7 +519,7 @@ def test_override_rejects_bad_files(tmp_path: Path, payload: str) -> None:
     path = tmp_path / "override.json"
     path.write_text(payload, encoding="utf-8")
     with pytest.raises(InputError):
-        bind_measures(layout, synthetic_score(12), override=path)
+        bind_measures(layout, synthetic_score(6), override=path)
 
 
 def test_override_missing_file_raises(tmp_path: Path) -> None:

@@ -17,13 +17,11 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 from musicflow.model import Alignment
-from musicflow.workdir import write_json
 
 from .snap import Snapped
 
@@ -46,11 +44,6 @@ MAP_BOX = (100, 720, 76, 486)
 RESIDUAL_BOX = (790, 1160, 76, 486)
 
 Box = tuple[int, int, int, int]  # left, right, top, bottom
-
-
-def write_payload(path: Path, payload: dict[str, Any]) -> None:
-    write_json(path, payload)
-    logger.info("wrote alignment report %s", path)
 
 
 def _font(size: int) -> ImageFont.ImageFont:

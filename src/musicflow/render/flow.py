@@ -14,11 +14,12 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
+from ..audio import probe as probe_audio
 from ..errors import RenderError
 from ..model import Alignment, FlowLayout, Route, VideoSpec
 from .camera import CameraTrack
-from .canvas import blank, draw_reading_line, file_signature, paste, rgb
-from .encoder import FrameSource, encode
+from .canvas import draw_reading_line, file_signature, rgb
+from .encoder import FrameSource, encode, plan_timeline
 from .tiles import StripTiles
 
 logger = logging.getLogger(__name__)
@@ -61,7 +62,7 @@ def plan_camera(*, route: Route, flow: FlowLayout, alignment: Alignment) -> Came
 
 
 def _frame_source(
-    *, track: CameraTrack, tiles: StripTiles, flow: FlowLayout, spec: VideoSpec
+    *, camera_x: np.ndarray, tiles: StripTiles, flow: FlowLayout, spec: VideoSpec
 ) -> FrameSource:
     assert flow.content.height > 0, "flow content has no height"
     scale = CONTENT_HEIGHT_RATIO * spec.height / flow.content.height
@@ -70,15 +71,18 @@ def _frame_source(
     bottom = max(top + 1, round(flow.content.y1))
     background = rgb(spec.background)
     content_height = float(bottom - top)
+    # A constant window width keeps the strip buffer reusable; the extra columns beyond the crop
+    # box are what the bilinear filter reads at the right edge.
+    window_width = math.ceil(spec.width / scale) + 2
+    paste_top = (spec.height - target_height) // 2
+    # One canvas for the whole render: the encoder writes each frame out before asking for the
+    # next one, so the buffer is never live in two frames at once.
+    frame = np.empty((spec.height, spec.width, 3), dtype=np.uint8)
 
     def frame_at(index: int) -> np.ndarray:
-        camera = track.x_at(index / spec.fps)
-        left = camera - spec.line_x / scale
+        left = float(camera_x[index]) - spec.line_x / scale
         columns_from = math.floor(left)
-        columns_to = math.ceil(left + spec.width / scale) + 1
-        window = tiles.window(
-            columns_from, top, columns_to - columns_from, bottom - top, background
-        )
+        window = tiles.window(columns_from, top, window_width, bottom - top, background)
         # A floating-point crop box keeps the fractional camera offset, so the strip moves in
         # sub-pixel steps instead of snapping to whole raster columns.
         scaled = Image.fromarray(window).resize(
@@ -91,8 +95,9 @@ def _frame_source(
                 content_height,
             ),
         )
-        frame = blank(spec)
-        paste(frame, np.asarray(scaled), 0, (spec.height - target_height) // 2)
+        frame[:paste_top] = background
+        frame[paste_top : paste_top + target_height] = np.asarray(scaled)
+        frame[paste_top + target_height :] = background
         draw_reading_line(frame, spec)
         return frame
 
@@ -107,13 +112,20 @@ def render_flow(
     spec: VideoSpec,
     out: Path,
     work_dir: Path,
+    tiles_dir: Path,
     preview: float | None,
     audio: Path,
 ) -> Path:
-    """Render the continuous-flow view and return the MP4 path."""
-    tiles = StripTiles(flow.tiles, work_dir)
+    """Render the continuous-flow view and return the MP4 path.
+
+    ``tiles_dir`` is the flow step directory that the layout's tile paths are relative to;
+    ``work_dir`` receives this render's segments and nothing of the engraver's.
+    """
+    tiles = StripTiles(flow.tiles, tiles_dir)
     track = plan_camera(route=route, flow=flow, alignment=alignment)
-    frame_at = _frame_source(track=track, tiles=tiles, flow=flow, spec=spec)
+    timeline = plan_timeline(probe_audio(audio).duration, spec, preview)
+    camera_x = track.x_many(np.arange(timeline.frames) / spec.fps)
+    frame_at = _frame_source(camera_x=camera_x, tiles=tiles, flow=flow, spec=spec)
     return encode(
         frame_at,
         spec=spec,
@@ -121,13 +133,14 @@ def render_flow(
         out=out,
         work_dir=work_dir,
         preview=preview,
+        timeline=timeline,
         kind="flow",
         parameters={
             "mode": "flow",
-            "content": flow.content.to_list(),
+            "content": flow.content.to_dict(),
             "strip_height": flow.strip_height,
             "tiles": [
-                [tile.path, tile.x0, tile.width, tile.height, file_signature(work_dir / tile.path)]
+                [tile.path, tile.x0, tile.width, tile.height, file_signature(tiles_dir / tile.path)]
                 for tile in flow.tiles
             ],
             "anchors": [list(anchor) for anchor in track.anchors],

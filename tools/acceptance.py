@@ -1,11 +1,15 @@
-"""Acceptance harness: render the corpus, then measure the delivered videos.
+"""Acceptance harness: analyse each case once, render its modes, then measure the videos.
 
 This is the V1-V4 regression driver of doc/PLAN.md. It is deliberately outside the pytest suite: a
 full-length 1080p render takes minutes per case, while the tests that guard semantics run in the
-suite. It renders every case for every requested mode, probes the produced MP4 (frame rate, frame
-count, duration against the recording), samples frames at native resolution, checks that each one
-carries score ink and, for flow, the reading line, then writes a JSON report plus a contact sheet
-per render and a markdown table.
+suite. It runs one analysis per case, renders every requested mode from it, probes each produced MP4
+(frame rate, frame count, duration against the recording), samples frames at native resolution,
+checks that each one carries score ink and, for flow, the reading line, then writes a JSON report
+plus a contact sheet per render and a markdown table.
+
+The report splits the cost of a mode the way the plan asks for it: the shared analysis (the
+``timings`` of ``report.json``), its engraving stage, and the render's own frame composition and
+encoding (see :class:`musicflow.render.encoder.EncodeStats`).
 
 Usage:
 
@@ -30,12 +34,44 @@ from PIL import Image, ImageDraw
 from musicflow import pipeline, scorexml, workdir
 from musicflow.errors import MusicFlowError
 from musicflow.model import VideoSpec
+from musicflow.render import encoder
 from musicflow.render.canvas import rgb
 
 SAMPLE_FRAMES = 6
 SHEET_WIDTH = 640
 DURATION_TOLERANCE = 0.2
 FRAME_TOLERANCE = 5
+
+
+@dataclass(frozen=True)
+class Costs:
+    """What one mode cost: the analysis it shares, its engraving, and its render.
+
+    ``analysis`` is ``report.json``'s ``timings.total`` and ``engraving`` its ``timings.flow``, so
+    both are what the pipeline already recorded; ``composing`` and ``encoding`` come from the
+    encoder statistics of this render. ``analysis`` is paid once per case, not once per mode.
+    """
+
+    analysis: float
+    engraving: float
+    composing: float
+    encoding: float
+    render: float
+    frames: int
+    segments: int
+    cached_segments: int
+
+    def to_dict(self) -> dict[str, float | int]:
+        return {
+            "analysis": round(self.analysis, 1),
+            "engraving": round(self.engraving, 1),
+            "composing": round(self.composing, 1),
+            "encoding": round(self.encoding, 1),
+            "render": round(self.render, 1),
+            "frames": self.frames,
+            "segments": self.segments,
+            "cached_segments": self.cached_segments,
+        }
 
 
 @dataclass
@@ -56,6 +92,7 @@ class CaseResult:
     ink: list[float] = field(default_factory=list)
     line: list[float] = field(default_factory=list)
     sheet: str = ""
+    costs: Costs | None = None
 
     def problems(self) -> list[str]:
         """Everything the video must satisfy to count as a delivered artifact."""
@@ -86,6 +123,7 @@ class CaseResult:
             "ok": not problems,
             "problems": problems,
             "seconds": round(self.seconds, 1),
+            "costs": None if self.costs is None else self.costs.to_dict(),
             "video": self.video,
             "video_seconds": round(self.video_seconds, 3),
             "audio_seconds": round(self.expected_seconds, 3),
@@ -200,20 +238,52 @@ def contact_sheet(frames: list[np.ndarray], path: Path, label: str, spec: VideoS
     return path
 
 
-def evaluate(
+def analyse_case(
+    case_name: str,
+    inputs: pipeline.Inputs,
+    out: Path,
+    spec: VideoSpec,
+    modes: list[str],
+) -> tuple[workdir.Workspace, pipeline.Analysis, dict]:
+    """Run the one analysis a case shares between its modes; return it with its report."""
+    workspace = workdir.Workspace(out / case_name / "work")
+    analysis = pipeline.analyze(
+        inputs,
+        workspace,
+        spec=spec,
+        with_pdf="switch" in modes,
+        with_flow="flow" in modes,
+    )
+    report = workdir.read_json(workspace.root / pipeline.REPORT_NAME)
+    return workspace, analysis, report
+
+
+def render_mode(
     case_name: str,
     mode: str,
     inputs: pipeline.Inputs,
+    workspace: workdir.Workspace,
+    analysis: pipeline.Analysis,
+    report: dict,
     out: Path,
     spec: VideoSpec,
     preview: float | None,
 ) -> CaseResult:
+    """Render one mode from the shared analysis and measure the produced video."""
     result = CaseResult(case=case_name, mode=mode, spec_fps=float(spec.fps))
-    started = time.perf_counter()
-    workspace = workdir.Workspace(out / case_name / f"work-{mode}")
     video = out / f"{case_name}.{mode}.mp4"
-    pipeline.render(inputs, workspace, mode=mode, out=video, spec=spec, preview=preview)
+    started = time.perf_counter()
+    pipeline.render(
+        inputs,
+        workspace,
+        mode=mode,
+        out=video,
+        spec=spec,
+        preview=preview,
+        analysis=analysis,
+    )
     result.seconds = time.perf_counter() - started
+    result.costs = costs_of(result.seconds, report, encoder.LAST_STATS)
     result.video = str(video)
     result.fps, result.frames, result.video_seconds, audio_in_file = probe_video(video)
     result.has_audio = audio_in_file > 0.0
@@ -238,6 +308,27 @@ def evaluate(
     return result
 
 
+def costs_of(seconds: float, report: dict, stats: dict[str, float | int] | None) -> Costs:
+    """Split what this render cost, taking the analysis and engraving from the merged report."""
+    timings = report.get("timings") or {}
+    return Costs(
+        analysis=float(timings.get("total") or 0.0),
+        engraving=float(timings.get("flow") or 0.0),
+        composing=0.0 if stats is None else float(stats["composing"]),
+        encoding=0.0 if stats is None else float(stats["feeding"]) + float(stats["muxing"]),
+        render=seconds,
+        frames=0 if stats is None else int(stats["frames"]),
+        segments=0 if stats is None else int(stats["segments"]),
+        cached_segments=0 if stats is None else int(stats["cached_segments"]),
+    )
+
+
+def failure(case_name: str, modes: list[str], error: Exception) -> list[CaseResult]:
+    """The same failure on every mode a case asked for: one analysis serves them all."""
+    detail = f"{type(error).__name__}: {error}"
+    return [CaseResult(case=case_name, mode=mode, error=detail) for mode in modes]
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--corpus", default="test_cases")
@@ -253,6 +344,7 @@ def main(argv: list[str] | None = None) -> int:
     spec = VideoSpec(width=width, height=height, fps=args.fps)
     out = Path(args.out)
     corpus = Path(args.corpus)
+    requested = [part.strip() for part in args.modes.split(",") if part.strip()]
     selected = {name.strip() for name in args.cases.split(",") if name.strip()}
     cases = [
         directory
@@ -266,32 +358,45 @@ def main(argv: list[str] | None = None) -> int:
     results: list[CaseResult] = []
     for directory in cases:
         pdf, track, symbolic = pipeline.discover_case(directory)
-        for mode in [part.strip() for part in args.modes.split(",") if part.strip()]:
-            if mode == "flow" and symbolic.suffix.lower() in scorexml.MIDI_SUFFIXES:
-                print(f"{directory.name:>7} {mode:<6} skipped: MIDI cannot drive flow")
-                continue
+        inputs = pipeline.Inputs(pdf=pdf, audio=track, symbolic=symbolic)
+        modes = list(requested)
+        if "flow" in modes and symbolic.suffix.lower() in scorexml.MIDI_SUFFIXES:
+            print(f"{directory.name:>7} flow   skipped: MIDI cannot drive flow")
+            modes.remove("flow")
+        if not modes:
+            continue
+        print(f"{directory.name:>7} analysing ...", flush=True)
+        try:
+            workspace, analysis, report = analyse_case(directory.name, inputs, out, spec, modes)
+        except (MusicFlowError, RuntimeError, subprocess.CalledProcessError) as error:
+            results.extend(failure(directory.name, modes, error))
+            print(f"{directory.name:>7} FAILED: {type(error).__name__}: {error}")
+            continue
+        for mode in modes:
             print(f"{directory.name:>7} {mode:<6} rendering ...", flush=True)
             try:
-                record = evaluate(
+                record = render_mode(
                     directory.name,
                     mode,
-                    pipeline.Inputs(pdf=pdf, audio=track, symbolic=symbolic),
+                    inputs,
+                    workspace,
+                    analysis,
+                    report,
                     out,
                     spec,
                     args.preview,
                 )
             except (MusicFlowError, RuntimeError, subprocess.CalledProcessError) as error:
-                results.append(
-                    CaseResult(
-                        case=directory.name, mode=mode, error=f"{type(error).__name__}: {error}"
-                    )
-                )
+                results.extend(failure(directory.name, [mode], error))
                 print(f"{directory.name:>7} {mode:<6} FAILED: {type(error).__name__}: {error}")
                 continue
             results.append(record)
             problems = record.problems()
+            costs = record.costs
             print(
                 f"{directory.name:>7} {mode:<6} {record.seconds:7.1f}s  "
+                f"costs analysis {costs.analysis:5.1f}s engraving {costs.engraving:5.1f}s "
+                f"compose {costs.composing:5.1f}s encode {costs.encoding:5.1f}s  "
                 f"video {record.video_seconds:8.2f}s / audio {record.expected_seconds:8.2f}s  "
                 f"{record.frames} frames @ {record.fps:g} fps  "
                 f"ink_min {min(record.ink):.3f}"

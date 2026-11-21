@@ -16,7 +16,7 @@ with every ancestor transform composed in.
 from __future__ import annotations
 
 import re
-from collections.abc import Set
+from collections.abc import Callable, Set
 from itertools import pairwise
 
 from lxml import etree
@@ -30,6 +30,7 @@ _INNER_TAG = re.compile(r'<svg\b[^>]*\bclass="definition-scale"[^>]*>')
 
 Matrix = tuple[float, float, float, float, float, float]
 IDENTITY: Matrix = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+Visitor = Callable[[etree._Element, Matrix], None]
 
 
 def _attribute(tag: str, name: str) -> str | None:
@@ -98,53 +99,58 @@ def _glyph_placement(note: etree._Element) -> etree._Element | None:
     return None
 
 
-def _walk(
-    element: etree._Element,
-    matrix: Matrix,
-    wanted: Set[str],
-    positions: dict[str, float],
-) -> None:
+def _walk(element: etree._Element, matrix: Matrix, visit: Visitor) -> None:
+    """Visit the subtree depth first with every ancestor transform composed into ``matrix``."""
     transform = element.get("transform")
     if transform:
         matrix = _compose(matrix, _transform_matrix(transform))
-    identifier = element.get("id")
-    if identifier is not None and identifier in wanted and identifier not in positions:
+    visit(element, matrix)
+    for child in element:
+        if isinstance(child.tag, str):
+            _walk(child, matrix, visit)
+
+
+def _note_visitor(wanted: Set[str], positions: dict[str, float]) -> Visitor:
+    """Visitor recording the horizontal position of every wanted note id, first one wins."""
+
+    def visit(element: etree._Element, matrix: Matrix) -> None:
+        identifier = element.get("id")
+        if identifier is None or identifier not in wanted or identifier in positions:
+            return
         placement = _glyph_placement(element)
         if placement is not None:
             glyph = _compose(matrix, _transform_matrix(placement.get("transform") or ""))
             positions[identifier] = glyph[4]
-    for child in element:
-        if isinstance(child.tag, str):
-            _walk(child, matrix, wanted, positions)
+
+    return visit
 
 
-def _walk_staff_lines(
-    element: etree._Element,
-    matrix: Matrix,
-    lines: list[tuple[float, float, float]],
-) -> None:
-    """Collect horizontal staff-line segments, with every ancestor transform applied."""
-    transform = element.get("transform")
-    if transform:
-        matrix = _compose(matrix, _transform_matrix(transform))
-    if etree.QName(element).localname == "path":
+def _line_visitor(lines: list[tuple[float, float, float]]) -> Visitor:
+    """Visitor collecting horizontal staff-line segments with every ancestor transform applied."""
+
+    def visit(element: etree._Element, matrix: Matrix) -> None:
+        if etree.QName(element).localname != "path":
+            return
         parent = element.getparent()
-        if parent is not None and parent.get("class") == "staff":
-            numbers = [float(v) for v in _NUMBER.findall(element.get("d") or "")]
-            if len(numbers) == 4 and numbers[1] == numbers[3]:
-                start = (
-                    matrix[0] * numbers[0] + matrix[2] * numbers[1] + matrix[4],
-                    matrix[1] * numbers[0] + matrix[3] * numbers[1] + matrix[5],
-                )
-                end = (
-                    matrix[0] * numbers[2] + matrix[2] * numbers[3] + matrix[4],
-                    matrix[1] * numbers[2] + matrix[3] * numbers[3] + matrix[5],
-                )
-                if abs(start[1] - end[1]) < 1e-6:
-                    lines.append((min(start[0], end[0]), start[1], max(start[0], end[0])))
-    for child in element:
-        if isinstance(child.tag, str):
-            _walk_staff_lines(child, matrix, lines)
+        if parent is None or parent.get("class") != "staff":
+            return
+        numbers = [float(value) for value in _NUMBER.findall(element.get("d") or "")]
+        if len(numbers) != 4 or numbers[1] != numbers[3]:
+            return
+        start = _point(matrix, numbers[0], numbers[1])
+        end = _point(matrix, numbers[2], numbers[3])
+        if abs(start[1] - end[1]) < 1e-6:
+            lines.append((min(start[0], end[0]), start[1], max(start[0], end[0])))
+
+    return visit
+
+
+def _point(matrix: Matrix, x: float, y: float) -> tuple[float, float]:
+    """Apply an SVG matrix to one point."""
+    return (
+        matrix[0] * x + matrix[2] * y + matrix[4],
+        matrix[1] * x + matrix[3] * y + matrix[5],
+    )
 
 
 class SvgDocument:
@@ -193,7 +199,7 @@ class SvgDocument:
         positions: dict[str, float] = {}
         if not wanted:
             return positions
-        _walk(self._element(), IDENTITY, wanted, positions)
+        _walk(self._element(), IDENTITY, _note_visitor(wanted, positions))
         for identifier, inner_x in tuple(positions.items()):
             positions[identifier] = self.offset_x + inner_x * self.scale
         return positions
@@ -208,7 +214,7 @@ class SvgDocument:
         """Every horizontal staff line as ``(x0, y, x1)`` in layout units."""
         lines: list[tuple[float, float, float]] = []
         to_layout: Matrix = (self.scale, 0.0, 0.0, self.scale, self.offset_x, self.offset_y)
-        _walk_staff_lines(self._element(), to_layout, lines)
+        _walk(self._element(), to_layout, _line_visitor(lines))
         return tuple(lines)
 
     def window(self, x0: float, y0: float, width: int, height: int) -> str:

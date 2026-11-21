@@ -226,20 +226,22 @@ def test_route_follows_the_written_score(case, score):
     assert score.unconfirmed == ()
     assert route.unconfirmed == ()
     written = score.note_by_id()
+    starts = {measure.index: measure.start_q for measure in score.measures}
+    passes = {
+        (measure_pass.measure, measure_pass.pass_index): measure_pass
+        for measure_pass in route.passes
+    }
     seen = Counter()
     for measure_pass in route.passes:
         seen[measure_pass.measure] += 1
         assert measure_pass.pass_index == seen[measure_pass.measure]
     for note in route.notes:
         source = written[note.note_id]
-        assert note.id == f"{note.note_id}@{note.pass_index}"
-        assert (note.pitch, note.part, note.staff, note.voice) == (
-            source.pitch,
-            source.part,
-            source.staff,
-            source.voice,
+        assert note.measure == source.measure
+        measure_pass = passes[note.measure, note.pass_index]
+        assert note.onset_q == pytest.approx(
+            measure_pass.start_q + source.onset_q - starts[source.measure]
         )
-        assert note.duration_q == pytest.approx(source.duration_q)
 
 
 def test_route_passes_are_contiguous(case, score, tmp_path):
@@ -357,7 +359,7 @@ def test_override_route_follows_the_file(case, score, tmp_path):
     offset = lengths[1] + lengths[2]
     shifts = [later.onset_q - earlier.onset_q for earlier, later in zip(first, second, strict=True)]
     assert shifts == pytest.approx([offset] * len(first))
-    assert {note.id.split("@")[1] for note in route.notes} == {"1", "2"}
+    assert {note.pass_index for note in route.notes} == {1, 2}
 
 
 @pytest.mark.parametrize(

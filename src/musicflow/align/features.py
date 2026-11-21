@@ -22,13 +22,16 @@ import librosa
 import numpy as np
 
 from musicflow import audio as audio_module
-from musicflow.model import Route
+from musicflow.model import Route, Score
 
 HOP_LENGTH = 256
 PITCH_CLASSES = 12
 CHROMA_OCTAVES = 8
 CQT_FMIN_NOTE = "C1"
 NOVELTY_SCALE_PERCENTILE = 98.0
+# An attack is not a single frame: its rise spans the frame or two after the onset. A caller can
+# spread the onset weight over this window so a path landing inside the rise still finds evidence.
+ATTACK_DECAY = ((0, 1.0), (1, 0.5), (2, 0.25))
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,7 +127,10 @@ class ScoreGrid:
     """The performance-route score model rasterised on a grid of ``step_q`` quarters.
 
     ``chroma`` holds the occupancy of every sounding pitch class, so a sustained note keeps
-    occupying its cells; ``attack`` marks the cells where notes start.
+    occupying its cells. ``attack`` is one exactly at each cell where a note starts and zero
+    elsewhere: a sustained note marks its onset, never its span, so the onset cost of the DTW fires
+    once per attack. A caller that passes ``attack_decay`` widens that mark into the decay window
+    an attack actually spans.
     """
 
     step_q: float
@@ -136,22 +142,46 @@ class ScoreGrid:
         return int(self.chroma.shape[0])
 
 
-def build_score_grid(route: Route, step_q: float) -> ScoreGrid:
-    """Rasterise ``route.notes`` (never ``score.notes``: repeats reorder them) onto a q grid."""
+def build_score_grid(
+    score: Score,
+    route: Route,
+    step_q: float,
+    *,
+    attack_decay: tuple[tuple[int, float], ...] = (),
+) -> ScoreGrid:
+    """Rasterise the performance route onto a q grid, at the written pitches and durations.
+
+    The route gives the performance order and the performance onset; what sounds is the written
+    note ``route.notes`` names, taken from ``score`` (its single source of truth). ``attack_decay``
+    turns the onset mark into a window of ``(row offset, weight)`` pairs, combined by maximum so a
+    chord or a cluster of onsets cannot exceed one.
+    """
+    written = score.note_by_id()
     cells = max(1, int(np.ceil(route.total_q / step_q)))
     onsets = np.asarray([n.onset_q for n in route.notes], dtype=np.float64)
-    ends = np.asarray([n.end_q for n in route.notes], dtype=np.float64)
-    pitches = np.asarray([n.pitch % PITCH_CLASSES for n in route.notes], dtype=np.int64)
+    ends = np.asarray(
+        [n.onset_q + written[n.note_id].duration_q for n in route.notes], dtype=np.float64
+    )
+    pitches = np.asarray(
+        [written[n.note_id].pitch % PITCH_CLASSES for n in route.notes], dtype=np.int64
+    )
     start = np.clip(np.rint(onsets / step_q).astype(np.int64), 0, cells)
     stop = np.clip(np.maximum(np.rint(ends / step_q).astype(np.int64), start + 1), 0, cells)
     delta = np.zeros((cells + 1, PITCH_CLASSES), dtype=np.float32)
     np.add.at(delta, (start, pitches), 1.0)
     np.add.at(delta, (stop, pitches), -1.0)
     chroma = np.cumsum(delta[:cells], axis=0)
-    entries = np.zeros(cells + 1, dtype=np.float32)
-    np.add.at(entries, start, 1.0)
-    np.add.at(entries, stop, -1.0)
-    attack = np.clip(np.cumsum(entries[:cells]), 0.0, 1.0).astype(np.float32)
+    attack = np.zeros(cells, dtype=np.float32)
+    np.add.at(attack, start[start < cells], 1.0)
+    np.clip(attack, 0.0, 1.0, out=attack)
+    if attack_decay:
+        binary = attack
+        spread = np.zeros(cells, dtype=np.float32)
+        for offset, weight in attack_decay:
+            lift = np.zeros(cells, dtype=np.float32)
+            lift[offset:] = binary[: cells - offset]
+            spread = np.maximum(spread, lift * weight)
+        attack = spread
     return ScoreGrid(step_q=step_q, chroma=_unit(chroma, pitch_axis=1), attack=attack)
 
 
@@ -166,10 +196,13 @@ class AttackSet:
         return int(self.q.size)
 
 
-def build_attacks(route: Route) -> AttackSet:
+def build_attacks(score: Score, route: Route) -> AttackSet:
     """One entry per distinct onset; a chord is one entry with several pitch classes."""
+    written = score.note_by_id()
     onsets = np.round(np.asarray([n.onset_q for n in route.notes], dtype=np.float64), 6)
-    pitches = np.asarray([n.pitch % PITCH_CLASSES for n in route.notes], dtype=np.int64)
+    pitches = np.asarray(
+        [written[n.note_id].pitch % PITCH_CLASSES for n in route.notes], dtype=np.int64
+    )
     unique, group = np.unique(onsets, return_inverse=True)
     vectors = np.zeros((unique.size, PITCH_CLASSES), dtype=np.float32)
     np.add.at(vectors, (group, pitches), 1.0)

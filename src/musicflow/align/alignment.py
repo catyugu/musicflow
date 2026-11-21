@@ -27,6 +27,7 @@ from typing import Any
 
 import numpy as np
 
+from musicflow import workdir
 from musicflow.errors import AnalysisError, InputError
 from musicflow.model import Alignment, Anchor, Route, Score
 
@@ -90,11 +91,11 @@ def align(
         features.rate,
     )
 
-    chain = stages.staged_path(features, route)
-    attacks = build_attacks(route)
+    fine, winner = stages.staged_path(features, score, route)
+    attacks = build_attacks(score, route)
     snapped = snap_attacks(
         attacks,
-        chain.fine,
+        fine,
         features,
         fixed=_chain_fixed_points(route, features.duration, manual),
     )
@@ -118,7 +119,7 @@ def align(
         method=METHOD,
         unconfirmed=(),
     )
-    numbers = _numbers(alignment, route, snapped, chain.fine, features)
+    numbers = _numbers(alignment, route, snapped, fine, features)
     unconfirmed = _honesty(alignment, numbers, merge_stats, snaps=snapped)
     alignment = Alignment(
         anchors=anchors,
@@ -128,11 +129,13 @@ def align(
     )
     elapsed = time.monotonic() - started
     payload = _payload(
-        alignment, route, snapped, chain, numbers, merge_stats, elapsed, features, manual
+        alignment, route, snapped, fine, winner, numbers, merge_stats, elapsed, manual
     )
-    report.write_payload(Path(work_dir) / "report.json", payload)
+    report_path = Path(work_dir) / "report.json"
+    workdir.write_json(report_path, payload)
+    logger.info("wrote alignment report %s", report_path)
     report.draw_figure(
-        Path(work_dir) / "alignment.png",
+        report_path.with_name("alignment.png"),
         alignment,
         snapped,
         total_q=route.total_q,
@@ -168,9 +171,9 @@ def _validate_route(score: Score, route: Route) -> None:
     """Cheap guard that the route really belongs to this score, before any expensive work.
 
     The pipeline caches every step separately, so a stale ``route`` payload can be paired with a
-    freshly loaded score. Every route note must name a written note of this score with the same
-    pitch and measure; anything else means the two artifacts describe different music and aligning
-    them would produce a confident, wrong map.
+    freshly loaded score. Every route note must name a written note of this score, and agree with
+    it on the measure that note belongs to; anything else means the two artifacts describe
+    different music and aligning them would produce a confident, wrong map.
     """
     known = score.note_by_id()
     unknown = [note.note_id for note in route.notes if note.note_id not in known]
@@ -179,18 +182,14 @@ def _validate_route(score: Score, route: Route) -> None:
             f"the performance route refers to {len(unknown)} note(s) this score does not contain "
             f"(first: {unknown[0]}); the cached route is stale"
         )
-    mismatched = [
-        note
-        for note in route.notes
-        if known[note.note_id].pitch != note.pitch or known[note.note_id].measure != note.measure
-    ]
+    mismatched = [note for note in route.notes if known[note.note_id].measure != note.measure]
     if mismatched:
         first = mismatched[0]
         raise AnalysisError(
             f"the performance route disagrees with the score on {len(mismatched)} note(s) "
-            f"(first: {first.note_id} is pitch {first.pitch} in measure {first.measure} in the "
-            f"route but pitch {known[first.note_id].pitch} in measure "
-            f"{known[first.note_id].measure} in the score); the cached route is stale"
+            f"(first: {first.note_id} is placed in measure {first.measure} in the route but "
+            f"belongs to measure {known[first.note_id].measure} in the score); the cached route "
+            "is stale"
         )
 
 
@@ -280,11 +279,11 @@ def _payload(
     alignment: Alignment,
     route: Route,
     snapped: Snapped,
-    chain: stages.Stages,
+    fine: TimeMap,
+    winner: stages.Hypothesis,
     numbers: _Numbers,
     merge_stats: dict[str, int],
     elapsed: float,
-    features: AudioFeatures,
     manual: tuple[Constraint, ...],
 ) -> dict[str, Any]:
     measures = [
@@ -312,41 +311,14 @@ def _payload(
         "residual_ms": {key: round(value, 3) for key, value in numbers.residual.items()},
         "coverage": round(numbers.coverage, 4),
         "unconfirmed": list(alignment.unconfirmed),
-        "dtw_path_length": int(chain.fine.path_cells),
+        "dtw_path_length": int(fine.path_cells),
         "onset_lag_ms": round(numbers.onset_lag, 3),
         "length_ratio": round(numbers.length_ratio, 4),
         "dropped_anchors": merge_stats,
         "reviewed_anchors": [{"q": item.q, "seconds": item.seconds} for item in manual],
-        "route_source": route.source,
-        "route_passes": len(route.passes),
-        "score_notes": len(route.notes),
-        "audio_frames": int(features.frames),
-        "audio_frame_rate": round(features.rate, 4),
-        "stages": {
-            "coarse": {
-                "cells": int(chain.coarse.path_cells),
-                "similarity": round(chain.coarse.mean_similarity, 4),
-            },
-            "medium": {
-                "cells": int(chain.medium.path_cells),
-                "similarity": round(chain.medium.mean_similarity, 4),
-            },
-            "fine": {
-                "cells": int(chain.fine.path_cells),
-                "similarity": round(chain.fine.mean_similarity, 4),
-            },
-        },
-        "hypotheses": [
-            {
-                "scale": round(item.scale, 6),
-                "offset": round(item.offset, 4),
-                "similarity": round(item.similarity, 4),
-            }
-            for item in chain.hypotheses
-        ],
         "chosen_hypothesis": {
-            "scale": round(chain.hypothesis.scale, 6),
-            "offset": round(chain.hypothesis.offset, 4),
+            "scale": round(winner.scale, 6),
+            "offset": round(winner.offset, 4),
         },
         "elapsed_seconds": round(elapsed, 3),
         "measures": measures,

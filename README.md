@@ -46,6 +46,10 @@ uv run musicflow doctor
 uv run musicflow analyze --pdf test_cases/case1/case1.pdf `
     --audio test_cases/case1/case1.mp3 --symbolic test_cases/case1/case1.mxl --json
 
+# the same analysis plus the PDF detection overlays under <workspace>/pdf/debug/
+uv run musicflow analyze --pdf test_cases/case1/case1.pdf `
+    --audio test_cases/case1/case1.mp3 --symbolic test_cases/case1/case1.mxl --debug-images
+
 # fixed-system switching video
 uv run musicflow render --mode switch `
     --pdf test_cases/case1/case1.pdf --audio test_cases/case1/case1.mp3 `
@@ -65,7 +69,22 @@ uv run musicflow batch test_cases --out build/corpus
 
 Common options: `--size 1920x1080`, `--fps 30`, `--line-x 0.35` (reading line position as a
 fraction of the width), `--workdir` (run directory, default `build/<pdf stem>`), `--preview N`
-(render only the first N seconds).
+(render only the first N seconds), `--debug-images` (`analyze` only: write the PDF detection
+overlays under `<workspace>/pdf/debug/`). Nothing else writes diagnostic images, `render` included.
+
+`batch` treats a case as the unit of work: one workspace `<out>/<case>/`, one analysis, one record
+per requested mode, and `--jobs` parallelises cases only. The two modes of a case therefore share
+the symbolic, PDF, alignment and engraving work. A MIDI-only case gets a `skip` line for `flow` and
+still renders `switch`.
+
+### Measure binding
+
+Binding is strict: systems are bound to written measures from the printed measure numbers when the
+PDF has a text layer; without one, the barline counts must tile the score's measures exactly. When
+neither decides, `analyze` stops with exit code 5 and asks for `--staffs`; read the ranges off the
+page and write one entry `[system_index, first_measure, last_measure]` per system you had to fix.
+The reviewed ranges are used verbatim, the rest is bound automatically, and the tiling is checked
+again on the result.
 
 ### Manual corrections
 
@@ -75,28 +94,35 @@ channel of the plan; nothing is silently patched.
 | Option | Content | Effect |
 | --- | --- | --- |
 | `--route FILE` | `{"spans": [[first_measure, last_measure], ...]}` | performance order of measures, replacing automatic repeat expansion |
-| `--staffs FILE` | `{"systems": [[system_index, first_measure, last_measure], ...]}` | PDF system to measure-range binding, replacing barline/printed-number detection |
+| `--staffs FILE` | `{"systems": [[system_index, first_measure, last_measure], ...]}` | PDF system to measure-range binding, pinning the listed systems; needed when the printed numbers and barlines cannot decide |
 | `--anchors FILE` | `{"anchors": [[q, seconds], ...]}` | reviewed score-position to recording-time anchors, honoured exactly |
 
 ## Outputs
 
-Every run keeps a workspace (`--workdir`, default `build/<pdf stem>/`) with one directory per
-pipeline step. Each step records a cache key over its input hashes and parameters, so a re-run only
-recomputes what the change touched; renders resume from completed segments.
+Every run keeps a workspace (`--workdir`, default `build/<pdf stem>/`) and writes one merged
+report; the expensive stages keep one directory each.
 
 ```text
 build/<stem>/
-  run.json                 provenance: input paths and sha256, tool versions, spec, checks
-  analysis.json            summary printed by `analyze` (checks, counts, unconfirmed items)
-  symbolic/                Score JSON + written.musicxml (id-annotated, for Verovio)
-  route/                   performance route (repeat expansion)
-  staffs/                  detected systems + debug/page-*.png overlays
-  staffs-bound/            system to measure-range binding
-  align/                   anchors, report.json, alignment.png
-  flow/                    strip.svg, tiles/strip-*.png, overview.png and the flow MP4 segments
-  render-switch/           page rasters, MP4 segments
-  render-flow/             flow cache metadata; the segments are written to flow/
+  report.json              one report: input paths and sha256, tool versions, spec, the
+                           score/route/layout/alignment/flow summaries, checks, artifact paths
+                           and the per-stage timings
+  symbolic/                Score payload + written.musicxml (id-annotated, for Verovio)
+  pdf/                     StaffLayout payload; debug/ only under --debug-images
+  align/                   Alignment payload, report.json evidence, alignment.png
+  flow/                    FlowLayout payload, strip.svg, overview.png, tiles/
+  render-switch/           page rasters and MP4 segments
+  render-flow/             MP4 segments (the flow tiles are read from flow/)
 ```
+
+Each stage records a cache key over the content digests of the files it read and the parameters
+that affect it, so a re-run only recomputes what the change touched. A stage payload also names the
+binary files it depends on (`written.musicxml`, the tiles, the alignment report): a cached payload
+whose file is gone is recomputed instead of reused. `switch` and `flow` resume from completed
+600-frame segments, and an unchanged input set re-encodes nothing.
+
+`analyze` prints a summary of that report and `--json` prints the report itself. `batch` prints one
+line per (case, mode) with the status, the render seconds and either the video path or the error.
 
 Exit codes: `0` success, `1` a `batch` case failed, `2` bad command line, `3` bad input, `4` input
 valid but the mode cannot use it (MIDI-only flow), `5` an analysis could not be trusted, `6` encoding
@@ -105,20 +131,21 @@ failed, `7` a required external program is missing.
 ## Verification
 
 ```powershell
-uv run pytest                                  # module and end-to-end tests
+uv run pytest
+uv run ruff check .
 uv run python tools/acceptance.py --out build/acceptance
-uv run python tools/acceptance.py --out build/acceptance --preview 20 --size 960x540
+uv run python tools/acceptance.py --out build/acceptance --preview 15 --size 960x540
 ```
 
-The acceptance harness renders the corpus, then measures the delivered videos: frame count against
-`duration x fps`, duration against the recording, audio stream present, sampled frames carry score
-ink, and (for flow) the reading line is intact. It writes `acceptance.json` plus one contact sheet per
-render. `doc/ACCEPTANCE.md` records the numbers of the last full run.
+The acceptance harness analyses each case once, renders both modes from that analysis, then measures
+the delivered videos: frame count against `duration x fps`, duration against the recording, audio
+stream present, sampled frames carry score ink, and (for flow) the reading line is intact. It writes
+`acceptance.json` — per render the video measurements, the problems found and the cost split (shared
+analysis, engraving, frame composition, encoding) — plus one contact sheet per render.
+`doc/ACCEPTANCE.md` records the numbers of the last full run.
 
-Measured on this machine (CPU encoding): `switch` renders about 12 ms per 1080p frame, `flow` about
-90-150 ms per frame, so a four-minute song takes roughly two minutes in `switch` and 15-20 minutes in
-`flow`. A render resumes from completed 600-frame segments, and an unchanged input set re-renders
-nothing.
+Measured on this machine (CPU encoding) at 1920x1080 and 30 fps; the analysis, engraving, frame
+composition and encoding costs of the last full run are recorded in `doc/ACCEPTANCE.md` section 二.
 
 ## Layout
 
@@ -129,7 +156,7 @@ src/musicflow/
   model.py          shared data structures and domain conventions
   scorexml.py       MXL container handling, stable `mf-` note ids
   audio.py          ffmpeg decode/probe; the recording is the only clock
-  workdir.py        run directories, fingerprints, cached steps
+  workdir.py        run directories, content digests, cached steps
   symbolic/         MusicXML / MXL / MIDI loading, performance-route expansion
   pdf/              staff-system detection, measure binding, cropping geometry
   align/            symbolic-to-audio alignment and reviewed anchors
@@ -154,8 +181,10 @@ doc/                requirements (PLAN.md), corpus notes (TEST_DATA.md), design 
 - `flow` needs MusicXML/MXL. A MIDI-only performance can drive `switch` and the alignment, but not
   the engraving.
 - MIDI has no measures or notation: its measure grid is inferred from time signatures, so a MIDI
-  whose repeats are expanded cannot recover the page jumps of `switch`; the binding is proportional
-  and reported as unconfirmed.
+  whose repeats are expanded already has a different measure count from the printed score (case3:
+  453 against 314). The systems then cannot be bound to measures at all: binding refuses with exit
+  code 5 instead of mapping measures proportionally, and `--staffs` is how the page ranges are
+  supplied by hand.
 - The PDF is compared with the symbolic score at the level that does not require reading it as
   notation: staff count per system, measure count from barlines and printed numbers, implied tempo,
   and the alignment's own confidence. Note-level differences (clefs, articulations) are not detected

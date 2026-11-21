@@ -36,19 +36,21 @@ class CameraTrack:
         self._times = np.asarray(merged_times)
         self._xs = np.asarray(merged_xs)
         self._runs: list[PchipInterpolator] = []
-        self._run_of_segment: list[int] = []
+        self._run_of_segment = np.empty(0, dtype=np.intp)
         self._cut_runs()
 
     def _cut_runs(self) -> None:
         times, xs = self._times, self._xs
         start = 0
+        segments: list[int] = []
         for stop in range(1, len(times)):
             if xs[stop] >= xs[stop - 1]:
                 continue
-            self._run_of_segment.extend([self._add_run(start, stop)] * (stop - 1 - start))
-            self._run_of_segment.append(-1)
+            segments.extend([self._add_run(start, stop)] * (stop - 1 - start))
+            segments.append(-1)
             start = stop
-        self._run_of_segment.extend([self._add_run(start, len(times))] * (len(times) - 1 - start))
+        segments.extend([self._add_run(start, len(times))] * (len(times) - 1 - start))
+        self._run_of_segment = np.asarray(segments, dtype=np.intp)
 
     def _add_run(self, start: int, stop: int) -> int:
         if stop - start < 2:
@@ -72,8 +74,44 @@ class CameraTrack:
         if seconds >= times[-1]:
             return float(self._xs[-1])
         index = int(np.searchsorted(times, seconds, side="right")) - 1
-        run = self._run_of_segment[index]
+        run = int(self._run_of_segment[index])
         if run < 0:
             ratio = (seconds - times[index]) / (times[index + 1] - times[index])
             return float(self._xs[index] + ratio * (self._xs[index + 1] - self._xs[index]))
         return float(self._runs[run](seconds))
+
+    def x_many(self, times: np.ndarray) -> np.ndarray:
+        """Camera x at every query time, in one pass over the runs.
+
+        Each forward run is evaluated on the whole slice of queries that falls inside it, so the
+        renderer resolves all frame positions in one call instead of walking the interpolation for
+        every frame. Queries outside the anchor range are held, exactly as :meth:`x_at` does.
+        """
+        queried = np.asarray(times, dtype=float)
+        anchors = self._times
+        positions = np.empty(queried.shape, dtype=float)
+        before = queried <= anchors[0]
+        after = queried >= anchors[-1]
+        positions[before] = self._xs[0]
+        positions[after] = self._xs[-1]
+        inside = ~(before | after)
+        if not inside.any():
+            return positions
+
+        values = queried[inside]
+        segment = np.searchsorted(anchors, values, side="right") - 1
+        runs = self._run_of_segment[segment]
+        resolved = np.empty(values.shape, dtype=float)
+        for run in np.unique(runs):
+            selected = runs == run
+            chunk = values[selected]
+            if run < 0:
+                lower = anchors[segment[selected]]
+                upper = anchors[segment[selected] + 1]
+                left_x = self._xs[segment[selected]]
+                ratio = (chunk - lower) / (upper - lower)
+                resolved[selected] = left_x + ratio * (self._xs[segment[selected] + 1] - left_x)
+            else:
+                resolved[selected] = self._runs[int(run)](chunk)
+        positions[inside] = resolved
+        return positions

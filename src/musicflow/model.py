@@ -18,16 +18,137 @@ Conventions used by every module:
 from __future__ import annotations
 
 import bisect
-from dataclasses import dataclass
-from typing import Any, Literal
+import types
+from dataclasses import dataclass, fields
+from functools import cache
+from typing import Any, Literal, Self, Union, get_args, get_origin, get_type_hints
 
 SymbolicProvider = Literal["musicxml", "midi"]
 RouteSource = Literal["written", "auto_repeats", "override"]
 AnchorKind = Literal["start", "onset", "manual", "end"]
 
 
+class Payload:
+    """JSON shape of a payload dataclass: one reflective encoder and one strict decoder.
+
+    The encoder writes the declared field names, so the artifact is readable and a new field is a
+    one-line change. The decoder accepts only the exact shape it was written from: an unknown or
+    missing key raises, so a payload of another code shape is never half-filled; the pipeline
+    version in the cache key is what keeps such a payload from being read back at all.
+    """
+
+    __slots__ = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {field.name: _encode(getattr(self, field.name)) for field in fields(self)}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Self:
+        return _decode(cls, data)
+
+
+def _encode(value: Any) -> Any:
+    if isinstance(value, Payload):
+        return value.to_dict()
+    if isinstance(value, (tuple, list)):
+        return [_encode(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _encode(item) for key, item in value.items()}
+    return value
+
+
+@cache
+def _hints(cls: type) -> dict[str, Any]:
+    return get_type_hints(cls)
+
+
+def _decode(cls: type[Payload], data: Any, path: str | None = None) -> Any:
+    path = cls.__name__ if path is None else path
+    if not isinstance(data, dict):
+        raise ValueError(f"{path}: expected a JSON object, got {type(data).__name__}")
+    hints = _hints(cls)
+    names = [field.name for field in fields(cls)]
+    unknown = sorted(set(data) - set(names))
+    if unknown:
+        raise ValueError(f"{path}: unknown field(s) {unknown}")
+    missing = [name for name in names if name not in data]
+    if missing:
+        raise ValueError(f"{path}: missing field(s) {missing}")
+    return cls(**{name: _decode_field(hints[name], data[name], f"{path}.{name}") for name in names})
+
+
+def _decode_field(annotation: Any, value: Any, path: str) -> Any:
+    origin = get_origin(annotation)
+    if origin is types.UnionType or origin is Union:
+        allowed = get_args(annotation)
+        if value is None:
+            if type(None) in allowed:
+                return None
+            raise ValueError(f"{path}: null is not allowed")
+        inner = [item for item in allowed if item is not type(None)]
+        assert len(inner) == 1, f"{path}: only a single optional type is supported"
+        return _decode_field(inner[0], value, path)
+    if origin is Literal:
+        allowed = get_args(annotation)
+        if value not in allowed:
+            raise ValueError(f"{path}: {value!r} is not one of {allowed}")
+        return value
+    if origin is tuple:
+        return _decode_tuple(annotation, value, path)
+    if origin is dict:
+        key_type, value_type = get_args(annotation)
+        assert key_type is str, f"{path}: only string keys are supported"
+        if not isinstance(value, dict):
+            raise ValueError(f"{path}: expected a JSON object, got {type(value).__name__}")
+        return {
+            key: _decode_field(value_type, item, f"{path}.{key}") for key, item in value.items()
+        }
+    if annotation is Any:
+        return value
+    if annotation is bool:
+        if not isinstance(value, bool):
+            raise ValueError(f"{path}: expected a boolean, got {type(value).__name__}")
+        return value
+    if annotation is float:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"{path}: expected a number, got {type(value).__name__}")
+        return float(value)
+    if annotation is int:
+        if isinstance(value, bool):
+            raise ValueError(f"{path}: expected an integer, got {value!r}")
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float) and value.is_integer():
+            return int(value)
+        raise ValueError(f"{path}: expected an integer, got {value!r}")
+    if annotation is str:
+        if not isinstance(value, str):
+            raise ValueError(f"{path}: expected a string, got {type(value).__name__}")
+        return value
+    if isinstance(annotation, type) and issubclass(annotation, Payload):
+        return _decode(annotation, value, path)
+    raise TypeError(f"{path}: unsupported annotation {annotation!r}")
+
+
+def _decode_tuple(annotation: Any, value: Any, path: str) -> tuple[Any, ...]:
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"{path}: expected a JSON array, got {type(value).__name__}")
+    items = tuple(value)
+    args = get_args(annotation)
+    if len(args) == 2 and args[1] is Ellipsis:
+        return tuple(
+            _decode_field(args[0], item, f"{path}[{index}]") for index, item in enumerate(items)
+        )
+    if len(args) != len(items):
+        raise ValueError(f"{path}: expected {len(args)} items, got {len(items)}")
+    return tuple(
+        _decode_field(arg, item, f"{path}[{index}]")
+        for index, (arg, item) in enumerate(zip(args, items, strict=True))
+    )
+
+
 @dataclass(frozen=True, slots=True)
-class Rect:
+class Rect(Payload):
     x0: float
     y0: float
     x1: float
@@ -56,23 +177,16 @@ class Rect:
             max(self.y1, other.y1),
         )
 
-    def to_list(self) -> list[float]:
-        return [self.x0, self.y0, self.x1, self.y1]
-
-    @classmethod
-    def from_list(cls, values: list[float]) -> Rect:
-        return Rect(*(float(v) for v in values))
-
 
 @dataclass(frozen=True, slots=True)
-class PartInfo:
+class PartInfo(Payload):
     id: str
     name: str
     staves: int
 
 
 @dataclass(frozen=True, slots=True)
-class MeasureInfo:
+class MeasureInfo(Payload):
     index: int
     start_q: float
     length_q: float
@@ -83,7 +197,7 @@ class MeasureInfo:
 
 
 @dataclass(frozen=True, slots=True)
-class Repeat:
+class Repeat(Payload):
     """A written repeat/jump instruction, in measure numbers."""
 
     kind: Literal["repeat_span", "da_capo", "dal_segno", "fine", "segno", "coda"]
@@ -93,7 +207,7 @@ class Repeat:
 
 
 @dataclass(frozen=True, slots=True)
-class NoteEvent:
+class NoteEvent(Payload):
     """One sounding note of the written score."""
 
     id: str
@@ -111,7 +225,7 @@ class NoteEvent:
 
 
 @dataclass(frozen=True, slots=True)
-class Score:
+class Score(Payload):
     """The written score: what is on the page, before any performance route is applied.
 
     Invariants: ``notes`` are ordered by ``onset_q``; every note's measure exists; measure
@@ -150,59 +264,9 @@ class Score:
     def note_by_id(self) -> dict[str, NoteEvent]:
         return {n.id: n for n in self.notes}
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "provider": self.provider,
-            "title": self.title,
-            "total_q": self.total_q,
-            "unconfirmed": list(self.unconfirmed),
-            "parts": [{"id": p.id, "name": p.name, "staves": p.staves} for p in self.parts],
-            "measures": [
-                {"index": m.index, "start_q": m.start_q, "length_q": m.length_q}
-                for m in self.measures
-            ],
-            "repeats": [
-                {
-                    "kind": r.kind,
-                    "start_measure": r.start_measure,
-                    "end_measure": r.end_measure,
-                    "times": r.times,
-                }
-                for r in self.repeats
-            ],
-            "notes": [
-                [n.id, n.part, n.staff, n.voice, n.measure, n.onset_q, n.duration_q, n.pitch]
-                for n in self.notes
-            ],
-        }
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> Score:
-        return cls(
-            provider=data["provider"],
-            title=data.get("title", ""),
-            total_q=float(data["total_q"]),
-            unconfirmed=tuple(data.get("unconfirmed", [])),
-            parts=tuple(PartInfo(p["id"], p["name"], int(p["staves"])) for p in data["parts"]),
-            measures=tuple(
-                MeasureInfo(int(m["index"]), float(m["start_q"]), float(m["length_q"]))
-                for m in data["measures"]
-            ),
-            repeats=tuple(
-                Repeat(r["kind"], int(r["start_measure"]), int(r["end_measure"]), int(r["times"]))
-                for r in data["repeats"]
-            ),
-            notes=tuple(
-                NoteEvent(
-                    n[0], n[1], int(n[2]), int(n[3]), int(n[4]), float(n[5]), float(n[6]), int(n[7])
-                )
-                for n in data["notes"]
-            ),
-        )
-
 
 @dataclass(frozen=True, slots=True)
-class MeasurePass:
+class MeasurePass(Payload):
     """One appearance of a written measure in the performance."""
 
     measure: int
@@ -212,27 +276,22 @@ class MeasurePass:
 
 
 @dataclass(frozen=True, slots=True)
-class PerformanceNote:
-    """A note as heard: the written note placed at one performance position."""
+class PerformanceNote(Payload):
+    """A written note placed at one performance position.
 
-    id: str
+    The route owns only where and when the note sounds; pitch, duration, part, staff and voice
+    stay in ``Score``, which is their single source of truth, and are looked up through
+    ``Score.note_by_id()``.
+    """
+
     note_id: str
     measure: int
     pass_index: int
     onset_q: float
-    duration_q: float
-    pitch: int
-    part: str
-    staff: int
-    voice: int
-
-    @property
-    def end_q(self) -> float:
-        return self.onset_q + self.duration_q
 
 
 @dataclass(frozen=True, slots=True)
-class Route:
+class Route(Payload):
     """The performance route: which written measures are played, in which order.
 
     Invariants: ``passes`` are contiguous and ordered, ``notes`` are ordered by ``onset_q`` and each
@@ -262,58 +321,9 @@ class Route:
             "performance note is not on a declared measure pass"
         )
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "source": self.source,
-            "total_q": self.total_q,
-            "unconfirmed": list(self.unconfirmed),
-            "passes": [[p.measure, p.pass_index, p.start_q, p.length_q] for p in self.passes],
-            "notes": [
-                [
-                    n.id,
-                    n.note_id,
-                    n.measure,
-                    n.pass_index,
-                    n.onset_q,
-                    n.duration_q,
-                    n.pitch,
-                    n.part,
-                    n.staff,
-                    n.voice,
-                ]
-                for n in self.notes
-            ],
-        }
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> Route:
-        return cls(
-            source=data["source"],
-            total_q=float(data["total_q"]),
-            unconfirmed=tuple(data.get("unconfirmed", [])),
-            passes=tuple(
-                MeasurePass(int(p[0]), int(p[1]), float(p[2]), float(p[3])) for p in data["passes"]
-            ),
-            notes=tuple(
-                PerformanceNote(
-                    n[0],
-                    n[1],
-                    int(n[2]),
-                    int(n[3]),
-                    float(n[4]),
-                    float(n[5]),
-                    int(n[6]),
-                    n[7],
-                    int(n[8]),
-                    int(n[9]),
-                )
-                for n in data["notes"]
-            ),
-        )
-
 
 @dataclass(frozen=True, slots=True)
-class Anchor:
+class Anchor(Payload):
     """A verified correspondence between a performance position and a recording time."""
 
     q: float
@@ -323,7 +333,7 @@ class Anchor:
 
 
 @dataclass(frozen=True, slots=True)
-class Alignment:
+class Alignment(Payload):
     """Score-to-audio time map.
 
     The map is the piecewise linear interpolation of ``anchors``, which must be strictly
@@ -360,35 +370,16 @@ class Alignment:
         ratio = 0.0 if span == 0 else (q - left.q) / span
         return left.seconds + ratio * (right.seconds - left.seconds)
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "method": self.method,
-            "audio_duration": self.audio_duration,
-            "unconfirmed": list(self.unconfirmed),
-            "anchors": [[a.q, a.seconds, a.kind, a.confidence] for a in self.anchors],
-        }
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> Alignment:
-        return cls(
-            method=data["method"],
-            audio_duration=float(data["audio_duration"]),
-            unconfirmed=tuple(data.get("unconfirmed", [])),
-            anchors=tuple(
-                Anchor(float(a[0]), float(a[1]), a[2], float(a[3])) for a in data["anchors"]
-            ),
-        )
-
 
 @dataclass(frozen=True, slots=True)
-class PageInfo:
+class PageInfo(Payload):
     number: int
     width: float
     height: float
 
 
 @dataclass(frozen=True, slots=True)
-class System:
+class System(Payload):
     """One staff system of a PDF page, in PDF points.
 
     ``printed_measure`` is the measure number engraved at the start of the system when the PDF has
@@ -408,7 +399,7 @@ class System:
 
 
 @dataclass(frozen=True, slots=True)
-class StaffLayout:
+class StaffLayout(Payload):
     pages: tuple[PageInfo, ...]
     systems: tuple[System, ...]
     unconfirmed: tuple[str, ...] = ()
@@ -419,52 +410,9 @@ class StaffLayout:
         indices = [s.index for s in self.systems]
         assert indices == list(range(1, len(self.systems) + 1)), "system indices are not 1..n"
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "pages": [[p.number, p.width, p.height] for p in self.pages],
-            "unconfirmed": list(self.unconfirmed),
-            "systems": [
-                {
-                    "index": s.index,
-                    "page": s.page,
-                    "bbox": s.bbox.to_list(),
-                    "staves": [r.to_list() for r in s.staves],
-                    "barlines": list(s.barlines),
-                    "measure_count": s.measure_count,
-                    "first_measure": s.first_measure,
-                    "last_measure": s.last_measure,
-                    "printed_measure": s.printed_measure,
-                }
-                for s in self.systems
-            ],
-        }
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> StaffLayout:
-        return cls(
-            pages=tuple(PageInfo(int(p[0]), float(p[1]), float(p[2])) for p in data["pages"]),
-            unconfirmed=tuple(data.get("unconfirmed", [])),
-            systems=tuple(
-                System(
-                    index=int(s["index"]),
-                    page=int(s["page"]),
-                    bbox=Rect.from_list(s["bbox"]),
-                    staves=tuple(Rect.from_list(r) for r in s["staves"]),
-                    barlines=tuple(float(b) for b in s["barlines"]),
-                    measure_count=int(s["measure_count"]),
-                    first_measure=None if s["first_measure"] is None else int(s["first_measure"]),
-                    last_measure=None if s["last_measure"] is None else int(s["last_measure"]),
-                    printed_measure=None
-                    if s.get("printed_measure") is None
-                    else int(s["printed_measure"]),
-                )
-                for s in data["systems"]
-            ),
-        )
-
 
 @dataclass(frozen=True, slots=True)
-class Tile:
+class Tile(Payload):
     """One rasterised horizontal slice of the engraved strip.
 
     ``path`` is relative to the flow step directory. The tile image is 1 pixel per strip unit,
@@ -478,7 +426,7 @@ class Tile:
 
 
 @dataclass(frozen=True, slots=True)
-class FlowLayout:
+class FlowLayout(Payload):
     """Engraved continuous strip: one very wide system, rasterised in tiles."""
 
     strip_width: float
@@ -497,32 +445,9 @@ class FlowLayout:
     def note_positions(self) -> dict[str, float]:
         return dict(self.note_x)
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "strip_width": self.strip_width,
-            "strip_height": self.strip_height,
-            "content": self.content.to_list(),
-            "scale": self.scale,
-            "note_x": [[k, v] for k, v in self.note_x],
-            "measure_x": [[m, a, b] for m, a, b in self.measure_x],
-            "tiles": [[t.path, t.x0, t.width, t.height] for t in self.tiles],
-        }
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> FlowLayout:
-        return cls(
-            strip_width=float(data["strip_width"]),
-            strip_height=float(data["strip_height"]),
-            content=Rect.from_list(data["content"]),
-            scale=float(data["scale"]),
-            note_x=tuple((k, float(v)) for k, v in data["note_x"]),
-            measure_x=tuple((int(m), float(a), float(b)) for m, a, b in data["measure_x"]),
-            tiles=tuple(Tile(t[0], float(t[1]), int(t[2]), int(t[3])) for t in data["tiles"]),
-        )
-
 
 @dataclass(frozen=True, slots=True)
-class VideoSpec:
+class VideoSpec(Payload):
     """Canvas and palette of the produced video."""
 
     width: int = 1920
@@ -541,14 +466,3 @@ class VideoSpec:
     @property
     def line_x(self) -> float:
         return self.width * self.line_x_ratio
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "width": self.width,
-            "height": self.height,
-            "fps": self.fps,
-            "background": self.background,
-            "line_color": self.line_color,
-            "line_x_ratio": self.line_x_ratio,
-            "line_width": self.line_width,
-        }

@@ -156,9 +156,37 @@ def _inputs(args: argparse.Namespace):
 
 
 def _workspace(args: argparse.Namespace) -> Path:
-    if args.workdir:
-        return Path(args.workdir)
-    return Path("build") / Path(args.pdf).stem
+    return Path(args.workdir) if args.workdir else Path("build") / Path(args.pdf).stem
+
+
+def _print_report(report: dict) -> None:
+    """The human summary of one run, from the merged report."""
+    score = report["score"]
+    route = report["route"]
+    layout = report["layout"]
+    alignment = report["alignment"]
+    flow = report["flow"]
+    notes = f"{score['written_notes']} written, {route['notes']} performed ({route['source']})"
+    audio = f"{alignment['audio_duration']:.2f} s, route {route['total_q']:.1f} quarter notes"
+    systems = "not detected"
+    if layout is not None:
+        systems = f"{layout['systems']} ({layout['bound_systems']} bound)"
+    print(f"provider         {score['provider']}")
+    print(f"parts            {len(score['parts'])} ({score['measures']} measures)")
+    print(f"notes            {notes}")
+    print(f"systems          {systems}")
+    print(f"anchors          {alignment['anchors']} ({alignment['method']})")
+    print(f"audio            {audio}")
+    for name in ("score", "route", "layout", "alignment"):
+        for line in (report[name] or {}).get("unconfirmed", []):
+            print(f"unconfirmed      {name}: {line}")
+    for check in report["checks"]:
+        status = "ok  " if check["ok"] else "FAIL"
+        print(f"check            {status} {check['name']}: {check['detail']}")
+    if flow:
+        print(f"flow             strip {flow['strip_width']:.0f} units, {flow['tiles']} tiles")
+    timings = ", ".join(f"{name} {seconds:.1f} s" for name, seconds in report["timings"].items())
+    print(f"timings          {timings}")
 
 
 def _cmd_analyze(args: argparse.Namespace) -> int:
@@ -166,37 +194,19 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
 
     inputs = _inputs(args)
     workspace = workdir.Workspace(_workspace(args))
-    spec = _video_spec(args)
-    analysis = pipeline.analyze(inputs, workspace, spec=spec, with_flow=args.with_flow)
-    payload = pipeline.summary_payload(inputs, analysis)
-    report_path = workspace.root / "analysis.json"
-    workdir.write_json(report_path, payload)
+    pipeline.analyze(
+        inputs,
+        workspace,
+        spec=_video_spec(args),
+        with_flow=args.with_flow,
+        debug_images=args.debug_images,
+    )
+    report_path = workspace.root / pipeline.REPORT_NAME
+    report = workdir.read_json(report_path)
     if args.json:
-        print(json.dumps(payload, ensure_ascii=False, indent=1))
+        print(json.dumps(report, ensure_ascii=False, indent=1))
     else:
-        print(f"provider         {payload['provider']}")
-        print(f"parts            {len(payload['parts'])} ({payload['measures']} measures)")
-        print(
-            f"notes            {payload['written_notes']} written, "
-            f"{payload['route_notes']} performed ({payload['route_source']})"
-        )
-        print(f"systems          {payload['systems']} ({payload['bound_systems']} bound)")
-        print(f"anchors          {payload['anchors']} ({payload['alignment_method']})")
-        print(
-            f"audio            {payload['audio_duration']:.2f} s, "
-            f"route {payload['route_total_q']:.1f} quarter notes"
-        )
-        for key in ("route_unconfirmed", "staff_layout_unconfirmed", "alignment_unconfirmed"):
-            for line in payload[key]:
-                print(f"unconfirmed      {key}: {line}")
-        for check in payload["checks"]:
-            status = "ok  " if check["ok"] else "FAIL"
-            print(f"check            {status} {check['name']}: {check['detail']}")
-        if payload["flow"]:
-            print(
-                f"flow             strip {payload['flow']['strip_width']:.0f} units, "
-                f"{payload['flow']['tiles']} tiles"
-            )
+        _print_report(report)
     print(f"report           {report_path}")
     return EXIT_OK
 
@@ -291,6 +301,9 @@ def build_parser() -> argparse.ArgumentParser:
     analyze.add_argument("--json", action="store_true", help="print the full analysis as JSON")
     analyze.add_argument(
         "--with-flow", action="store_true", help="also engrave the continuous flow layout"
+    )
+    analyze.add_argument(
+        "--debug-images", action="store_true", help="write the PDF detection diagnostic bitmaps"
     )
     analyze.set_defaults(handler=_cmd_analyze)
 

@@ -4,16 +4,23 @@ Each case directory holds one work: a PDF score, a recording and the same music 
 MusicXML and compressed MusicXML. Tests that need a case take the ``case`` fixture, which yields a
 :class:`Case` for every case present on disk.
 
+The one thing the corpus-wide video tests share besides the corpus itself is ``media``: the probe
+and frame sampler for a produced file, so no module re-declares its own ffprobe/ffmpeg calls.
+
 case4 is the one single-staff work, the case that exercises the solo-instrument paths: one staff per
 system, no grand staff to find measures in.
 """
 
 from __future__ import annotations
 
+import json
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
 import pytest
+from PIL import Image
 
 CORPUS = Path(__file__).resolve().parents[1] / "test_cases"
 CASE_NAMES = ("case1", "case2", "case3", "case4")
@@ -56,6 +63,89 @@ def available_cases() -> list[Case]:
     return [Case(name, CORPUS / name) for name in CASE_NAMES if (CORPUS / name).is_dir()]
 
 
+@dataclass(frozen=True)
+class StreamInfo:
+    """What ffprobe reports about one file: video geometry, frame count and duration."""
+
+    fps: float
+    frames: int
+    width: int
+    height: int
+    duration: float
+
+
+class Media:
+    """A produced MP4 or the recording: probe it and sample decoded RGB frames from it.
+
+    ``frame_at`` returns int16 so a test can subtract a reference colour without wrapping; a
+    recording has no video stream, so only its duration is meaningful.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._info: StreamInfo | None = None
+
+    def probe(self) -> StreamInfo:
+        """Geometry, frame count and duration, probed once per file."""
+        if self._info is None:
+            self._info = _probe(self.path)
+        return self._info
+
+    def frame_at(self, seconds: float, destination: Path) -> np.ndarray:
+        """One decoded RGB frame at ``seconds``."""
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-v",
+                "error",
+                "-ss",
+                f"{seconds:.3f}",
+                "-i",
+                str(self.path),
+                "-frames:v",
+                "1",
+                "-y",
+                str(destination),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        with Image.open(destination) as image:
+            return np.asarray(image.convert("RGB"), dtype=np.int16)
+
+
+def _probe(path: Path) -> StreamInfo:
+    result = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-count_frames",
+            "-show_entries",
+            "stream=r_frame_rate,nb_read_frames,width,height:format=duration",
+            "-of",
+            "json",
+            str(path),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    stream = (payload.get("streams") or [{}])[0]
+    numerator, _, denominator = str(stream.get("r_frame_rate", "0/1")).partition("/")
+    return StreamInfo(
+        fps=float(numerator) / float(denominator or 1),
+        frames=int(stream.get("nb_read_frames") or 0),
+        width=int(stream.get("width") or 0),
+        height=int(stream.get("height") or 0),
+        duration=float(payload.get("format", {}).get("duration") or 0.0),
+    )
+
+
 @pytest.fixture(params=[case.name for case in available_cases()], scope="session")
 def case(request: pytest.FixtureRequest) -> Case:
     return Case(request.param, CORPUS / request.param)
@@ -72,3 +162,9 @@ def solo() -> Case:
 @pytest.fixture(scope="session")
 def corpus() -> Path:
     return CORPUS
+
+
+@pytest.fixture(scope="session")
+def media() -> type[Media]:
+    """The probe and frame sampler a test module uses to measure a produced file."""
+    return Media

@@ -1,8 +1,15 @@
-"""Pipeline orchestration: input validation, cached analysis steps, rendering and batch runs.
+"""Pipeline orchestration: input validation, cached analysis stages, rendering and batch runs.
 
-This module owns the cache keys and the order of stages; the stages themselves live in
-``musicflow.symbolic``, ``musicflow.pdf``, ``musicflow.align``, ``musicflow.flow`` and
-``musicflow.render`` and are pure functions over the structures in ``musicflow.model``.
+This module owns the cache keys, the order of stages and the merged report. The stages themselves
+live in ``musicflow.symbolic``, ``musicflow.pdf``, ``musicflow.align``, ``musicflow.flow`` and
+``musicflow.render`` and are pure functions over the structures in ``musicflow.model``. ``route``
+and the measure binding read data the run already loaded, so they are computed in memory and have
+neither a directory nor a cache key.
+
+Only the expensive stages are cached, and each of them is keyed by the files and parameters it
+actually reads: ``symbolic`` by the symbolic score, ``pdf`` by the score PDF and the staff count the
+detection is validated against, ``align`` by the recording, the route and the written notes it
+aligns, ``flow`` by the written MusicXML and the engraving geometry.
 
 The stage modules are imported inside their stage functions on purpose: importing ``librosa``,
 ``verovio`` and ``partitura`` costs seconds, and `musicflow --help`, `musicflow doctor` and the
@@ -19,7 +26,7 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any, Literal
 
-from . import audio, scorexml, workdir
+from . import scorexml, workdir
 from .errors import InputError, UnsupportedInputError
 from .model import Alignment, FlowLayout, Route, Score, StaffLayout, VideoSpec
 
@@ -28,7 +35,8 @@ logger = logging.getLogger(__name__)
 Mode = Literal["switch", "flow"]
 # Bump when a stage's behaviour changes: every cache key includes it, so stale artifacts from an
 # older algorithm can never be mistaken for current output.
-PIPELINE_VERSION = 5
+PIPELINE_VERSION = 6
+REPORT_NAME = "report.json"
 
 AUDIO_SUFFIXES = (".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".opus", ".wma")
 
@@ -76,13 +84,12 @@ class Inputs:
 
 @dataclass(frozen=True, slots=True)
 class Analysis:
-    """Everything the renderers need, loaded from the workspace after analysis."""
+    """Everything a renderer displays, loaded from one workspace analysis."""
 
     score: Score
     route: Route
-    layout: StaffLayout
     alignment: Alignment
-    audio_duration: float
+    layout: StaffLayout | None
     flow: FlowLayout | None
     align_report: dict[str, Any]
 
@@ -97,13 +104,39 @@ def _tool_versions(*names: str) -> dict[str, str]:
     return versions
 
 
-def _symbolic_step(inputs: Inputs, workspace: workdir.Workspace) -> tuple[Score, Path | None]:
+def _input_records(inputs: Inputs) -> dict[str, dict[str, Any]]:
+    """Path, size and content hash of every file a run reads, by the name the report uses."""
+    files = {"pdf": inputs.pdf, "audio": inputs.audio, "symbolic": inputs.symbolic}
+    optional = (
+        ("route_override", inputs.route_override),
+        ("anchors", inputs.anchors),
+        ("staff_override", inputs.staff_override),
+    )
+    files |= {name: path for name, path in optional if path is not None}
+    return {
+        name: {
+            "path": str(path.resolve()),
+            "bytes": path.stat().st_size,
+            "sha256": workdir.digest_file(path),
+        }
+        for name, path in files.items()
+    }
+
+
+def _digests(records: dict[str, dict[str, Any]]) -> dict[str, str]:
+    """One sha256 per input file, for the cache keys of the steps that read it."""
+    return {name: record["sha256"] for name, record in records.items()}
+
+
+def _symbolic_step(
+    inputs: Inputs, digests: dict[str, str], workspace: workdir.Workspace
+) -> tuple[Score, Path | None]:
     from . import symbolic
 
     step = workspace.step("symbolic")
     written = step.path / "written.musicxml" if inputs.provider == "musicxml" else None
-    key = workdir.fingerprint(
-        {"symbolic": inputs.symbolic},
+    key = workdir.key(
+        {"symbolic": digests["symbolic"]},
         {"provider": inputs.provider, **_tool_versions("partitura", "lxml")},
     )
 
@@ -114,7 +147,11 @@ def _symbolic_step(inputs: Inputs, workspace: workdir.Workspace) -> tuple[Score,
             "written": written.relative_to(step.path).as_posix() if written else None,
         }
 
-    payload = step.run(key, compute)
+    def present(payload: dict[str, Any]) -> bool:
+        name = payload["written"]
+        return name is None or (step.path / name).is_file()
+
+    payload = step.run(key, compute, validate=present)
     score = Score.from_dict(payload["score"])
     written_path = step.path / payload["written"] if payload["written"] else None
     logger.info(
@@ -127,104 +164,77 @@ def _symbolic_step(inputs: Inputs, workspace: workdir.Workspace) -> tuple[Score,
     return score, written_path
 
 
-def _route_step(inputs: Inputs, score: Score, workspace: workdir.Workspace) -> Route:
-    from . import symbolic
-
-    step = workspace.step("route")
-    files = {"symbolic": inputs.symbolic}
-    if inputs.route_override is not None:
-        files["route_override"] = inputs.route_override
-    key = workdir.fingerprint(files, {"provider": score.provider, **_tool_versions("lxml")})
-
-    def compute(_: Path) -> dict[str, Any]:
-        return symbolic.build_route(score, override=inputs.route_override).to_dict()
-
-    route = Route.from_dict(step.run(key, compute))
-    logger.info(
-        "route: %s, %d measure passes, %.1f quarter notes",
-        route.source,
-        len(route.passes),
-        route.total_q,
-    )
-    return route
-
-
-def _staffs_step(inputs: Inputs, score: Score, workspace: workdir.Workspace) -> StaffLayout:
+def _pdf_step(
+    inputs: Inputs,
+    digests: dict[str, str],
+    score: Score,
+    workspace: workdir.Workspace,
+    debug_images: bool,
+) -> StaffLayout:
+    """Detect the staff geometry of the PDF; the measure binding is not part of this payload."""
     from . import pdf
 
-    step = workspace.step("staffs")
-    key = workdir.fingerprint(
-        {"pdf": inputs.pdf},
+    step = workspace.step("pdf")
+    expected_staves = score.staff_count
+    key = workdir.key(
+        {"pdf": digests["pdf"]},
         {
-            "expected_staves": score.staff_count,
+            "expected_staves": expected_staves,
+            # The request decides which side files the step writes, so it belongs to its key.
+            "debug_images": debug_images,
             **_tool_versions("pymupdf", "opencv-python-headless"),
         },
     )
 
     def compute(path: Path) -> dict[str, Any]:
-        layout = pdf.detect_layout(
-            inputs.pdf, expected_staves=score.staff_count, debug_dir=path / "debug"
-        )
-        return layout.to_dict()
+        return pdf.detect_layout(
+            inputs.pdf,
+            expected_staves=expected_staves,
+            debug_dir=path / "debug" if debug_images else None,
+        ).to_dict()
 
     layout = StaffLayout.from_dict(step.run(key, compute))
-    logger.info("staffs: %d systems on %d pages", len(layout.systems), len(layout.pages))
+    logger.info("pdf: %d systems on %d pages", len(layout.systems), len(layout.pages))
     return layout
 
 
-def _bound_step(
-    inputs: Inputs, layout: StaffLayout, score: Score, workspace: workdir.Workspace
-) -> StaffLayout:
-    from . import pdf
-
-    step = workspace.step("staffs-bound")
-    files = {"symbolic": inputs.symbolic}
-    if inputs.staff_override is not None:
-        files["staff_override"] = inputs.staff_override
-    key = workdir.fingerprint(
-        files,
-        {
-            "layout": workdir.hash_payload(layout.to_dict()),
-            "score": workdir.hash_payload(score.to_dict()),
-            **_tool_versions(),
-        },
-    )
-
-    def compute(_: Path) -> dict[str, Any]:
-        return pdf.bind_measures(layout, score, override=inputs.staff_override).to_dict()
-
-    bound = StaffLayout.from_dict(step.run(key, compute))
-    return bound
-
-
 def _align_step(
-    inputs: Inputs, score: Score, route: Route, workspace: workdir.Workspace
+    inputs: Inputs,
+    digests: dict[str, str],
+    score: Score,
+    score_digest: str,
+    route: Route,
+    workspace: workdir.Workspace,
 ) -> tuple[Alignment, dict[str, Any]]:
     from . import align
 
     step = workspace.step("align")
-    files = {"symbolic": inputs.symbolic, "audio": inputs.audio}
+    digests_for_key = {"audio": digests["audio"]}
     if inputs.anchors is not None:
-        files["anchors"] = inputs.anchors
-    key = workdir.fingerprint(
-        files,
+        digests_for_key["anchors"] = digests["anchors"]
+    key = workdir.key(
+        digests_for_key,
         {
+            # The attacks the aligner hears come from the written score as much as from the route.
+            "score": score_digest,
             "route": workdir.hash_payload(route.to_dict()),
             **_tool_versions("librosa", "numpy"),
         },
     )
 
     def compute(path: Path) -> dict[str, Any]:
-        alignment = align.align(
+        return align.align(
             score,
             route,
             inputs.audio,
             work_dir=path,
             constraints=inputs.anchors,
-        )
-        return alignment.to_dict()
+        ).to_dict()
 
-    alignment = Alignment.from_dict(step.run(key, compute))
+    def present(payload: dict[str, Any]) -> bool:
+        return (step.path / "report.json").is_file()
+
+    alignment = Alignment.from_dict(step.run(key, compute, validate=present))
     report_path = step.path / "report.json"
     report: dict[str, Any] = workdir.read_json(report_path) if report_path.is_file() else {}
     logger.info(
@@ -238,20 +248,21 @@ def _align_step(
 
 def _flow_step(
     score: Score,
+    score_digest: str,
     written: Path,
-    workspace: workdir.Workspace,
     spec: VideoSpec,
+    workspace: workdir.Workspace,
 ) -> FlowLayout:
     from . import flow
     from .render.flow import CONTENT_HEIGHT_RATIO
 
     step = workspace.step("flow")
     target_height = int(spec.height * CONTENT_HEIGHT_RATIO)
-    key = workdir.fingerprint(
-        {"written": written},
+    key = workdir.key(
+        {"written": workdir.digest_file(written)},
         {
+            "score": score_digest,
             "target_content_height": target_height,
-            "score": workdir.hash_payload(score.to_dict()),
             "paper": spec.background,
             **_tool_versions("verovio", "resvg-py"),
         },
@@ -266,7 +277,10 @@ def _flow_step(
             paper=spec.background,
         ).to_dict()
 
-    layout = FlowLayout.from_dict(step.run(key, compute))
+    def present(payload: dict[str, Any]) -> bool:
+        return all((step.path / tile["path"]).is_file() for tile in payload["tiles"])
+
+    layout = FlowLayout.from_dict(step.run(key, compute, validate=present))
     logger.info(
         "flow: strip %.0f x %.0f units, %d tiles",
         layout.strip_width,
@@ -281,87 +295,186 @@ def analyze(
     workspace: workdir.Workspace,
     *,
     spec: VideoSpec,
+    with_pdf: bool = True,
     with_flow: bool = False,
+    debug_images: bool = False,
 ) -> Analysis:
-    """Run the analysis stages ``with_flow`` and ``with_flow`` imply, reusing cached steps."""
+    """Run exactly the analysis stages the requested outputs need, reusing cached steps.
+
+    ``with_pdf`` adds the staff geometry ``switch`` displays, ``with_flow`` the engraved strip
+    ``flow`` displays, and ``debug_images`` the diagnostic bitmaps of the PDF detection. The merged
+    ``<workspace>/report.json`` is written from the result.
+    """
     inputs.validate()
     if with_flow and inputs.provider != "musicxml":
         raise UnsupportedInputError(
             "flow mode requires MusicXML or MXL: MIDI has no engraving semantics"
         )
     started = time.monotonic()
-    score, written = _symbolic_step(inputs, workspace)
-    route = _route_step(inputs, score, workspace)
-    layout = _bound_step(inputs, _staffs_step(inputs, score, workspace), score, workspace)
-    alignment, report = _align_step(inputs, score, route, workspace)
+    timings: dict[str, float] = {}
+    records = _input_records(inputs)
+    digests = _digests(records)
+
+    stage = time.monotonic()
+    score, written = _symbolic_step(inputs, digests, workspace)
+    timings["symbolic"] = round(time.monotonic() - stage, 3)
+
+    from . import symbolic
+
+    route = symbolic.build_route(score, override=inputs.route_override)
+    logger.info(
+        "route: %s, %d measure passes, %.1f quarter notes",
+        route.source,
+        len(route.passes),
+        route.total_q,
+    )
+    score_digest = workdir.hash_payload(score.to_dict())
+
+    layout = None
+    if with_pdf:
+        from . import pdf
+
+        stage = time.monotonic()
+        layout = pdf.bind_measures(
+            _pdf_step(inputs, digests, score, workspace, debug_images),
+            score,
+            override=inputs.staff_override,
+        )
+        timings["pdf"] = round(time.monotonic() - stage, 3)
+        logger.info(
+            "measures: %d of %d systems bound to a measure range",
+            sum(1 for system in layout.systems if system.first_measure is not None),
+            len(layout.systems),
+        )
+
+    stage = time.monotonic()
+    alignment, align_report = _align_step(inputs, digests, score, score_digest, route, workspace)
+    timings["align"] = round(time.monotonic() - stage, 3)
+
     flow_layout = None
     if with_flow:
         assert written is not None, "flow mode requires a written MusicXML file"
-        flow_layout = _flow_step(score, written, workspace, spec)
-    audio_info = audio.probe(inputs.audio)
+        stage = time.monotonic()
+        flow_layout = _flow_step(score, score_digest, written, spec, workspace)
+        timings["flow"] = round(time.monotonic() - stage, 3)
+
+    timings["total"] = round(time.monotonic() - started, 3)
     analysis = Analysis(
         score=score,
         route=route,
-        layout=layout,
         alignment=alignment,
-        audio_duration=audio_info.duration,
+        layout=layout,
         flow=flow_layout,
-        align_report=report,
+        align_report=align_report,
     )
-    write_provenance(workspace, inputs, analysis, spec)
-    logger.info("analysis finished in %.1f s", time.monotonic() - started)
+    _write_report(workspace, records, spec, analysis, timings, debug_images)
+    logger.info("analysis finished in %.1f s", timings["total"])
     return analysis
 
 
-def write_provenance(
-    workspace: workdir.Workspace, inputs: Inputs, analysis: Analysis, spec: VideoSpec
+def _write_report(
+    workspace: workdir.Workspace,
+    records: dict[str, dict[str, Any]],
+    spec: VideoSpec,
+    analysis: Analysis,
+    timings: dict[str, float],
+    debug_images: bool,
 ) -> Path:
-    """Record what produced this run: input paths and hashes, tools, spec and the verdict.
+    """Write the one report of a run: inputs, tools, summaries, checks, artifacts and timings.
 
-    The step directories keep opaque cache keys; this file is the readable evidence trail the plan
-    asks for ("save the input fingerprints and the reviewed evidence"), and it is what makes a
-    delivered video traceable back to its materials.
+    The alignment contributes its headline numbers only; the measured evidence stays in the
+    ``align/report.json`` this maps under ``artifacts``. ``artifacts.videos`` stays empty until a
+    render adds its mode, and names only files that exist.
     """
-    files = {"pdf": inputs.pdf, "audio": inputs.audio, "symbolic": inputs.symbolic}
-    optional = (
-        ("route_override", inputs.route_override),
-        ("anchors", inputs.anchors),
-        ("staff_override", inputs.staff_override),
-    )
-    files |= {name: path for name, path in optional if path is not None}
+    score = analysis.score
+    route = analysis.route
+    alignment = analysis.alignment
+    layout = analysis.layout
+    flow = analysis.flow
+    evidence = analysis.align_report
+    align_dir = workspace.step("align").path
+    align_report = align_dir / "report.json"
+    figure = align_dir / "alignment.png"
+    debug_dir = workspace.step("pdf").path / "debug"
     payload = {
-        "inputs": {
-            name: {
-                "path": str(path.resolve()),
-                "bytes": path.stat().st_size,
-                "sha256": workdir.sha256_file(path),
-            }
-            for name, path in files.items()
-        },
+        "inputs": records,
         "tools": _tool_versions(
             "partitura", "pymupdf", "opencv-python-headless", "verovio", "resvg-py", "librosa"
         ),
         "spec": spec.to_dict(),
-        "provider": analysis.score.provider,
-        "measures": len(analysis.score.measures),
-        "written_notes": len(analysis.score.notes),
+        "score": {
+            "provider": score.provider,
+            "title": score.title,
+            "staves": score.staff_count,
+            "parts": [
+                {"id": part.id, "name": part.name, "staves": part.staves} for part in score.parts
+            ],
+            "measures": len(score.measures),
+            "written_notes": len(score.notes),
+            "total_q": round(score.total_q, 3),
+            "unconfirmed": list(score.unconfirmed),
+        },
         "route": {
-            "source": analysis.route.source,
-            "passes": len(analysis.route.passes),
-            "notes": len(analysis.route.notes),
-            "total_q": analysis.route.total_q,
-            "unconfirmed": list(analysis.route.unconfirmed),
+            "source": route.source,
+            "passes": len(route.passes),
+            "notes": len(route.notes),
+            "total_q": round(route.total_q, 3),
+            "unconfirmed": list(route.unconfirmed),
+        },
+        "layout": None
+        if layout is None
+        else {
+            "pages": len(layout.pages),
+            "systems": len(layout.systems),
+            "bound_systems": sum(
+                1 for system in layout.systems if system.first_measure is not None
+            ),
+            "unconfirmed": list(layout.unconfirmed),
         },
         "alignment": {
-            "method": analysis.alignment.method,
-            "anchors": len(analysis.alignment.anchors),
-            "unconfirmed": list(analysis.alignment.unconfirmed),
+            "method": alignment.method,
+            "anchors": len(alignment.anchors),
+            "audio_duration": round(alignment.audio_duration, 3),
+            "implied_bpm": round(_implied_bpm(analysis), 2),
+            "similarity_mean": evidence.get("similarity_mean"),
+            "coverage": evidence.get("coverage"),
+            "residual_ms": evidence.get("residual_ms"),
+            "unconfirmed": list(alignment.unconfirmed),
+        },
+        "flow": None
+        if flow is None
+        else {
+            "strip_width": round(flow.strip_width, 1),
+            "strip_height": round(flow.strip_height, 1),
+            "tiles": len(flow.tiles),
+            "scale": flow.scale,
+            "note_coverage": round(len(flow.note_x) / len(score.notes), 4),
         },
         "checks": checks(analysis),
+        "artifacts": {
+            "align_report": str(align_report.resolve()) if align_report.is_file() else None,
+            "alignment_figure": str(figure.resolve()) if figure.is_file() else None,
+            "debug_images": str(debug_dir.resolve())
+            if debug_images and debug_dir.is_dir()
+            else None,
+            "videos": {},
+        },
+        "timings": timings,
     }
-    path = workspace.root / "run.json"
+    path = workspace.root / REPORT_NAME
     workdir.write_json(path, payload)
+    logger.info("wrote report %s", path)
     return path
+
+
+def _record_video(workspace: workdir.Workspace, mode: Mode, video: Path) -> None:
+    """Add the video this render produced to the report, next to the other mode's."""
+    path = workspace.root / REPORT_NAME
+    if not path.is_file():
+        return
+    report = workdir.read_json(path)
+    report.setdefault("artifacts", {}).setdefault("videos", {})[mode] = str(video)
+    workdir.write_json(path, report)
 
 
 def render(
@@ -372,34 +485,32 @@ def render(
     out: Path,
     spec: VideoSpec,
     preview: float | None = None,
+    analysis: Analysis | None = None,
 ) -> Path:
-    """Render one video and return its path."""
+    """Render one video and return its path.
+
+    Without ``analysis`` the stages the mode displays run first; with one, the analysis must
+    already carry what the mode needs (``layout`` for ``switch``, ``flow`` for ``flow``).
+    """
     from . import render as renderer
 
     assert mode in ("switch", "flow")
-    analysis = analyze(inputs, workspace, spec=spec, with_flow=mode == "flow")
-    step = workspace.step(f"render-{mode}")
-    out = out if out.is_absolute() else Path.cwd() / out
-    out.parent.mkdir(parents=True, exist_ok=True)
-    key = workdir.hash_payload(
-        {
-            "mode": mode,
-            "out": str(out),
-            "spec": spec.to_dict(),
-            "preview": preview,
-            "route": workdir.hash_payload(analysis.route.to_dict()),
-            "alignment": analysis.alignment.to_dict(),
-            "layout": analysis.layout.to_dict(),
-            "flow": analysis.flow.to_dict() if analysis.flow else None,
-            **_tool_versions("verovio", "pymupdf"),
-        }
-    )
-    cached = step.cached(key)
-    if cached is not None and Path(cached["out"]).is_file():
-        logger.info("render %s: cached video at %s", mode, cached["out"])
-        return Path(cached["out"])
-
-    step.path.mkdir(parents=True, exist_ok=True)
+    if analysis is None:
+        analysis = analyze(
+            inputs,
+            workspace,
+            spec=spec,
+            with_pdf=mode == "switch",
+            with_flow=mode == "flow",
+        )
+    if mode == "switch":
+        assert analysis.layout is not None, "switch rendering needs the PDF staff layout"
+    else:
+        assert analysis.flow is not None, "flow rendering needs the engraved flow layout"
+    target = out if out.is_absolute() else Path.cwd() / out
+    target.parent.mkdir(parents=True, exist_ok=True)
+    work_dir = workspace.root / f"render-{mode}"
+    work_dir.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
     if mode == "switch":
         produced = renderer.render_switch(
@@ -408,27 +519,25 @@ def render(
             layout=analysis.layout,
             alignment=analysis.alignment,
             spec=spec,
-            out=out,
-            work_dir=step.path,
+            out=target,
+            work_dir=work_dir,
             preview=preview,
-            pdf=inputs.pdf,
             audio=inputs.audio,
+            pdf=inputs.pdf,
         )
     else:
-        assert analysis.flow is not None, "flow layout was not built"
-        # Tile paths in FlowLayout are relative to the flow step directory, where the engraver
-        # wrote them, so the renderer works there; its cache metadata stays in this step.
         produced = renderer.render_flow(
             route=analysis.route,
             alignment=analysis.alignment,
             flow=analysis.flow,
             spec=spec,
-            out=out,
-            work_dir=workspace.step("flow").path,
+            out=target,
+            work_dir=work_dir,
+            tiles_dir=workspace.step("flow").path,
             preview=preview,
             audio=inputs.audio,
         )
-    step.store(key, {"out": str(produced), "seconds": round(time.monotonic() - started, 3)})
+    _record_video(workspace, mode, produced)
     logger.info("rendered %s in %.1f s", produced, time.monotonic() - started)
     return produced
 
@@ -461,41 +570,79 @@ def discover_case(directory: Path) -> tuple[Path, Path, Path]:
 
 @dataclass(frozen=True, slots=True)
 class BatchTask:
-    """One (case, mode) attempt, picklable so a batch can run in worker processes."""
+    """One case of a batch, picklable so a batch can run in worker processes."""
 
     case: str
-    mode: Mode
     inputs: Inputs
-    out: Path
+    out_dir: Path
     work_dir: Path
     spec: VideoSpec
     preview: float | None
+    modes: tuple[Mode, ...]
 
 
-def run_batch_task(task: BatchTask) -> dict[str, Any]:
-    """Render one batch task and describe the outcome; never raises for a case failure."""
+def run_case_task(task: BatchTask) -> list[dict[str, Any]]:
+    """Analyse one case once, render every requested mode and return one record per mode.
+
+    ``seconds`` is that mode's render time: the analysis is shared, so it is not charged twice.
+    """
     started = time.monotonic()
-    record: dict[str, Any] = {
-        "case": task.case,
-        "mode": task.mode,
-        "ok": False,
-        "out": str(task.out),
-    }
+    workspace = workdir.Workspace(task.work_dir)
+
+    def out_path(mode: Mode) -> Path:
+        return task.out_dir / f"{task.case}.{mode}.mp4"
+
     try:
-        produced = render(
+        analysis = analyze(
             task.inputs,
-            workdir.Workspace(task.work_dir),
-            mode=task.mode,
-            out=task.out,
+            workspace,
             spec=task.spec,
-            preview=task.preview,
+            with_pdf="switch" in task.modes,
+            with_flow="flow" in task.modes,
         )
-        record["ok"] = True
-        record["out"] = str(produced)
     except Exception as error:
-        record["error"] = f"{type(error).__name__}: {error}"
-    record["seconds"] = round(time.monotonic() - started, 1)
-    return record
+        # One shared analysis, so the cause is the same for every mode of this case.
+        detail = f"{type(error).__name__}: {error}"
+        seconds = round(time.monotonic() - started, 1)
+        return [
+            {
+                "case": task.case,
+                "mode": mode,
+                "ok": False,
+                "out": str(out_path(mode)),
+                "error": detail,
+                "seconds": seconds,
+            }
+            for mode in task.modes
+        ]
+
+    records: list[dict[str, Any]] = []
+    for mode in task.modes:
+        out = out_path(mode)
+        record: dict[str, Any] = {
+            "case": task.case,
+            "mode": mode,
+            "ok": False,
+            "out": str(out),
+        }
+        stage = time.monotonic()
+        try:
+            produced = render(
+                task.inputs,
+                workspace,
+                mode=mode,
+                out=out,
+                spec=task.spec,
+                preview=task.preview,
+                analysis=analysis,
+            )
+            record["ok"] = True
+            record["out"] = str(produced)
+        except Exception as error:
+            record["error"] = f"{type(error).__name__}: {error}"
+        record["seconds"] = round(time.monotonic() - stage, 1)
+        records.append(record)
+    return records
 
 
 def batch(
@@ -507,12 +654,13 @@ def batch(
     preview: float | None,
     jobs: int,
 ) -> list[dict[str, Any]]:
-    """Render every case in ``corpus`` for every requested mode; return one record per attempt."""
+    """Render every case in ``corpus`` for every requested mode; return one record per mode."""
     if not corpus.is_dir():
         raise InputError(f"corpus directory not found: {corpus}")
     cases = sorted(p for p in corpus.iterdir() if p.is_dir())
     if not cases:
         raise InputError(f"no case directories in {corpus}")
+    requested = tuple(modes)
     tasks: list[BatchTask] = []
     skipped: list[dict[str, Any]] = []
     for case in cases:
@@ -521,106 +669,112 @@ def batch(
         except InputError as error:
             skipped.append({"case": case.name, "mode": "-", "ok": False, "error": str(error)})
             continue
-        for mode in modes:
-            if mode == "flow" and symbolic.suffix.lower() in scorexml.MIDI_SUFFIXES:
-                skipped.append(
-                    {
-                        "case": case.name,
-                        "mode": mode,
-                        "ok": True,
-                        "skipped": "flow requires MusicXML or MXL",
-                    }
-                )
-                continue
-            tasks.append(
-                BatchTask(
-                    case=case.name,
-                    mode=mode,
-                    inputs=Inputs(pdf=pdf, audio=track, symbolic=symbolic),
-                    out=out_dir / f"{case.name}.{mode}.mp4",
-                    work_dir=out_dir / case.name / f"work-{mode}",
-                    spec=spec,
-                    preview=preview,
-                )
+        wanted = list(requested)
+        if "flow" in wanted and symbolic.suffix.lower() in scorexml.MIDI_SUFFIXES:
+            skipped.append(
+                {
+                    "case": case.name,
+                    "mode": "flow",
+                    "ok": True,
+                    "skipped": "flow requires MusicXML or MXL",
+                }
             )
+            wanted.remove("flow")
+        if not wanted:
+            continue
+        tasks.append(
+            BatchTask(
+                case=case.name,
+                inputs=Inputs(pdf=pdf, audio=track, symbolic=symbolic),
+                out_dir=out_dir,
+                work_dir=out_dir / case.name,
+                spec=spec,
+                preview=preview,
+                modes=tuple(wanted),
+            )
+        )
 
     if jobs <= 1:
-        records = [run_batch_task(task) for task in tasks]
+        per_case = [run_case_task(task) for task in tasks]
     else:
         from concurrent.futures import ProcessPoolExecutor
 
         with ProcessPoolExecutor(max_workers=jobs) as pool:
-            records = list(pool.map(run_batch_task, tasks))
-    return skipped + records
+            per_case = list(pool.map(run_case_task, tasks))
+    return skipped + [record for records in per_case for record in records]
 
 
 def _implied_bpm(analysis: Analysis) -> float:
-    if analysis.audio_duration <= 0:
-        return 0.0
-    return 60.0 * analysis.route.total_q / analysis.audio_duration
+    duration = analysis.alignment.audio_duration
+    return 60.0 * analysis.route.total_q / duration if duration > 0 else 0.0
 
 
 def checks(analysis: Analysis) -> list[dict[str, Any]]:
-    """Cross-check the artifacts against each other: the diagnostics of doc/PLAN.md 二.5.
+    """Cross-check the artifacts that exist against each other: the diagnostics of doc/PLAN.md 二.5.
 
     These are the comparisons that can be made without reading the PDF as notation: the staff count
     each printed system carries, the number of measures the printed barlines divide the page into,
     the tempo the recording implies for the route, the number of engraved notes the flow layout
-    resolved, and whether the aligner can stand behind its map.
+    resolved, and whether the aligner can stand behind its map. A check whose evidence was not
+    produced is absent rather than reported as passing.
     """
-    from .pdf.detect import MIN_MATCHING_SHARE
+    results: list[dict[str, Any]] = []
+    if analysis.layout is not None:
+        from .pdf.detect import MIN_MATCHING_SHARE
 
-    systems = analysis.layout.systems
-    expected_staves = analysis.score.staff_count
-    # Printed scores drop staves that stay empty (a vocal line during a piano interlude), so fewer
-    # staves than the score declares is normal; more staves than the piece has is a detection error.
-    floor = min(2, expected_staves)
-    plausible = sum(1 for system in systems if floor <= len(system.staves) <= expected_staves)
-    overfull = [system.index for system in systems if len(system.staves) > expected_staves]
-    staff_ratio = plausible / len(systems) if systems else 0.0
-    partial = sum(1 for system in systems if len(system.staves) < expected_staves)
-
-    detected_measures = sum(system.measure_count for system in systems)
-    score_measures = len(analysis.score.measures)
-    measure_ok = score_measures > 0 and abs(detected_measures - score_measures) <= max(
-        2, round(0.02 * score_measures)
-    )
+        systems = analysis.layout.systems
+        expected_staves = analysis.score.staff_count
+        # Printed scores drop staves that stay empty (a vocal line during a piano interlude), so
+        # fewer staves than the score declares is normal; more staves than the piece has is a
+        # detection error.
+        floor = min(2, expected_staves)
+        plausible = sum(1 for system in systems if floor <= len(system.staves) <= expected_staves)
+        overfull = [system.index for system in systems if len(system.staves) > expected_staves]
+        partial = sum(1 for system in systems if len(system.staves) < expected_staves)
+        staff_ratio = plausible / len(systems) if systems else 0.0
+        detected_measures = sum(system.measure_count for system in systems)
+        score_measures = len(analysis.score.measures)
+        measure_ok = score_measures > 0 and abs(detected_measures - score_measures) <= max(
+            2, round(0.02 * score_measures)
+        )
+        results.append(
+            {
+                "name": "staffs_per_system",
+                "ok": staff_ratio >= MIN_MATCHING_SHARE and not overfull,
+                "detail": (
+                    f"{plausible}/{len(systems)} printed systems carry {floor}..{expected_staves} "
+                    f"staves ({partial} have fewer, which is normal when a staff stays empty); "
+                    f"overfull systems: {overfull or 'none'}"
+                ),
+            }
+        )
+        results.append(
+            {
+                "name": "measure_count",
+                "ok": measure_ok,
+                "detail": (
+                    f"barlines give {detected_measures} measures, the symbolic score has "
+                    f"{score_measures}"
+                ),
+            }
+        )
 
     implied_bpm = _implied_bpm(analysis)
-
-    results = [
-        {
-            "name": "staffs_per_system",
-            "ok": staff_ratio >= MIN_MATCHING_SHARE and not overfull,
-            "detail": (
-                f"{plausible}/{len(systems)} printed systems carry {floor}..{expected_staves} "
-                f"staves ({partial} have fewer, which is normal when a staff stays empty); "
-                f"overfull systems: {overfull or 'none'}"
-            ),
-        },
-        {
-            "name": "measure_count",
-            "ok": measure_ok,
-            "detail": (
-                f"barlines give {detected_measures} measures, the symbolic score has "
-                f"{score_measures}"
-            ),
-        },
+    results.append(
         {
             "name": "tempo",
             "ok": 20.0 <= implied_bpm <= 300.0,
             "detail": f"the route implies {implied_bpm:.1f} quarter notes per minute",
-        },
+        }
+    )
+    unconfirmed = analysis.alignment.unconfirmed
+    results.append(
         {
             "name": "alignment_confidence",
-            "ok": not analysis.alignment.unconfirmed,
-            "detail": (
-                "the aligner reported no unconfirmed item"
-                if not analysis.alignment.unconfirmed
-                else "; ".join(analysis.alignment.unconfirmed)
-            ),
-        },
-    ]
+            "ok": not unconfirmed,
+            "detail": "; ".join(unconfirmed) or "the aligner reported no unconfirmed item",
+        }
+    )
     if analysis.flow is not None:
         resolved = len(analysis.flow.note_x)
         total = len(analysis.score.notes)
@@ -632,42 +786,3 @@ def checks(analysis: Analysis) -> list[dict[str, Any]]:
             }
         )
     return results
-
-
-def summary_payload(inputs: Inputs, analysis: Analysis) -> dict[str, Any]:
-    """Compact, JSON-serialisable description of an analysis, for ``musicflow analyze --json``."""
-    return {
-        "pdf": str(inputs.pdf),
-        "audio": str(inputs.audio),
-        "symbolic": str(inputs.symbolic),
-        "provider": analysis.score.provider,
-        "title": analysis.score.title,
-        "parts": [
-            {"id": part.id, "name": part.name, "staves": part.staves}
-            for part in analysis.score.parts
-        ],
-        "measures": len(analysis.score.measures),
-        "written_notes": len(analysis.score.notes),
-        "route_source": analysis.route.source,
-        "route_passes": len(analysis.route.passes),
-        "route_notes": len(analysis.route.notes),
-        "route_total_q": round(analysis.route.total_q, 3),
-        "systems": len(analysis.layout.systems),
-        "bound_systems": sum(1 for s in analysis.layout.systems if s.first_measure is not None),
-        "staff_layout_unconfirmed": list(analysis.layout.unconfirmed),
-        "route_unconfirmed": list(analysis.route.unconfirmed),
-        "alignment_unconfirmed": list(analysis.alignment.unconfirmed),
-        "alignment_method": analysis.alignment.method,
-        "anchors": len(analysis.alignment.anchors),
-        "audio_duration": round(analysis.audio_duration, 3),
-        "implied_bpm": round(_implied_bpm(analysis), 2),
-        "align_report": analysis.align_report,
-        "checks": checks(analysis),
-        "flow": None
-        if analysis.flow is None
-        else {
-            "strip_width": round(analysis.flow.strip_width, 1),
-            "tiles": len(analysis.flow.tiles),
-            "scale": analysis.flow.scale,
-        },
-    }

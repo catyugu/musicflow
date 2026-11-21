@@ -8,9 +8,9 @@ line (design.md section 五).
 
 from __future__ import annotations
 
+import bisect
 import logging
 import math
-import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -18,7 +18,7 @@ import numpy as np
 import pymupdf
 from PIL import Image
 
-from ..errors import InputError, RenderError
+from ..errors import AnalysisError, InputError, RenderError
 from ..model import Alignment, Route, Score, StaffLayout, System, VideoSpec
 from .canvas import FrameCache, blank, file_signature, paste
 from .encoder import encode
@@ -33,50 +33,47 @@ MARGIN_RATIO = 0.03
 
 @dataclass(frozen=True, slots=True)
 class SwitchPlan:
-    """Which system is on screen at a given recording time.
+    """Which system is on screen at a given frame.
 
-    ``times[i]`` is when ``systems[i]`` comes on screen. The entries follow the *performance* order,
-    so a repeated section appears again when the route returns to it: with a written repeat the same
-    system index can occur several times. ``system_at`` takes the last entry whose time is not after
-    the query, and the first entry covers everything before it.
+    ``times[i]`` is when ``systems[i]`` comes on screen and ``first_frame[i]`` is the first frame at
+    the plan's ``fps`` whose time reaches it. The entries follow the *performance* order, so a
+    repeated section appears again when the route returns to it: with a written repeat the same
+    system index can occur several times. ``system_at_frame`` takes the last entry whose first frame
+    is not after the query, and the first entry covers everything before it.
     """
 
     systems: tuple[System, ...]
     times: tuple[float, ...]
+    fps: int
+    first_frame: tuple[int, ...]
 
-    def system_at(self, seconds: float) -> System:
-        index = int(np.searchsorted(np.asarray(self.times), seconds, side="right")) - 1
+    def system_at_frame(self, frame: int) -> System:
+        index = bisect.bisect_right(self.first_frame, frame) - 1
         return self.systems[max(0, min(index, len(self.systems) - 1))]
 
 
 def plan_switch(
-    *, score: Score, route: Route, layout: StaffLayout, alignment: Alignment
+    *, score: Score, route: Route, layout: StaffLayout, alignment: Alignment, fps: int
 ) -> SwitchPlan:
     """Follow the performance and switch systems whenever the measure's system changes.
 
     The route is the authority: a written repeat that sends the performance back to measure 1 must
     put the first system back on screen, which a document-ordered list of systems cannot express.
+    Every system must carry its measure range; without it the route cannot drive the switch, and
+    ``pdf.bind_measures`` guarantees that it does.
     """
     by_measure: dict[int, System] = {}
+    unbound: list[int] = []
     for system in layout.systems:
         if system.first_measure is None or system.last_measure is None:
+            unbound.append(system.index)
             continue
         for measure in range(system.first_measure, system.last_measure + 1):
             by_measure.setdefault(measure, system)
-
-    bound = {system.index for system in by_measure.values()}
-    unbound = [system.index for system in layout.systems if system.index not in bound]
-    if not by_measure or unbound:
-        # Without a complete measure map the route cannot drive the switch; spread the printed
-        # systems over the performance instead and say so.
-        logger.warning(
-            "switch: %d of %d systems have no bound measure range; spreading them over the "
-            "performance proportionally",
-            len(unbound) if by_measure else len(layout.systems),
-            len(layout.systems),
+    if unbound:
+        raise AnalysisError(
+            f"switch: systems {unbound} have no bound measure range to follow the performance"
         )
-        times = _proportional_times(layout.systems, route, alignment)
-        return SwitchPlan(systems=layout.systems, times=tuple(times))
 
     known = {measure.index for measure in score.measures}
     stray = sorted(measure for measure in by_measure if measure not in known)
@@ -90,9 +87,7 @@ def plan_switch(
     first_onset: dict[tuple[int, int], float] = {}
     for note in route.notes:
         key = (note.measure, note.pass_index)
-        current = first_onset.get(key)
-        if current is None or note.onset_q < current:
-            first_onset[key] = note.onset_q
+        first_onset[key] = min(first_onset.get(key, note.onset_q), note.onset_q)
 
     visits: list[tuple[float, System]] = []
     for measure_pass in route.passes:
@@ -116,24 +111,14 @@ def plan_switch(
             missing[:8],
         )
     if not visits:
-        times = _proportional_times(layout.systems, route, alignment)
-        return SwitchPlan(systems=layout.systems, times=tuple(times))
+        raise AnalysisError("switch: no printed system covers a measure of the performance")
+    times = tuple(seconds for seconds, _ in visits)
     return SwitchPlan(
-        systems=tuple(system for _, system in visits), times=tuple(t for t, _ in visits)
+        systems=tuple(system for _, system in visits),
+        times=times,
+        fps=fps,
+        first_frame=tuple(math.ceil(seconds * fps) for seconds in times),
     )
-
-
-def _proportional_times(
-    systems: tuple[System, ...], route: Route, alignment: Alignment
-) -> list[float]:
-    """Fallback switch times: cut the performance's measure passes evenly between systems."""
-    passes = route.passes
-    total = len(systems)
-    times = []
-    for position in range(total):
-        first = min(len(passes) - 1, position * len(passes) // total)
-        times.append(alignment.time_at(passes[first].start_q))
-    return times
 
 
 def _page_dpis(layout: StaffLayout, spec: VideoSpec) -> dict[int, int]:
@@ -148,20 +133,8 @@ def _page_dpis(layout: StaffLayout, spec: VideoSpec) -> dict[int, int]:
     return {page: max(MIN_DPI, round(dpi)) for page, dpi in wanted.items()}
 
 
-def _page_raster(pdf: Path, page: int, dpi: int, work_dir: Path) -> np.ndarray:
-    cached = work_dir / f"page-{page:04d}-{dpi:03d}.png"
-    if not cached.is_file():
-        _write_page_raster(pdf, page, dpi, cached)
-    try:
-        with Image.open(cached) as image:
-            return np.array(image.convert("RGB"), dtype=np.uint8)
-    except OSError as error:
-        cached.unlink(missing_ok=True)
-        raise RenderError(f"cannot read the page raster {cached}: {error}") from error
-
-
-def _write_page_raster(pdf: Path, page: int, dpi: int, path: Path) -> None:
-    temporary = path.with_name(f"{path.stem}.part.png")
+def _page_raster(pdf: Path, page: int, dpi: int) -> np.ndarray:
+    """Rasterise one page in memory at the DPI its systems ask for."""
     try:
         with pymupdf.open(pdf) as document:
             if not 1 <= page <= document.page_count:
@@ -169,14 +142,12 @@ def _write_page_raster(pdf: Path, page: int, dpi: int, path: Path) -> None:
             pixmap = document.load_page(page - 1).get_pixmap(
                 dpi=dpi, colorspace=pymupdf.csRGB, alpha=False
             )
-            pixmap.save(temporary)
-        os.replace(temporary, path)
     except (pymupdf.FileDataError, FileNotFoundError) as error:
-        temporary.unlink(missing_ok=True)
         raise InputError(f"cannot open the score PDF {pdf}: {error}") from error
     except (RuntimeError, ValueError) as error:
-        temporary.unlink(missing_ok=True)
         raise RenderError(f"cannot rasterise page {page} of {pdf}: {error}") from error
+    image = Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples)
+    return np.array(image, dtype=np.uint8)
 
 
 def _system_frame(image: np.ndarray, dpi: int, system: System, spec: VideoSpec) -> np.ndarray:
@@ -217,17 +188,17 @@ def render_switch(
     """Render the switching view of the original PDF score and return the MP4 path."""
     if not pdf.is_file():
         raise InputError(f"score PDF not found: {pdf}")
-    plan = plan_switch(score=score, route=route, layout=layout, alignment=alignment)
+    plan = plan_switch(score=score, route=route, layout=layout, alignment=alignment, fps=spec.fps)
     dpis = _page_dpis(layout, spec)
     rasters = FrameCache(capacity=4)
     frames = FrameCache(capacity=4)
 
     def frame_at(index: int) -> np.ndarray:
-        system = plan.system_at(index / spec.fps)
+        system = plan.system_at_frame(index)
 
         def build() -> np.ndarray:
             dpi = dpis[system.page]
-            image = rasters.get(system.page, lambda: _page_raster(pdf, system.page, dpi, work_dir))
+            image = rasters.get(system.page, lambda: _page_raster(pdf, system.page, dpi))
             return _system_frame(image, dpi, system, spec)
 
         return frames.get(system.index, build)
@@ -243,7 +214,7 @@ def render_switch(
         parameters={
             "mode": "switch",
             "pdf": file_signature(pdf),
-            "systems": [[s.index, s.page, s.bbox.to_list()] for s in plan.systems],
+            "systems": [[s.index, s.page, s.bbox.to_dict()] for s in plan.systems],
             "times": list(plan.times),
             "dpi": sorted(dpis.items()),
         },

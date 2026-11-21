@@ -13,12 +13,13 @@ import logging
 from dataclasses import dataclass
 
 import numpy as np
+from scipy.fft import irfft, next_fast_len, rfft
 from scipy.signal import fftconvolve
 
-from musicflow.model import Route
+from musicflow.model import Route, Score
 
 from .dtw import DtwWeights, TimeMap, align_path
-from .features import AudioFeatures, build_score_grid
+from .features import ATTACK_DECAY, AudioFeatures, build_score_grid
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,11 @@ POSITION_ATTACK_WEIGHT = 0.5
 TIMING_ATTACK_WEIGHT = 5.0
 SMOOTH_PENALTY = (0.05, 3.2)
 SMOOTH_DEVIATION_SCALE = 0.10
+# smooth_penalty collapses to 0.05 on rubato (case1's medium path deviates 0.47), which would leave
+# the fine stage free to trade timing for chroma inside the corridor. The coarse and medium stages
+# already carry the tempo, so the fine stage's price of leaving the medium path never falls below
+# this floor; 0.5 is the low end that restores onset tracking without making the path rigid.
+FINE_MIN_SMOOTH_PENALTY = 0.5
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,29 +55,39 @@ class Hypothesis:
     similarity: float
 
 
-@dataclass(frozen=True, slots=True)
-class Stages:
-    """The three paths of the refinement chain plus the hypothesis that started it."""
-
-    coarse: TimeMap
-    medium: TimeMap
-    fine: TimeMap
-    hypothesis: Hypothesis
-    hypotheses: tuple[Hypothesis, ...]
-
-
 def pool_factor(features: AudioFeatures, seconds: float) -> int:
     """Frame decimation that turns one audio column into ``seconds`` of recording."""
     return max(1, round(seconds * features.rate))
 
 
+def _audio_spectrum(chroma: np.ndarray, length: int) -> np.ndarray:
+    """The recording chroma in the frequency domain, transformed once for the whole scan.
+
+    Rows are pitch classes and columns are time; the transpose puts frequency last so a score
+    sequence can meet it directly. Every tempo hypothesis convolves the same recording, so doing
+    this per hypothesis would only recompute the same transform.
+    """
+    return rfft(np.asarray(chroma, dtype=np.float64), length, axis=1).T
+
+
+def _correlation(spectrum: np.ndarray, sequence: np.ndarray, length: int) -> np.ndarray:
+    """Correlation curve of one resampled score sequence against the shared recording spectrum.
+
+    ``sequence`` is ``(columns, pitch classes)``. The curve has one entry per lag of the full
+    convolution of every recording row with the reversed score column, summed over pitch classes,
+    which is exactly what convolving the two sequences directly produces.
+    """
+    reversed_score = rfft(np.asarray(sequence, dtype=np.float64)[::-1], length, axis=0)
+    return irfft((reversed_score * spectrum).sum(axis=1), length)
+
+
 def affine_hypotheses(
-    features: AudioFeatures, route: Route, *, limit: int = HYPOTHESIS_LIMIT
+    features: AudioFeatures, score: Score, route: Route, *, limit: int = HYPOTHESIS_LIMIT
 ) -> list[Hypothesis]:
     """Best (scale, offset) pairs of a rigid score-to-recording fit, most promising first."""
     expected = features.duration / route.total_q
     audio = features.pooled(pool_factor(features, HYPOTHESIS_COLUMN_SECONDS))
-    grid = build_score_grid(route, HYPOTHESIS_SCORE_STEP_Q)
+    grid = build_score_grid(score, route, HYPOTHESIS_SCORE_STEP_Q)
     frames = audio.frames
     seconds = np.arange(frames) / audio.rate
     max_lag = round(min(HYPOTHESIS_OFFSET_SECONDS, 0.5 * features.duration) * audio.rate)
@@ -81,18 +97,16 @@ def affine_hypotheses(
     overlap = np.maximum(
         fftconvolve(ones, ones, "full")[centre - max_lag : centre + max_lag + 1], 1.0
     )
+    window = slice(centre - max_lag, centre + max_lag + 1)
+    length = next_fast_len(2 * frames - 1)
+    spectrum = _audio_spectrum(audio.chroma, length)
     results: list[Hypothesis] = []
     for relative in np.geomspace(*HYPOTHESIS_SCALE_RANGE, HYPOTHESIS_SCALES):
         scale = expected * relative
         rows = np.clip(
             np.rint(seconds / scale / HYPOTHESIS_SCORE_STEP_Q).astype(np.int64), 0, grid.cells - 1
         )
-        sequence = grid.chroma[rows]
-        total = np.zeros(lags.size)
-        for pitch_class in range(12):
-            total += fftconvolve(audio.chroma[pitch_class], sequence[::-1, pitch_class], "full")[
-                centre - max_lag : centre + max_lag + 1
-            ]
+        total = _correlation(spectrum, grid.chroma[rows], length)[window]
         similarity = total / overlap
         best = int(np.argmax(similarity))
         results.append(
@@ -117,14 +131,14 @@ def affine_hypotheses(
 
 
 def _coarse(
-    features: AudioFeatures, route: Route, hypotheses: list[Hypothesis]
+    features: AudioFeatures, score: Score, route: Route, hypotheses: list[Hypothesis]
 ) -> tuple[TimeMap, Hypothesis]:
     audio = features.pooled(pool_factor(features, COARSE_COLUMN_SECONDS))
     band = round(max(COARSE_BAND_SECONDS, COARSE_BAND_RATIO * features.duration) * audio.rate)
     best: tuple[float, TimeMap, Hypothesis] | None = None
     for hypothesis in hypotheses:
         step_q = (1.0 / audio.rate) / hypothesis.scale
-        grid = build_score_grid(route, step_q)
+        grid = build_score_grid(score, route, step_q)
         centre = np.arange(grid.cells, dtype=np.float64) + hypothesis.offset * audio.rate
         path = align_path(grid, audio, centre=centre, half_width=band)
         logger.info(
@@ -180,19 +194,22 @@ def smooth_penalty(deviation: float) -> float:
 def _refine(
     source: TimeMap,
     features: AudioFeatures,
+    score: Score,
     route: Route,
     *,
     column_seconds: float,
     band_seconds: float,
     scale: float,
     attack: float,
+    attack_decay: tuple[tuple[int, float], ...] = (),
+    penalty_floor: float = 0.0,
 ) -> TimeMap:
     audio = features.pooled(pool_factor(features, column_seconds))
     step_q = (1.0 / audio.rate) / scale
-    grid = build_score_grid(route, step_q)
+    grid = build_score_grid(score, route, step_q, attack_decay=attack_decay)
     centre = source.at(np.arange(1, grid.cells + 1) * step_q) * audio.rate
     deviation = tempo_deviation(source)
-    penalty = smooth_penalty(deviation)
+    penalty = max(penalty_floor, smooth_penalty(deviation))
     weights = DtwWeights(attack=attack, fast_step=penalty, slow_step=penalty)
     path = align_path(
         grid,
@@ -213,15 +230,20 @@ def _refine(
     return path
 
 
-def staged_path(features: AudioFeatures, route: Route) -> Stages:
-    """Coarse, medium and fine paths; each stage narrows the corridor of the next."""
+def staged_path(features: AudioFeatures, score: Score, route: Route) -> tuple[TimeMap, Hypothesis]:
+    """Coarse, medium and fine paths; each stage narrows the corridor of the next.
+
+    Returns the fine path and the hypothesis that seeded the chain. The coarse and medium paths are
+    working state of the chain: only the fine path is read downstream.
+    """
     expected = features.duration / route.total_q
-    hypotheses = affine_hypotheses(features, route)
+    hypotheses = affine_hypotheses(features, score, route)
     assert hypotheses, "no tempo hypothesis could be formed"
-    coarse, winner = _coarse(features, route, hypotheses)
+    coarse, winner = _coarse(features, score, route, hypotheses)
     medium = _refine(
         coarse,
         features,
+        score,
         route,
         column_seconds=MEDIUM_COLUMN_SECONDS,
         band_seconds=MEDIUM_BAND_SECONDS,
@@ -231,16 +253,13 @@ def staged_path(features: AudioFeatures, route: Route) -> Stages:
     fine = _refine(
         medium,
         features,
+        score,
         route,
         column_seconds=1.0 / features.rate,
         band_seconds=FINE_BAND_SECONDS,
         scale=expected,
         attack=TIMING_ATTACK_WEIGHT,
+        attack_decay=ATTACK_DECAY,
+        penalty_floor=FINE_MIN_SMOOTH_PENALTY,
     )
-    return Stages(
-        coarse=coarse,
-        medium=medium,
-        fine=fine,
-        hypothesis=winner,
-        hypotheses=tuple(hypotheses),
-    )
+    return fine, winner

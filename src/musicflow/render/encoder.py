@@ -31,6 +31,13 @@ from .canvas import parameters_digest
 logger = logging.getLogger(__name__)
 
 SEGMENT_FRAMES = 600
+# x264 speed preset for the segment encoder. Measured on the real case1 flow preview (1920x1080,
+# 10 s = 300 frames, crf 18, median of three runs): medium 1.55 s wall / 17.6 s cpu / 2.08 MB,
+# faster 1.22 s / 12.8 s / 2.40 MB (+15.1%), veryfast 1.09 s / 9.75 s / 2.56 MB (+23.2%). No
+# faster preset is both ~1.8x quicker and at most ~15% larger, and at 1920x1080 the encode step adds
+# ~5 ms/frame of wall time to a frame source that needs 25-90 ms/frame, so the preset cannot shorten
+# a render by more than a few percent; 15-23% more bytes for that is not worth it.
+X264_PRESET = "medium"
 _DURATION_TOLERANCE = 0.1
 _STDERR_TAIL = 4000
 
@@ -43,6 +50,13 @@ class Timeline:
 
     seconds: float
     frames: int
+
+
+# Where the most recently completed encode spent its wall time: total, inside the frame source
+# (composing), blocked writing frames into ffmpeg's stdin (feeding, also the encoder holding the
+# producer back), and muxing. The acceptance harness reads it; rendering is one video at a time in
+# this process, so no result object has to be threaded through the render signatures.
+LAST_STATS: dict[str, float | int] | None = None
 
 
 def require_tool(name: str) -> str:
@@ -69,17 +83,28 @@ def encode(
     preview: float | None,
     kind: str,
     parameters: Mapping[str, Any],
+    timeline: Timeline | None = None,
     segment_frames: int = SEGMENT_FRAMES,
 ) -> Path:
-    """Encode every frame of the timeline and mux the recording; return the MP4 path."""
+    """Encode every frame of the timeline and mux the recording; return the MP4 path.
+
+    ``timeline`` lets a caller that already probed the recording (to precompute its per-frame state)
+    hand the span in, so the audio is not probed a second time.
+    """
     ffmpeg = require_tool("ffmpeg")
     ffprobe = require_tool("ffprobe")
-    timeline = plan_timeline(probe_audio(audio).duration, spec, preview)
+    if timeline is None:
+        timeline = plan_timeline(probe_audio(audio).duration, spec, preview)
     _prepare_directory(work_dir)
     _ensure_writable(out)
 
+    started = time.perf_counter()
     digest = parameters_digest(kind, spec, parameters)
     segments: list[Path] = []
+    composing = 0.0
+    feeding = 0.0
+    encoded = 0
+    cached = 0
     count = math.ceil(timeline.frames / segment_frames)
     logger.info(
         "%s: %d frames at %d fps (%.2f s), %d segment(s)",
@@ -96,9 +121,10 @@ def encode(
         segments.append(path)
         if _segment_is_usable(path, frames, ffprobe):
             logger.info("%s: segment %d/%d cached", kind, index + 1, count)
+            cached += 1
             continue
-        started = time.perf_counter()
-        _encode_segment(
+        began = time.perf_counter()
+        composing_spent, feeding_spent = _encode_segment(
             frame_at,
             start=start,
             frames=frames,
@@ -107,7 +133,10 @@ def encode(
             ffmpeg=ffmpeg,
             label=f"{kind} segment {index + 1}/{count}",
         )
-        elapsed = time.perf_counter() - started
+        elapsed = time.perf_counter() - began
+        composing += composing_spent
+        feeding += feeding_spent
+        encoded += frames
         written = _segment_frames(path, ffprobe)
         if written != frames:
             raise RenderError(
@@ -124,6 +153,7 @@ def encode(
         )
 
     _drop_stale(work_dir, kind, keep=set(segments))
+    muxing_started = time.perf_counter()
     concat = _write_concat(work_dir, kind, digest, segments)
     measured = _mux(
         concat=concat,
@@ -134,7 +164,24 @@ def encode(
         ffprobe=ffprobe,
         preview=preview,
     )
-    logger.info("%s: wrote %s, %.2f s", kind, out, measured)
+    muxing = time.perf_counter() - muxing_started
+    global LAST_STATS
+    LAST_STATS = {
+        "seconds": round(time.perf_counter() - started, 3),
+        "composing": round(composing, 3),
+        "feeding": round(feeding, 3),
+        "muxing": round(muxing, 3),
+        "frames": encoded,
+        "segments": len(segments),
+        "cached_segments": cached,
+    }
+    logger.info(
+        f"{kind}: wrote {out}, {LAST_STATS['seconds']:.2f} s total "
+        f"({LAST_STATS['composing']:.1f} s composing, "
+        f"{LAST_STATS['feeding']:.1f} s feeding ffmpeg, "
+        f"{LAST_STATS['muxing']:.1f} s muxing), {count - cached}/{count} segments encoded"
+    )
+    logger.debug("%s: muxed duration %.3f s", kind, measured)
     return out
 
 
@@ -176,7 +223,8 @@ def _encode_segment(
     spec: VideoSpec,
     ffmpeg: str,
     label: str,
-) -> None:
+) -> tuple[float, float]:
+    """Encode one segment and return the seconds spent composing frames and feeding ffmpeg."""
     command = [
         ffmpeg,
         "-hide_banner",
@@ -200,7 +248,7 @@ def _encode_segment(
         "-crf",
         "18",
         "-preset",
-        "medium",
+        X264_PRESET,
         "-pix_fmt",
         "yuv420p",
         "-y",
@@ -208,14 +256,21 @@ def _encode_segment(
     ]
     shape = (spec.height, spec.width, 3)
     broken: OSError | None = None
+    composing = 0.0
+    feeding = 0.0
     with tempfile.TemporaryFile() as errors:
         process = subprocess.Popen(
             command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=errors
         )
         assert process.stdin is not None, "ffmpeg stdin was not piped"
+        # Two clock reads per frame: one where the frame is ready, one where it is written. The
+        # previous write's end is this frame's composing start, so no third read is needed.
+        mark = time.perf_counter()
         try:
             for index in range(start, start + frames):
                 frame = frame_at(index)
+                ready = time.perf_counter()
+                composing += ready - mark
                 if frame.shape != shape:
                     raise RenderError(f"frame {index} has shape {frame.shape}, expected {shape}")
                 try:
@@ -223,6 +278,8 @@ def _encode_segment(
                 except OSError as error:
                     broken = error
                     break
+                mark = time.perf_counter()
+                feeding += mark - ready
                 if (index - start + 1) % 100 == 0:
                     logger.debug("%s: %d/%d frames", label, index - start + 1, frames)
         finally:
@@ -236,6 +293,7 @@ def _encode_segment(
             raise RenderError(f"ffmpeg failed on {label} (exit {code}): {detail}")
     if not path.is_file() or path.stat().st_size == 0:
         raise RenderError(f"ffmpeg produced no data for {label}")
+    return composing, feeding
 
 
 def _probe_value(path: Path, ffprobe: str, entries: str, extra: tuple[str, ...] = ()) -> str:

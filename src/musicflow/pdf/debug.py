@@ -1,7 +1,8 @@
-"""Diagnostic images: one overlay per page and one crop per system.
+"""Diagnostic images: one overlay per page.
 
 The images are for human and agent inspection only; nothing downstream reads them, and a diagnostic
-that cannot be written must never fail a detection run.
+that cannot be written must never fail a detection run. Callers that want no image never call these
+writers, so the first write creates the directory: a run without diagnostics touches no path.
 """
 
 from __future__ import annotations
@@ -19,14 +20,6 @@ logger = logging.getLogger(__name__)
 RED = (0, 0, 255)
 BLUE = (255, 0, 0)
 GREEN = (0, 200, 0)
-
-
-def page_overlay_path(debug_dir: Path, page: int) -> Path:
-    return debug_dir / f"page-{page:02d}.png"
-
-
-def system_crop_path(debug_dir: Path, index: int) -> Path:
-    return debug_dir / f"system-{index:03d}.png"
 
 
 def write_page_overlay(
@@ -60,28 +53,7 @@ def write_page_overlay(
                     RED,
                     thickness,
                 )
-    return _write(page_overlay_path(debug_dir, raster.number), canvas)
-
-
-def write_system_crops(
-    raster: PageRaster, systems: list[SystemGeometry], first_index: int, debug_dir: Path
-) -> list[Path]:
-    """Save the boxed area of every system as its own image, skipping empty boxes."""
-    paths = []
-    height, width = raster.gray.shape
-    for offset, system in enumerate(systems):
-        y0 = min(max(0, int(system.y0)), height)
-        y1 = min(max(0, int(system.y1)), height)
-        x0 = min(max(0, int(system.x0)), width)
-        x1 = min(max(0, int(system.x1)), width)
-        index = first_index + offset
-        if x1 <= x0 or y1 <= y0:
-            logger.debug("system %d: empty crop, no diagnostic image", index)
-            continue
-        path = _write(system_crop_path(debug_dir, index), raster.gray[y0:y1, x0:x1])
-        if path is not None:
-            paths.append(path)
-    return paths
+    return _write(debug_dir / f"page-{raster.number:02d}.png", canvas)
 
 
 def _write(path: Path, image) -> Path | None:
@@ -89,8 +61,9 @@ def _write(path: Path, image) -> Path | None:
         if image.size == 0:
             logger.debug("empty diagnostic image: %s", path)
             return None
+        path.parent.mkdir(parents=True, exist_ok=True)
         cv2.imwrite(str(path), image)
-    except cv2.error as error:
+    except (cv2.error, OSError) as error:
         logger.warning("cannot write diagnostic image %s: %s", path, error)
         return None
     return path

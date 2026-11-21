@@ -20,7 +20,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .imaging import PageRaster, Staff
+from .imaging import PageRaster, Staff, runs
 
 logger = logging.getLogger(__name__)
 
@@ -118,7 +118,7 @@ def crossing_columns(raster: PageRaster, upper: Staff, lower: Staff, space: floa
     limit = max(6, round(1.2 * space))
     return [
         x0 + (start + stop) / 2
-        for start, stop in _runs_bounds(coverage >= CROSSING_COVERAGE)
+        for start, stop in runs(coverage >= CROSSING_COVERAGE)
         if stop - start + 1 <= limit
     ]
 
@@ -159,7 +159,7 @@ def group_barlines(raster: PageRaster, group: Group, space: float) -> list[float
     probe_rows = np.concatenate([_inner_rows(staff, raster) for staff in group.staves] + gap_rows)
     limit = max(6, round(THIN_STROKE_SPACES * space))
     columns = []
-    for start, stop in _runs_bounds(mask):
+    for start, stop in runs(mask):
         centre = (start + stop) // 2
         if _thin_share(raster.ink, probe_rows, centre, limit) >= MIN_THIN_SHARE:
             columns.append(float(centre))
@@ -197,21 +197,6 @@ def _overshoot(ink: np.ndarray, column: int, top: int, bottom: int) -> int:
     while down + 1 < window.shape[0] and window[down + 1].any():
         down += 1
     return max(0, top - up, down - bottom)
-
-
-def _runs_bounds(mask: np.ndarray) -> list[tuple[int, int]]:
-    """Bounds of the True runs in ``mask``."""
-    bounds: list[tuple[int, int]] = []
-    start: int | None = None
-    for index, value in enumerate(mask):
-        if value and start is None:
-            start = index
-        elif not value and start is not None:
-            bounds.append((start, index - 1))
-            start = None
-    if start is not None:
-        bounds.append((start, len(mask) - 1))
-    return bounds
 
 
 def _thin_share(ink: np.ndarray, rows: np.ndarray, column: int, limit: int) -> float:
@@ -288,20 +273,11 @@ def staff_support(raster: PageRaster, staff: Staff, columns: list[float]) -> flo
     """Share of ``columns`` whose ink spans the full height of ``staff``."""
     if not columns:
         return 0.0
-    top = int(np.floor(staff.lines[0].y0)) - 1
-    bottom = int(np.ceil(staff.lines[-1].y1)) + 1
-    top = max(top, 0)
-    bottom = min(bottom, raster.ink.shape[0] - 1)
-    block = raster.ink[top : bottom + 1]
     # Rows belonging to the staff lines themselves are inked everywhere and prove nothing.
-    skip = set()
-    for line in staff.lines:
-        for y in range(int(line.y0) - 1, int(line.y1) + 2):
-            skip.add(y - top)
-    keep = [index for index in range(block.shape[0]) if index not in skip]
-    if len(keep) < 3:
+    rows = _inner_rows(staff, raster)
+    if rows.size < 3:
         return 0.0
-    space_rows = block[keep].astype(bool)
+    space_rows = raster.ink[rows].astype(bool)
     hits = 0
     for column in columns:
         x = round(column)
@@ -353,23 +329,18 @@ def group_systems(groups: list[Group], raster: PageRaster, space: float) -> list
         overlap = min(upper.x1, lower.x1) - max(upper.x0, lower.x0)
         shorter = min(upper.x1 - upper.x0, lower.x1 - lower.x0)
         tolerance = BARLINE_CLUSTER * space
+        reference = upper.barlines or lower.barlines
+        against = lower.staves if upper.barlines else upper.staves
         if upper.barlines and lower.barlines:
             agreement = barline_agreement(list(upper.barlines), list(lower.barlines), tolerance)
-        elif upper.barlines:
-            agreement = max(
-                staff_support(raster, staff, list(upper.barlines)) for staff in lower.staves
-            )
-        elif lower.barlines:
-            agreement = max(
-                staff_support(raster, staff, list(lower.barlines)) for staff in upper.staves
-            )
+        elif reference:
+            agreement = max(staff_support(raster, staff, list(reference)) for staff in against)
         else:
             agreement = 1.0
         limit = EXTENDED_GAP_HEIGHTS if agreement >= STRONG_AGREEMENT else MAX_GAP_HEIGHTS
         fits = overlap >= 0.5 * shorter and gap <= limit * height
         pairs.append(
             {
-                "gap": gap,
                 "ratio": gap / height if height else float("inf"),
                 "agreement": agreement,
                 "fits": 1.0 if fits else 0.0,
@@ -520,16 +491,11 @@ def _blank_bands(
 ) -> list[tuple[int, int, int]]:
     """Runs of rows whose ink count does not exceed ``threshold``, as ``(width, first, last)``."""
     bands: list[tuple[int, int, int]] = []
-    start: int | None = None
-    for row in rows:
-        if profile[row] <= threshold:
-            if start is None:
-                start = row
-        elif start is not None:
-            bands.append((row - start, start, row - 1))
-            start = None
-    if start is not None:
-        bands.append((lower + 1 - start, start, lower))
+    for start, stop in runs(profile[row] <= threshold for row in rows):
+        first, last = rows.start + start, rows.start + stop
+        if last == rows[-1]:
+            last = lower
+        bands.append((last - first + 1, first, last))
     return bands
 
 
@@ -608,10 +574,8 @@ def system_boxes(
     splits = _gap_splits(raster, unions, spans)
     for index, system in enumerate(systems):
         staves = [staff for group in system for staff in group.staves]
-        x0 = min(staff.x0 for staff in staves)
-        x1 = max(staff.x1 for staff in staves)
-        top = min(staff.top for staff in staves)
-        bottom = max(staff.bottom for staff in staves)
+        top, bottom = unions[index]
+        x0, x1 = spans[index]
         columns0 = int(max(0, x0 - PAD_SIDE_SPACES * space))
         columns1 = int(min(width, x1 + PAD_SIDE_SPACES * space))
         pad = max(2, round(0.2 * space))
@@ -632,11 +596,10 @@ def system_boxes(
         threshold = max(1, round(0.002 * (right - left)))
         top_limit = splits[index - 1][1] if index else 0
         bottom_limit = splits[index][0] if index < len(splits) else height
-        first = index == 0
         # The top edge of the first system has no neighbour to stop the walk at, so page furniture
         # could chain into the band: a title sits far above the first staff. Capping that one edge
         # keeps the title out without cutting any stave.
-        if first:
+        if index == 0:
             upper_limit = int(PAD_TOP_SPACES * space) + gap_rows
         else:
             upper_limit = max(int(PAD_TOP_SPACES * space) + gap_rows, int(top) - top_limit)

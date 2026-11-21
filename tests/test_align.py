@@ -16,6 +16,10 @@ Two families of checks, both semantic rather than structural:
   control that the produced map scores at least twice as well as the same map shifted by two
   seconds.
 
+Two unit checks pin what the corpus cannot isolate: the attack indicator marks one cell per onset
+rather than the whole span of a sustained note (and its optional window decays over the following
+rows), and the shared-spectrum correlation equals the direct convolution it replaces.
+
 Alignments are cached per case in a module-scoped fixture: case3 takes ~20 s and no test needs it
 twice.
 """
@@ -33,11 +37,24 @@ import numpy as np
 import partitura
 import pytest
 from PIL import Image
+from scipy.fft import next_fast_len
+from scipy.signal import fftconvolve
 
 from musicflow import audio as audio_module
 from musicflow.align import align
+from musicflow.align.features import ATTACK_DECAY, build_score_grid
+from musicflow.align.stages import _audio_spectrum, _correlation
 from musicflow.errors import AnalysisError, InputError
-from musicflow.model import Alignment, Route, Score
+from musicflow.model import (
+    Alignment,
+    MeasureInfo,
+    MeasurePass,
+    NoteEvent,
+    PartInfo,
+    PerformanceNote,
+    Route,
+    Score,
+)
 from musicflow.symbolic import build_route, load_score
 
 CORPUS = Path(__file__).resolve().parents[1] / "test_cases"
@@ -140,10 +157,11 @@ def _error_against_midi(run: Run) -> tuple[np.ndarray, float, int]:
             f" {run.alignment.audio_duration:.1f}s recording, so it is the notation at its own"
             " tempo, not this performance"
         )
+    written = run.score.note_by_id()
     quarters: list[float] = []
     times: list[float] = []
     for note in run.route.notes:
-        values = buckets.get((round(note.onset_q, 3), note.pitch))
+        values = buckets.get((round(note.onset_q, 3), written[note.note_id].pitch))
         if values:
             quarters.append(note.onset_q)
             times.append(values.pop(0))
@@ -249,13 +267,15 @@ def _independent_similarities(run: Run) -> tuple[float, float]:
     audio_chroma = folded - folded.mean(axis=0, keepdims=True)
     audio_chroma /= np.maximum(np.linalg.norm(audio_chroma, axis=0, keepdims=True), 1e-9)
 
+    written = run.score.note_by_id()
     step_q = 0.25
     cells = int(np.ceil(run.route.total_q / step_q))
     occupancy = np.zeros((cells, PITCH_CLASSES))
     for note in run.route.notes:
+        source = written[note.note_id]
         start = min(round(note.onset_q / step_q), cells - 1)
-        stop = max(start + 1, min(round(note.end_q / step_q), cells))
-        occupancy[start:stop, note.pitch % PITCH_CLASSES] += 1.0
+        stop = max(start + 1, min(round((note.onset_q + source.duration_q) / step_q), cells))
+        occupancy[start:stop, source.pitch % PITCH_CLASSES] += 1.0
     score_chroma = occupancy - occupancy.mean(axis=1, keepdims=True)
     score_chroma /= np.maximum(np.linalg.norm(score_chroma, axis=1, keepdims=True), 1e-9)
 
@@ -349,3 +369,69 @@ def test_stale_route_is_rejected(tmp_path: Path) -> None:
     _, other_route, _ = _corpus_paths("case2")
     with pytest.raises(AnalysisError, match="stale"):
         align(score, other_route, audio, work_dir=tmp_path / "stale")
+
+
+def _sustained_note(duration_q: float) -> tuple[Score, Route]:
+    """One written note held for ``duration_q``, performed once at its written position."""
+    score = Score(
+        provider="musicxml",
+        parts=(PartInfo(id="P1", name="Piano", staves=1),),
+        measures=(MeasureInfo(index=1, start_q=0.0, length_q=4.0),),
+        notes=(
+            NoteEvent(
+                id="n1",
+                part="P1",
+                staff=1,
+                voice=1,
+                measure=1,
+                onset_q=1.0,
+                duration_q=duration_q,
+                pitch=60,
+            ),
+        ),
+        repeats=(),
+        total_q=4.0,
+    )
+    route = Route(
+        passes=(MeasurePass(measure=1, pass_index=0, start_q=0.0, length_q=4.0),),
+        notes=(PerformanceNote(note_id="n1", measure=1, pass_index=0, onset_q=1.0),),
+        total_q=4.0,
+        source="written",
+    )
+    return score, route
+
+
+def test_attack_indicator_marks_the_onset_cell_only() -> None:
+    step_q = 0.25
+    score, route = _sustained_note(duration_q=2.0)
+    grid = build_score_grid(score, route, step_q)
+    onset = round(1.0 / step_q)
+    sounding = np.arange(onset, round(3.0 / step_q))
+    assert grid.attack[onset] == 1.0
+    assert np.count_nonzero(grid.attack) == 1, "only the onset cell may carry an attack"
+    assert np.all(grid.attack[sounding[1:]] == 0.0), "a sustained note must not mark its span"
+    assert np.all(grid.chroma[sounding, 0] > 0.0), "the chroma occupancy must be unchanged"
+
+
+def test_attack_window_decays_after_the_onset() -> None:
+    step_q = 0.25
+    score, route = _sustained_note(duration_q=2.0)
+    grid = build_score_grid(score, route, step_q, attack_decay=ATTACK_DECAY)
+    onset = round(1.0 / step_q)
+    assert grid.attack[onset] == 1.0
+    assert grid.attack[onset + 1] == 0.5
+    assert grid.attack[onset + 2] == 0.25
+    assert np.count_nonzero(grid.attack) == 3, "the window must not reach past the onset's rise"
+
+
+def test_shared_spectrum_correlation_matches_direct_convolution() -> None:
+    rng = np.random.default_rng(20261121)
+    columns = 37
+    audio = rng.normal(size=(PITCH_CLASSES, columns))
+    sequence = rng.normal(size=(columns, PITCH_CLASSES))
+    length = next_fast_len(2 * columns - 1)
+    got = _correlation(_audio_spectrum(audio, length), sequence, length)[: 2 * columns - 1]
+    expected = np.zeros(2 * columns - 1)
+    for pitch_class in range(PITCH_CLASSES):
+        expected += fftconvolve(audio[pitch_class], sequence[::-1, pitch_class], "full")
+    assert np.allclose(got, expected, rtol=0.0, atol=1e-6)

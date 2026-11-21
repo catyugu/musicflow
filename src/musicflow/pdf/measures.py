@@ -1,10 +1,17 @@
 """Binding detected systems to written measures.
 
-The binding prefers the measure number printed at the start of a system when the PDF has a text
-layer: it names the measure directly, so one wrong barline cannot shift every later system. Without
-a text layer (a scan) the systems are bound cumulatively from their barline counts, and any total
-mismatch is rescaled proportionally and reported — never silently stretched. Where both signals
-exist, every disagreement is named in ``unconfirmed``.
+A system's measure range is the stretch of written measures engraved on it, and the ranges must tile
+the score: every written measure is covered by exactly one system, in reading order, from the first
+measure to the last.
+
+The evidence decides how the boundaries are found. A printed measure number at the start of a system
+names the measure directly, so when the PDF has a text layer the printed numbers are the authority
+and the next system's number closes the current range; the barline counts are then a cross-check
+reported in ``unconfirmed``. A scan has no text layer, so its systems are bound cumulatively from
+the barline counts, which is only honest when those counts add up to the written measure count
+exactly: each system then spans the number of measures its barlines give. When the evidence cannot
+produce the tiling, :func:`bind_measures` raises :class:`AnalysisError` asking for a ``--staffs``
+override, which pins ranges read off the page by hand.
 
 Only ``first_measure``/``last_measure`` are written; the detected barlines, staves and boxes stay
 untouched.
@@ -19,9 +26,8 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-from ..errors import InputError
-from ..model import Score, StaffLayout
-from ._text import _numbers
+from ..errors import AnalysisError, InputError
+from ..model import Score, StaffLayout, System
 
 logger = logging.getLogger(__name__)
 
@@ -32,130 +38,107 @@ def bind_measures(
     """Fill ``first_measure``/``last_measure`` of every system.
 
     ``override`` is an optional reviewed correction file:
-    ``{"systems": [[index, first, last], ...]}``.
-    Listed systems take the given measure range; unlisted systems keep the automatic binding.
+    ``{"systems": [[index, first, last], ...]}``. Listed systems take the given measure range; the
+    others keep the automatic binding. The override may repair a layout whose automatic binding
+    cannot be completed, because the tiling is checked on the final result.
     """
     measures = score.measures
     if not measures:
         raise InputError("the symbolic score has no measures")
-    count = len(measures)
     indexes = [measure.index for measure in measures]
-    first_index = indexes[0]
-    unconfirmed = list(layout.unconfirmed)
-    positions, notes = _bind_by_printed_measures(layout, first_index, indexes)
-    unconfirmed.extend(notes)
-    if positions is None:
-        positions = _bind_by_barlines(layout, count)
-        detected_total = sum(system.measure_count for system in layout.systems)
-        if detected_total != count:
-            rescaled = [
-                system.index
-                for system, (start, end) in zip(layout.systems, positions, strict=False)
-                if end - start + 1 != system.measure_count
-            ]
-            unconfirmed.append(
-                f"detected {detected_total} measures from barlines but the score has {count};"
-                f" the binding was rescaled proportionally for {_numbers(rescaled)}"
-            )
-            logger.warning(
-                "measure count mismatch: detected %d, score %d, rescaled %d systems",
-                detected_total,
-                count,
-                len(rescaled),
-            )
+    forced = _read_override(Path(override), layout, indexes) if override is not None else {}
+    if any(system.printed_measure is not None for system in layout.systems):
+        ranges, notes = _printed_ranges(layout.systems, forced, indexes[0], indexes[-1])
+    else:
+        ranges, notes = _barline_ranges(layout.systems, forced, indexes[0]), []
+    _require_tiling(layout.systems, ranges, indexes)
+    unconfirmed = [*layout.unconfirmed, *notes]
     if override is not None:
-        forced = _read_override(Path(override), layout, indexes)
-        for position, system in enumerate(layout.systems):
-            if system.index in forced:
-                first, last = forced[system.index]
-                positions[position] = (indexes.index(first), indexes.index(last))
         unconfirmed.append(f"{len(forced)} system binding(s) overridden from {override}")
         logger.info("overriding %d system bindings from %s", len(forced), override)
-    systems = []
-    for system, (start, end) in zip(layout.systems, positions, strict=False):
-        if start < 0 or end < start:
-            systems.append(replace(system, first_measure=None, last_measure=None))
-        else:
-            systems.append(replace(system, first_measure=indexes[start], last_measure=indexes[end]))
-    bound = sum(1 for system in systems if system.first_measure is not None)
-    logger.info("bound %d/%d systems to measures", bound, len(systems))
+    systems = [
+        replace(system, first_measure=start, last_measure=end)
+        for system, (start, end) in zip(layout.systems, ranges, strict=True)
+    ]
+    logger.info("bound %d systems to %d measures", len(systems), len(indexes))
     return replace(layout, systems=tuple(systems), unconfirmed=tuple(unconfirmed))
 
 
-def _bind_by_printed_measures(
-    layout: StaffLayout, first_index: int, indexes: list[int]
-) -> tuple[list[tuple[int, int]] | None, list[str]]:
-    """Bind from the engraved measure numbers, cross-checked against the barline counts."""
-    systems = layout.systems
-    printed = [
-        value if value is not None and first_index <= value <= indexes[-1] else None
-        for value in (system.printed_measure for system in systems)
-    ]
-    if all(value is None for value in printed):
-        return None, []
+def _printed_ranges(
+    systems: tuple[System, ...], forced: dict[int, tuple[int, int]], first: int, last: int
+) -> tuple[list[tuple[int, int]], list[str]]:
+    """Ranges closed by the next system's start, from the printed measure numbers."""
     starts: list[int] = []
-    cursor = first_index
-    for value, system in zip(printed, systems, strict=False):
-        if value is None:
-            starts.append(cursor)
+    cursor = first
+    for system in systems:
+        if system.index in forced:
+            start, end = forced[system.index]
+            cursor = end + 1
         else:
-            starts.append(value)
-        cursor = starts[-1] + system.measure_count
+            start = system.printed_measure if system.printed_measure is not None else cursor
+            cursor = start + system.measure_count
+        starts.append(start)
+    ranges: list[tuple[int, int]] = []
     notes: list[str] = []
-    last_index = indexes[-1]
     for position, system in enumerate(systems):
-        end = starts[position + 1] - 1 if position + 1 < len(systems) else last_index
+        if system.index in forced:
+            ranges.append(forced[system.index])
+            continue
+        end = starts[position + 1] - 1 if position + 1 < len(systems) else last
+        ranges.append((starts[position], end))
         implied = end - starts[position] + 1
         if implied != system.measure_count:
             notes.append(
                 f"page {system.page} system {system.index}: printed numbering covers measures"
                 f" {starts[position]}..{end} ({implied}), barlines give {system.measure_count}"
             )
-    starts[0] = starts[0] if starts[0] >= first_index else first_index
-    ends = [starts[position + 1] - 1 for position in range(len(systems) - 1)] + [last_index]
-    invalid = [
-        system.index
-        for system, start, end in zip(systems, starts, ends, strict=False)
-        if not first_index <= start <= end <= last_index
-    ]
-    if invalid:
-        notes.append(
-            "printed measure numbers are not a usable sequence; fell back to barline counting"
-            f" for systems: {_numbers(invalid)}"
-        )
-        return None, notes
-    known = {value: position for position, value in enumerate(indexes)}
-    try:
-        return [(known[start], known[end]) for start, end in zip(starts, ends, strict=True)], notes
-    except KeyError:
-        notes.append(
-            "printed measure numbers are not measure numbers of the score;"
-            " fell back to barline counting"
-        )
-        return None, notes
+    return ranges, notes
 
 
-def _bind_by_barlines(layout: StaffLayout, count: int) -> list[tuple[int, int]]:
-    """Cumulative binding from the barline counts, proportional when the totals disagree."""
-    counts = [system.measure_count for system in layout.systems]
-    total = sum(counts)
-    if total == count:
-        spans: list[tuple[int, int]] = []
-        cursor = 0
-        for value in counts:
-            spans.append((cursor, cursor + value - 1))
-            cursor += value
-        return spans
-    spans = []
-    ratio = count / total if total else 0.0
-    cumulative = 0
-    previous = 0
-    for value in counts:
-        cumulative += value
-        boundary = min(count, round(cumulative * ratio))
-        spans.append((previous, boundary - 1))
-        previous = boundary
-    return spans
+def _barline_ranges(
+    systems: tuple[System, ...], forced: dict[int, tuple[int, int]], first: int
+) -> list[tuple[int, int]]:
+    """Cumulative ranges in which every system spans exactly the measures it counts."""
+    ranges: list[tuple[int, int]] = []
+    cursor = first
+    for system in systems:
+        if system.index in forced:
+            start, end = forced[system.index]
+        else:
+            start, end = cursor, cursor + system.measure_count - 1
+        ranges.append((start, end))
+        cursor = end + 1
+    return ranges
+
+
+def _require_tiling(
+    systems: tuple[System, ...], ranges: list[tuple[int, int]], indexes: list[int]
+) -> None:
+    """Require the ranges to cover every written measure exactly once, in reading order."""
+    written = set(indexes)
+    problems: list[str] = []
+    cursor = indexes[0]
+    for system, (start, end) in zip(systems, ranges, strict=True):
+        if start != cursor:
+            problems.append(f"system {system.index} starts at {start}, expected {cursor}")
+        if end < start:
+            problems.append(f"system {system.index} covers no measures")
+        elif start not in written or end not in written:
+            problems.append(f"system {system.index} covers {start}..{end}, outside the score")
+        cursor = end + 1
+    if cursor != indexes[-1] + 1:
+        problems.append(f"the last system ends at {cursor - 1}, not at {indexes[-1]}")
+    if problems:
+        raise _unbindable(systems, "; ".join(problems), len(indexes))
+
+
+def _unbindable(systems: tuple[System, ...], detail: str, written: int) -> AnalysisError:
+    detected = sum(system.measure_count for system in systems)
+    return AnalysisError(
+        f"cannot bind the systems to the score's measures: {detail}."
+        f" The barlines give {detected} measures, the score has {written};"
+        " supply a --staffs override file to bind the systems by hand."
+    )
 
 
 def _read_override(

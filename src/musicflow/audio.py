@@ -27,8 +27,6 @@ ANALYSIS_SAMPLE_RATE = 24000
 @dataclass(frozen=True, slots=True)
 class AudioInfo:
     duration: float
-    sample_rate: int
-    channels: int
 
 
 def _tool(name: str) -> str:
@@ -49,7 +47,7 @@ def probe(path: Path) -> AudioInfo:
         "-select_streams",
         "a:0",
         "-show_entries",
-        "stream=sample_rate,channels,duration",
+        "stream=duration",
         "-of",
         "json",
         str(path),
@@ -60,15 +58,10 @@ def probe(path: Path) -> AudioInfo:
     streams = json.loads(result.stdout).get("streams") or []
     if not streams:
         raise InputError(f"{path} has no audio stream")
-    stream = streams[0]
-    duration = float(stream.get("duration") or 0.0)
+    duration = float(streams[0].get("duration") or 0.0)
     if duration <= 0.0:
         raise InputError(f"{path} reports no duration")
-    return AudioInfo(
-        duration=duration,
-        sample_rate=int(stream.get("sample_rate") or 0),
-        channels=int(stream.get("channels") or 0),
-    )
+    return AudioInfo(duration=duration)
 
 
 def decode(path: Path, *, sample_rate: int = ANALYSIS_SAMPLE_RATE) -> np.ndarray:

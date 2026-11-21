@@ -1,12 +1,14 @@
 """Random access to the rasterised flow strip.
 
 The strip is stored as horizontal tiles at one pixel per layout unit (see ``Tile``), so a frame's
-window is an integer rectangle of strip pixels. Only the tiles a window touches are decoded, and a
-small LRU keeps the handful that consecutive frames reuse.
+window is an integer rectangle of strip pixels. Tiles are kept in x order, so a window locates the
+one or two tiles it intersects by bisect instead of touching every tile; a small LRU keeps the
+handful that consecutive frames reuse. The window buffer is reused between frames.
 """
 
 from __future__ import annotations
 
+import bisect
 from collections import OrderedDict
 from pathlib import Path
 
@@ -18,29 +20,39 @@ from ..model import Tile
 
 
 class StripTiles:
-    """The strip's tile images, addressed by layout unit."""
+    """The strip's tile images, addressed by layout unit.
+
+    :meth:`window` returns a buffer owned by this object and overwritten by the next call: a caller
+    that needs to keep two windows must copy the first one.
+    """
 
     def __init__(self, tiles: tuple[Tile, ...], root: Path, *, capacity: int = 8) -> None:
         self._tiles = tiles
-        self._root = root
-        self._capacity = capacity
-        self._open: OrderedDict[str, np.ndarray] = OrderedDict()
-        for tile in tiles:
+        self._left = [round(tile.x0) for tile in tiles]
+        for tile, left in zip(tiles, self._left, strict=True):
+            assert left == tile.x0, "tile x0 is not an integer number of pixels"
             path = root / tile.path
             if not path.is_file():
                 raise RenderError(f"flow tile is missing: {path}")
+        assert self._left == sorted(self._left), "flow tiles are not ordered by x0"
+        self._root = root
+        self._capacity = capacity
+        self._open: OrderedDict[str, np.ndarray] = OrderedDict()
+        self._buffer: np.ndarray | None = None
 
     def window(
         self, left: int, top: int, width: int, height: int, background: np.ndarray
     ) -> np.ndarray:
         """Strip pixels of ``[left, left+width) x [top, top+height)``, background outside."""
         assert width > 0 and height > 0, "empty strip window"
-        buffer = np.empty((height, width, 3), dtype=np.uint8)
+        buffer = self._buffer_for(width, height)
         buffer[:] = background
-        for tile in self._tiles:
-            tile_left = round(tile.x0)
-            assert tile_left == tile.x0, "tile x0 is not an integer number of pixels"
-            if tile_left + tile.width <= left or tile_left >= left + width:
+        index = max(0, bisect.bisect_right(self._left, left) - 1)
+        while index < len(self._tiles) and self._left[index] < left + width:
+            tile = self._tiles[index]
+            tile_left = self._left[index]
+            index += 1
+            if tile_left + tile.width <= left:
                 continue
             image = self._load(tile.path)
             tile_right = tile_left + min(tile.width, image.shape[1])
@@ -54,6 +66,11 @@ class StripTiles:
                 image[rows_from:rows_to, columns_from - tile_left : columns_to - tile_left]
             )
         return buffer
+
+    def _buffer_for(self, width: int, height: int) -> np.ndarray:
+        if self._buffer is None or self._buffer.shape != (height, width, 3):
+            self._buffer = np.empty((height, width, 3), dtype=np.uint8)
+        return self._buffer
 
     def _load(self, relative: str) -> np.ndarray:
         cached = self._open.get(relative)

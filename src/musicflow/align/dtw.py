@@ -35,16 +35,16 @@ class DtwWeights:
 
 @dataclass(frozen=True, slots=True)
 class TimeMap:
-    """A monotone score-position to recording-time map sampled on the DTW row grid."""
+    """A monotone score-position to recording-time map sampled on the DTW row grid.
+
+    ``mean_similarity`` is the average chroma cosine of the path against the recording; the
+    per-row values are not kept because no consumer reads them.
+    """
 
     q: np.ndarray
     seconds: np.ndarray
-    similarity: np.ndarray
     path_cells: int
-
-    @property
-    def mean_similarity(self) -> float:
-        return float(np.mean(self.similarity))
+    mean_similarity: float
 
     def at(self, q: np.ndarray | float) -> np.ndarray:
         return np.interp(q, self.q, self.seconds)
@@ -168,6 +168,6 @@ def _trace(
     return TimeMap(
         q=q,
         seconds=(filled + 0.5) / audio.rate,
-        similarity=similarity.astype(np.float32),
         path_cells=int(index.size),
+        mean_similarity=float(np.mean(similarity)),
     )
