@@ -14,6 +14,7 @@ import math
 from dataclasses import dataclass
 from pathlib import Path
 
+import msgspec
 import numpy as np
 import pymupdf
 from PIL import Image
@@ -214,7 +215,7 @@ def render_switch(
         parameters={
             "mode": "switch",
             "pdf": file_signature(pdf),
-            "systems": [[s.index, s.page, s.bbox.to_dict()] for s in plan.systems],
+            "systems": [[s.index, s.page, msgspec.to_builtins(s.bbox)] for s in plan.systems],
             "times": list(plan.times),
             "dpi": sorted(dpis.items()),
         },

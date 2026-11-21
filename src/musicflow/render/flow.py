@@ -11,6 +11,7 @@ import logging
 import math
 from pathlib import Path
 
+import msgspec
 import numpy as np
 from PIL import Image
 
@@ -137,7 +138,7 @@ def render_flow(
         kind="flow",
         parameters={
             "mode": "flow",
-            "content": flow.content.to_dict(),
+            "content": msgspec.to_builtins(flow.content),
             "strip_height": flow.strip_height,
             "tiles": [
                 [tile.path, tile.x0, tile.width, tile.height, file_signature(tiles_dir / tile.path)]

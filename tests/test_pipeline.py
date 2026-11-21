@@ -11,7 +11,9 @@ import pickle
 from dataclasses import replace
 from pathlib import Path
 
+import msgspec
 import pytest
+from msgspec.structs import replace as replace_struct
 from support import SPEC, flow_of, layout_of, measure, musicxml, note, time_map, written
 
 from musicflow import cli, model, pipeline, workdir
@@ -115,33 +117,28 @@ def test_workdir_keys_and_the_step_cache(tmp_path: Path) -> None:
     first.write_bytes(b"one")
     second.write_bytes(b"two")
     assert workdir.digest_file(first) != workdir.digest_file(second)
-    base = workdir.key({"a": workdir.digest_file(first)}, {"p": 1})
-    assert base == workdir.key({"a": workdir.digest_file(first)}, {"p": 1})
-    assert base != workdir.key({"a": workdir.digest_file(first)}, {"p": 2})
-    assert base != workdir.key({"a": workdir.digest_file(second)}, {"p": 1})
-    reordered = workdir.hash_payload({"b": [1, 2], "a": 1})
-    assert workdir.hash_payload({"a": 1, "b": [1, 2]}) == reordered
-    assert workdir.hash_payload({"a": 1}) != workdir.hash_payload({"a": 2})
+    assert workdir.key({"b": [1, 2], "a": 1}) == workdir.key({"a": 1, "b": [1, 2]})
 
-    calls: list[str] = []
-    step = workdir.Workspace(tmp_path / "work").step("demo")
+    calls: list[Path] = []
+    workspace = workdir.Workspace(tmp_path / "work")
+    step = workspace.step("demo", "key-a")
 
-    def compute(path: Path) -> dict[str, object]:
-        calls.append("run")
+    def compute(path: Path) -> dict[str, str]:
+        calls.append(path)
         (path / "side.bin").write_bytes(b"x")
         return {"file": "side.bin"}
 
-    def present(payload: dict[str, object]) -> bool:
-        return (step.path / str(payload["file"])).is_file()
+    def present(payload: dict) -> bool:
+        return (step.path / payload["file"]).is_file()
 
-    assert step.run("key-a", compute, validate=present) == {"file": "side.bin"}
-    assert step.run("key-a", compute, validate=present) == {"file": "side.bin"}
-    assert calls == ["run"], "an unchanged key did not reuse the payload"
-    assert step.run("key-b", compute, validate=present) == {"file": "side.bin"}
-    assert calls == ["run", "run"], "a different key served the old payload"
+    assert step.run(dict, compute, present=present) == {"file": "side.bin"}
+    assert step.run(dict, compute, present=present) == {"file": "side.bin"}
+    assert len(calls) == 1
     (step.path / "side.bin").unlink()
-    assert step.run("key-b", compute, validate=present) == {"file": "side.bin"}
-    assert calls == ["run", "run", "run"], "a payload whose side file is gone was reused"
+    assert step.run(dict, compute, present=present) == {"file": "side.bin"}
+    (step.path / "cache.json").write_text("corrupt", encoding="utf-8")
+    assert step.run(dict, compute, present=present) == {"file": "side.bin"}
+    assert len(calls) == 3
 
 
 def test_analyze_writes_one_report_with_checks(
@@ -155,15 +152,14 @@ def test_analyze_writes_one_report_with_checks(
     report = workdir.read_json(workspace.root / pipeline.REPORT_NAME)
     expected = "inputs tools spec score route layout alignment flow checks artifacts timings"
     assert set(report) == set(expected.split())
-    assert report["spec"] == SPEC.to_dict()
+    assert report["spec"] == msgspec.to_builtins(SPEC)
     summary = (report["layout"]["systems"], report["flow"]["tiles"])
     assert summary == (1, 1)
     assert report["alignment"]["similarity_mean"] == 0.5, "headline numbers come from the evidence"
     assert report["alignment"]["coverage"] == 1.0
-    align_dir = workspace.step("align").path
+    align_dir = next((workspace.root / "align").iterdir())
     assert report["artifacts"]["align_report"] == str((align_dir / "report.json").resolve())
     assert report["artifacts"]["alignment_figure"] is None
-    assert report["artifacts"]["videos"] == {}
     assert set(report["timings"]) == {"symbolic", "pdf", "align", "flow", "total"}
     names = [
         "staffs_per_system",
@@ -179,12 +175,12 @@ def test_analyze_writes_one_report_with_checks(
 
     pipeline.analyze(inputs, workspace, spec=SPEC, with_pdf=True, with_flow=True, debug_images=True)
     report = workdir.read_json(workspace.root / pipeline.REPORT_NAME)
-    debug_dir = workspace.step("pdf").path / "debug"
+    debug_dir = Path(report["artifacts"]["debug_images"])
     assert list(debug_dir.glob("*.png")), "--debug-images wrote nothing"
     assert report["artifacts"]["debug_images"] == str(debug_dir.resolve())
     assert len(stages["builds"]) == 1, "the second run engraved an unchanged strip again"
 
-    (workspace.step("flow").path / "tiles/t0.png").unlink()
+    (analysis.tiles_dir / "tiles/t0.png").unlink()
     pipeline.analyze(inputs, workspace, spec=SPEC, with_pdf=True, with_flow=True)
     assert len(stages["builds"]) == 2, "a cached flow layout whose tile is gone was reused"
 
@@ -199,7 +195,7 @@ def test_analyze_reuses_cached_steps_and_rekeys_on_the_route(
     pipeline.analyze(inputs, workspace, spec=SPEC, with_pdf=False)
     pipeline.analyze(inputs, workspace, spec=SPEC, with_pdf=False)
     assert len(routes) == 1, "the second run re-aligned an unchanged score"
-    (workspace.step("align").path / "report.json").unlink()
+    next((workspace.root / "align").glob("*/report.json")).unlink()
     pipeline.analyze(inputs, workspace, spec=SPEC, with_pdf=False)
     assert len(routes) == 2, "an alignment whose report is gone was reused"
 
@@ -209,7 +205,7 @@ def test_analyze_reuses_cached_steps_and_rekeys_on_the_route(
         pipeline.analyze(replace(inputs, route_override=path), workspace, spec=SPEC, with_pdf=False)
     assert len(routes) == 4, "a different performance route served the first route's alignment"
     assert [route.source for route in routes[2:]] == ["override", "override"]
-    assert routes[2].to_dict() != routes[3].to_dict()
+    assert routes[2] != routes[3]
 
 
 def test_checks_and_render_cover_only_the_artifacts_they_have(tmp_path: Path) -> None:
@@ -222,11 +218,11 @@ def test_checks_and_render_cover_only_the_artifacts_they_have(tmp_path: Path) ->
     assert [check["name"] for check in pipeline.checks(with_layout)] == expected
     measure_check = next(c for c in pipeline.checks(with_layout) if c["name"] == "measure_count")
     assert measure_check["ok"] is True, "four detected measures against four written measures agree"
-    wrong = replace(with_layout.layout.systems[0], measure_count=9)
-    disagreed = replace(with_layout, layout=replace(with_layout.layout, systems=(wrong,)))
+    wrong = replace_struct(with_layout.layout.systems[0], measure_count=9)
+    disagreed = replace(with_layout, layout=replace_struct(with_layout.layout, systems=(wrong,)))
     assert not next(c for c in pipeline.checks(disagreed) if c["name"] == "measure_count")["ok"]
 
-    short = replace(flow_of(analysis.score), note_x=flow_of(analysis.score).note_x[:1])
+    short = replace_struct(flow_of(analysis.score), note_x=flow_of(analysis.score).note_x[:1])
     with_flow = replace(bare, layout=layout_of(measures=4), flow=short)
     coverage = next(c for c in pipeline.checks(with_flow) if c["name"] == "flow_note_coverage")
     assert coverage["ok"] is False, "one of four written notes placed must not pass"

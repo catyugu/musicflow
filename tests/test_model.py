@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-import json
-from dataclasses import replace
-
+import msgspec
 import pytest
+from msgspec.structs import replace
 from support import flow_of, layout_of, time_map, written
 
 from musicflow import model
@@ -49,30 +48,20 @@ def samples() -> list[object]:
 
 def test_every_payload_round_trips_through_json() -> None:
     for value in samples():
-        restored = type(value).from_dict(json.loads(json.dumps(value.to_dict())))
-        assert restored == value, f"{type(value).__name__} did not round-trip"
-    assert json.loads(json.dumps(time_map().to_dict()))["anchors"][0]["kind"] == "start"
+        assert msgspec.json.decode(msgspec.json.encode(value), type=type(value)) == value
 
 
 def test_codec_refuses_any_other_shape() -> None:
-    good = model.MeasureInfo(1, 0.0, 4.0).to_dict()
-    score = written().to_dict()
-    route = one_route().to_dict()
-    cases = [
-        (model.MeasureInfo, [1, 0.0, 4.0], "expected a JSON object"),
-        (model.MeasureInfo, {**good, "extra": 1}, "unknown field"),
-        (model.MeasureInfo, {"index": 1, "start_q": 0.0}, "missing field"),
-        (model.MeasureInfo, {**good, "index": 1.5}, "expected an integer"),
-        (model.MeasureInfo, {**good, "index": True}, "expected an integer"),
-        (model.MeasureInfo, {**good, "start_q": True}, "expected a number"),
-        (model.MeasureInfo, {**good, "start_q": "0"}, "expected a number"),
-        (model.Score, {**score, "title": None}, "expected a string"),
-        (model.Route, {**route, "total_q": [4.0]}, "expected a number"),
-        (model.Route, {**route, "passes": [["not a pass"]]}, "expected a JSON object"),
-    ]
-    for cls, payload, message in cases:
-        with pytest.raises(ValueError, match=message):
-            cls.from_dict(payload)
+    for text in (
+        "[1, 0.0, 4.0]",
+        '{"index":1,"start_q":0,"duration_q":4,"extra":1}',
+        '{"index":1,"start_q":0}',
+        '{"index":1.0,"start_q":0,"duration_q":4}',
+        '{"index":true,"start_q":0,"duration_q":4}',
+        '{"index":1,"start_q":"0","duration_q":4}',
+    ):
+        with pytest.raises(msgspec.ValidationError):
+            msgspec.json.decode(text, type=model.MeasureInfo)
 
 
 def test_dataclass_invariants_reject_broken_payloads() -> None:

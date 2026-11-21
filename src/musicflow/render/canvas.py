@@ -9,6 +9,7 @@ from collections.abc import Callable, Hashable, Mapping
 from pathlib import Path
 from typing import Any
 
+import msgspec
 import numpy as np
 
 from ..errors import RenderError
@@ -93,7 +94,7 @@ def file_signature(path: Path) -> list[Any]:
 def parameters_digest(kind: str, spec: VideoSpec, parameters: Mapping[str, Any]) -> str:
     """Segment-name digest over everything that changes the pixels of a frame."""
     payload = json.dumps(
-        {"kind": kind, "spec": spec.to_dict(), "parameters": dict(parameters)},
+        {"kind": kind, "spec": msgspec.to_builtins(spec), "parameters": dict(parameters)},
         sort_keys=True,
         default=float,
         ensure_ascii=True,

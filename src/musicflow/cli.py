@@ -124,12 +124,17 @@ def _cmd_render(args: argparse.Namespace) -> int:
     inputs = _inputs(args)
     workspace = workdir.Workspace(_workspace(args))
     out = Path(args.out) if args.out else Path("build") / f"{Path(args.pdf).stem}.{args.mode}.mp4"
+    spec = _video_spec(args)
+    analysis = pipeline.analyze(
+        inputs, workspace, spec=spec, with_pdf=args.mode == "switch", with_flow=args.mode == "flow"
+    )
     produced = pipeline.render(
         inputs,
         workspace,
         mode=args.mode,
         out=out,
-        spec=_video_spec(args),
+        spec=spec,
+        analysis=analysis,
         preview=args.preview,
     )
     print(f"video            {produced}")

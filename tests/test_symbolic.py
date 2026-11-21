@@ -44,7 +44,7 @@ def test_reader_numbers_notes_and_measures_and_unwraps_mxl(tmp_path: Path) -> No
             '<container><rootfiles><rootfile full-path="s.musicxml"/></rootfiles></container>',
         )
         archive.writestr("s.musicxml", written.read_text(encoding="utf-8"))
-    assert load_score(boxed).to_dict() == score.to_dict()
+    assert load_score(boxed) == score
 
 
 def test_ties_merge_into_one_sounding_note(tmp_path: Path) -> None:

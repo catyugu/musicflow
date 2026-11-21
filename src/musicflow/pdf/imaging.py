@@ -68,7 +68,7 @@ class PageRaster:
                 inverse[0, 0] * x + inverse[0, 1] * y + inverse[0, 2],
                 inverse[1, 0] * x + inverse[1, 1] * y + inverse[1, 2],
             )
-        return x / self.scale_x, y / self.scale_y
+        return float(x / self.scale_x), float(y / self.scale_y)
 
     def rect_to_points(self, x0: float, y0: float, x1: float, y1: float) -> tuple[float, ...]:
         """Map an axis-aligned raster rectangle to the enclosing axis-aligned point rectangle."""

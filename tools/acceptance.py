@@ -36,6 +36,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import msgspec
 import numpy as np
 import partitura
 from PIL import Image, ImageDraw
@@ -632,7 +633,7 @@ def main(argv: list[str] | None = None) -> int:
 
     report_path = out / "acceptance.json"
     payload = {
-        "spec": spec.to_dict(),
+        "spec": msgspec.to_builtins(spec),
         "preview": args.preview,
         "results": [record.record() for record in results],
     }

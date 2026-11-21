@@ -20,10 +20,10 @@ import logging
 import re
 import time
 from collections import Counter
-from dataclasses import replace
 from pathlib import Path
 
 import pymupdf
+from msgspec.structs import replace
 
 from ..errors import AnalysisError
 from ..model import PageInfo, Rect, StaffLayout, System

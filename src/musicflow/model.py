@@ -18,136 +18,15 @@ Conventions used by every module:
 from __future__ import annotations
 
 import bisect
-import types
-from dataclasses import dataclass, fields
-from functools import cache
-from typing import Any, Literal, Self, Union, get_args, get_origin, get_type_hints
+from typing import Literal
+
+from msgspec import Struct
 
 RouteSource = Literal["written", "auto_repeats", "override"]
 AnchorKind = Literal["start", "onset", "manual", "end"]
 
 
-class Payload:
-    """JSON shape of a payload dataclass: one reflective encoder and one strict decoder.
-
-    The encoder writes the declared field names, so the artifact is readable and a new field is a
-    one-line change. The decoder accepts only the exact shape it was written from: an unknown or
-    missing key raises, so a payload of another code shape is never half-filled; the pipeline
-    version in the cache key is what keeps such a payload from being read back at all.
-    """
-
-    __slots__ = ()
-
-    def to_dict(self) -> dict[str, Any]:
-        return {field.name: _encode(getattr(self, field.name)) for field in fields(self)}
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> Self:
-        return _decode(cls, data)
-
-
-def _encode(value: Any) -> Any:
-    if isinstance(value, Payload):
-        return value.to_dict()
-    if isinstance(value, (tuple, list)):
-        return [_encode(item) for item in value]
-    if isinstance(value, dict):
-        return {key: _encode(item) for key, item in value.items()}
-    return value
-
-
-@cache
-def _hints(cls: type) -> dict[str, Any]:
-    return get_type_hints(cls)
-
-
-def _decode(cls: type[Payload], data: Any, path: str | None = None) -> Any:
-    path = cls.__name__ if path is None else path
-    if not isinstance(data, dict):
-        raise ValueError(f"{path}: expected a JSON object, got {type(data).__name__}")
-    hints = _hints(cls)
-    names = [field.name for field in fields(cls)]
-    unknown = sorted(set(data) - set(names))
-    if unknown:
-        raise ValueError(f"{path}: unknown field(s) {unknown}")
-    missing = [name for name in names if name not in data]
-    if missing:
-        raise ValueError(f"{path}: missing field(s) {missing}")
-    return cls(**{name: _decode_field(hints[name], data[name], f"{path}.{name}") for name in names})
-
-
-def _decode_field(annotation: Any, value: Any, path: str) -> Any:
-    origin = get_origin(annotation)
-    if origin is types.UnionType or origin is Union:
-        allowed = get_args(annotation)
-        if value is None:
-            if type(None) in allowed:
-                return None
-            raise ValueError(f"{path}: null is not allowed")
-        inner = [item for item in allowed if item is not type(None)]
-        assert len(inner) == 1, f"{path}: only a single optional type is supported"
-        return _decode_field(inner[0], value, path)
-    if origin is Literal:
-        allowed = get_args(annotation)
-        if value not in allowed:
-            raise ValueError(f"{path}: {value!r} is not one of {allowed}")
-        return value
-    if origin is tuple:
-        return _decode_tuple(annotation, value, path)
-    if origin is dict:
-        key_type, value_type = get_args(annotation)
-        assert key_type is str, f"{path}: only string keys are supported"
-        if not isinstance(value, dict):
-            raise ValueError(f"{path}: expected a JSON object, got {type(value).__name__}")
-        return {
-            key: _decode_field(value_type, item, f"{path}.{key}") for key, item in value.items()
-        }
-    if annotation is Any:
-        return value
-    if annotation is bool:
-        if not isinstance(value, bool):
-            raise ValueError(f"{path}: expected a boolean, got {type(value).__name__}")
-        return value
-    if annotation is float:
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            raise ValueError(f"{path}: expected a number, got {type(value).__name__}")
-        return float(value)
-    if annotation is int:
-        if isinstance(value, bool):
-            raise ValueError(f"{path}: expected an integer, got {value!r}")
-        if isinstance(value, int):
-            return value
-        if isinstance(value, float) and value.is_integer():
-            return int(value)
-        raise ValueError(f"{path}: expected an integer, got {value!r}")
-    if annotation is str:
-        if not isinstance(value, str):
-            raise ValueError(f"{path}: expected a string, got {type(value).__name__}")
-        return value
-    if isinstance(annotation, type) and issubclass(annotation, Payload):
-        return _decode(annotation, value, path)
-    raise TypeError(f"{path}: unsupported annotation {annotation!r}")
-
-
-def _decode_tuple(annotation: Any, value: Any, path: str) -> tuple[Any, ...]:
-    if not isinstance(value, (list, tuple)):
-        raise ValueError(f"{path}: expected a JSON array, got {type(value).__name__}")
-    items = tuple(value)
-    args = get_args(annotation)
-    if len(args) == 2 and args[1] is Ellipsis:
-        return tuple(
-            _decode_field(args[0], item, f"{path}[{index}]") for index, item in enumerate(items)
-        )
-    if len(args) != len(items):
-        raise ValueError(f"{path}: expected {len(args)} items, got {len(items)}")
-    return tuple(
-        _decode_field(arg, item, f"{path}[{index}]")
-        for index, (arg, item) in enumerate(zip(args, items, strict=True))
-    )
-
-
-@dataclass(frozen=True, slots=True)
-class Rect(Payload):
+class Rect(Struct, frozen=True, forbid_unknown_fields=True):
     x0: float
     y0: float
     x1: float
@@ -177,15 +56,13 @@ class Rect(Payload):
         )
 
 
-@dataclass(frozen=True, slots=True)
-class PartInfo(Payload):
+class PartInfo(Struct, frozen=True, forbid_unknown_fields=True):
     id: str
     name: str
     staves: int
 
 
-@dataclass(frozen=True, slots=True)
-class MeasureInfo(Payload):
+class MeasureInfo(Struct, frozen=True, forbid_unknown_fields=True):
     index: int
     start_q: float
     length_q: float
@@ -195,8 +72,7 @@ class MeasureInfo(Payload):
         return self.start_q + self.length_q
 
 
-@dataclass(frozen=True, slots=True)
-class Repeat(Payload):
+class Repeat(Struct, frozen=True, forbid_unknown_fields=True):
     """A written repeat/jump instruction, in measure numbers."""
 
     kind: Literal["repeat_span", "da_capo", "dal_segno", "fine", "segno", "coda"]
@@ -205,8 +81,7 @@ class Repeat(Payload):
     times: int = 2
 
 
-@dataclass(frozen=True, slots=True)
-class NoteEvent(Payload):
+class NoteEvent(Struct, frozen=True, forbid_unknown_fields=True):
     """One sounding note of the written score."""
 
     id: str
@@ -223,8 +98,7 @@ class NoteEvent(Payload):
         return self.onset_q + self.duration_q
 
 
-@dataclass(frozen=True, slots=True)
-class Score(Payload):
+class Score(Struct, frozen=True, forbid_unknown_fields=True):
     """The written score: what is on the page, before any performance route is applied.
 
     Invariants: ``notes`` are ordered by ``onset_q``; every note's measure exists; measure
@@ -263,8 +137,7 @@ class Score(Payload):
         return {n.id: n for n in self.notes}
 
 
-@dataclass(frozen=True, slots=True)
-class MeasurePass(Payload):
+class MeasurePass(Struct, frozen=True, forbid_unknown_fields=True):
     """One appearance of a written measure in the performance."""
 
     measure: int
@@ -273,8 +146,7 @@ class MeasurePass(Payload):
     length_q: float
 
 
-@dataclass(frozen=True, slots=True)
-class PerformanceNote(Payload):
+class PerformanceNote(Struct, frozen=True, forbid_unknown_fields=True):
     """A written note placed at one performance position.
 
     The route owns only where and when the note sounds; pitch, duration, part, staff and voice
@@ -288,8 +160,7 @@ class PerformanceNote(Payload):
     onset_q: float
 
 
-@dataclass(frozen=True, slots=True)
-class Route(Payload):
+class Route(Struct, frozen=True, forbid_unknown_fields=True):
     """The performance route: which written measures are played, in which order.
 
     Invariants: ``passes`` are contiguous and ordered, ``notes`` are ordered by ``onset_q`` and each
@@ -320,8 +191,7 @@ class Route(Payload):
         )
 
 
-@dataclass(frozen=True, slots=True)
-class Anchor(Payload):
+class Anchor(Struct, frozen=True, forbid_unknown_fields=True):
     """A verified correspondence between a performance position and a recording time."""
 
     q: float
@@ -330,8 +200,7 @@ class Anchor(Payload):
     confidence: float = 1.0
 
 
-@dataclass(frozen=True, slots=True)
-class Alignment(Payload):
+class Alignment(Struct, frozen=True, forbid_unknown_fields=True):
     """Score-to-audio time map.
 
     The map is the piecewise linear interpolation of ``anchors``, which must be strictly
@@ -369,15 +238,13 @@ class Alignment(Payload):
         return left.seconds + ratio * (right.seconds - left.seconds)
 
 
-@dataclass(frozen=True, slots=True)
-class PageInfo(Payload):
+class PageInfo(Struct, frozen=True, forbid_unknown_fields=True):
     number: int
     width: float
     height: float
 
 
-@dataclass(frozen=True, slots=True)
-class System(Payload):
+class System(Struct, frozen=True, forbid_unknown_fields=True):
     """One staff system of a PDF page, in PDF points.
 
     ``printed_measure`` is the measure number engraved at the start of the system when the PDF has
@@ -396,8 +263,7 @@ class System(Payload):
     printed_measure: int | None = None
 
 
-@dataclass(frozen=True, slots=True)
-class StaffLayout(Payload):
+class StaffLayout(Struct, frozen=True, forbid_unknown_fields=True):
     pages: tuple[PageInfo, ...]
     systems: tuple[System, ...]
     unconfirmed: tuple[str, ...] = ()
@@ -409,8 +275,7 @@ class StaffLayout(Payload):
         assert indices == list(range(1, len(self.systems) + 1)), "system indices are not 1..n"
 
 
-@dataclass(frozen=True, slots=True)
-class Tile(Payload):
+class Tile(Struct, frozen=True, forbid_unknown_fields=True):
     """One rasterised horizontal slice of the engraved strip.
 
     ``path`` is relative to the flow step directory. The tile image is 1 pixel per strip unit,
@@ -423,8 +288,7 @@ class Tile(Payload):
     height: int
 
 
-@dataclass(frozen=True, slots=True)
-class FlowLayout(Payload):
+class FlowLayout(Struct, frozen=True, forbid_unknown_fields=True):
     """Engraved continuous strip: one very wide system, rasterised in tiles."""
 
     strip_width: float
@@ -444,8 +308,7 @@ class FlowLayout(Payload):
         return dict(self.note_x)
 
 
-@dataclass(frozen=True, slots=True)
-class VideoSpec(Payload):
+class VideoSpec(Struct, frozen=True, forbid_unknown_fields=True):
     """Canvas and palette of the produced video."""
 
     width: int = 1920

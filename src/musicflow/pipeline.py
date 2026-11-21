@@ -16,6 +16,8 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any, Literal
 
+import msgspec
+
 from . import scorexml, workdir
 from .errors import InputError, UnsupportedInputError
 from .model import Alignment, FlowLayout, Route, Score, StaffLayout, VideoSpec
@@ -25,7 +27,7 @@ logger = logging.getLogger(__name__)
 Mode = Literal["switch", "flow"]
 # Bump when a stage's behaviour changes: every cache key includes it, so stale artifacts from an
 # older algorithm can never be mistaken for current output.
-PIPELINE_VERSION = 7
+PIPELINE_VERSION = 8
 REPORT_NAME = "report.json"
 # The alignment evidence the merged report repeats: the rest of it stays in ``align/report.json``.
 HEADLINE_KEYS = ("audio_duration", "implied_bpm", "similarity_mean", "coverage", "residual_ms")
@@ -77,6 +79,7 @@ class Analysis:
     layout: StaffLayout | None
     flow: FlowLayout | None
     align_report: dict[str, Any]
+    tiles_dir: Path | None = None
 
 
 def _tool_versions(*names: str) -> dict[str, str]:
@@ -108,153 +111,6 @@ def _input_records(inputs: Inputs) -> dict[str, dict[str, Any]]:
     }
 
 
-def _digests(records: dict[str, dict[str, Any]]) -> dict[str, str]:
-    """One sha256 per input file, for the cache keys of the steps that read it."""
-    return {name: record["sha256"] for name, record in records.items()}
-
-
-def _symbolic_step(
-    inputs: Inputs, digests: dict[str, str], workspace: workdir.Workspace
-) -> tuple[Score, Path]:
-    from . import symbolic
-
-    step = workspace.step("symbolic")
-    written = step.path / "written.musicxml"
-    key = workdir.key(
-        {"symbolic": digests["symbolic"]},
-        _tool_versions("partitura", "lxml"),
-    )
-
-    def compute(_: Path) -> dict[str, Any]:
-        return symbolic.load_score(inputs.symbolic, written_path=written).to_dict()
-
-    return Score.from_dict(step.run(key, compute, validate=lambda _: written.is_file())), written
-
-
-def _pdf_step(
-    inputs: Inputs,
-    digests: dict[str, str],
-    score: Score,
-    workspace: workdir.Workspace,
-    debug_images: bool,
-) -> StaffLayout:
-    """Detect the staff geometry of the PDF; the measure binding is not part of this payload."""
-    from . import pdf
-
-    step = workspace.step("pdf")
-    expected_staves = score.staff_count
-    key = workdir.key(
-        {"pdf": digests["pdf"]},
-        {
-            "expected_staves": expected_staves,
-            # The request decides which side files the step writes, so it belongs to its key.
-            "debug_images": debug_images,
-            **_tool_versions("pymupdf", "opencv-python-headless"),
-        },
-    )
-
-    def compute(path: Path) -> dict[str, Any]:
-        return pdf.detect_layout(
-            inputs.pdf,
-            expected_staves=expected_staves,
-            debug_dir=path / "debug" if debug_images else None,
-        ).to_dict()
-
-    layout = StaffLayout.from_dict(step.run(key, compute))
-    logger.info("pdf: %d systems on %d pages", len(layout.systems), len(layout.pages))
-    return layout
-
-
-def _align_step(
-    inputs: Inputs,
-    digests: dict[str, str],
-    score: Score,
-    score_digest: str,
-    route: Route,
-    workspace: workdir.Workspace,
-) -> tuple[Alignment, dict[str, Any]]:
-    from . import align
-
-    step = workspace.step("align")
-    digests_for_key = {"audio": digests["audio"]}
-    if inputs.anchors is not None:
-        digests_for_key["anchors"] = digests["anchors"]
-    key = workdir.key(
-        digests_for_key,
-        {
-            # The attacks the aligner hears come from the written score as much as from the route.
-            "score": score_digest,
-            "route": workdir.hash_payload(route.to_dict()),
-            **_tool_versions("librosa", "numpy"),
-        },
-    )
-
-    def compute(path: Path) -> dict[str, Any]:
-        return align.align(
-            score,
-            route,
-            inputs.audio,
-            work_dir=path,
-            constraints=inputs.anchors,
-        ).to_dict()
-
-    payload = step.run(key, compute, validate=lambda _: (step.path / "report.json").is_file())
-    alignment = Alignment.from_dict(payload)
-    report_path = step.path / "report.json"
-    report: dict[str, Any] = workdir.read_json(report_path) if report_path.is_file() else {}
-    logger.info(
-        "align: %s, %d anchors, audio %.1f s",
-        alignment.method,
-        len(alignment.anchors),
-        alignment.audio_duration,
-    )
-    return alignment, report
-
-
-def _flow_step(
-    score: Score,
-    score_digest: str,
-    written: Path,
-    spec: VideoSpec,
-    workspace: workdir.Workspace,
-) -> FlowLayout:
-    from . import flow
-    from .render.flow import CONTENT_HEIGHT_RATIO
-
-    step = workspace.step("flow")
-    target_height = int(spec.height * CONTENT_HEIGHT_RATIO)
-    key = workdir.key(
-        {"written": workdir.digest_file(written)},
-        {
-            "score": score_digest,
-            "target_content_height": target_height,
-            "paper": spec.background,
-            **_tool_versions("verovio", "resvg-py"),
-        },
-    )
-
-    def compute(path: Path) -> dict[str, Any]:
-        return flow.build_layout(
-            score,
-            written,
-            work_dir=path,
-            target_content_height=target_height,
-            paper=spec.background,
-        ).to_dict()
-
-    def present(payload: dict[str, Any]) -> bool:
-        return all((step.path / tile["path"]).is_file() for tile in payload["tiles"])
-
-    layout = FlowLayout.from_dict(step.run(key, compute, validate=present))
-    logger.info(
-        "flow: strip %.0f x %.0f units, %d tiles",
-        layout.strip_width,
-        layout.strip_height,
-        len(layout.tiles),
-    )
-    return layout
-
-
 def analyze(
     inputs: Inputs,
     workspace: workdir.Workspace,
@@ -270,52 +126,93 @@ def analyze(
     ``flow`` displays, and ``debug_images`` the diagnostic bitmaps of the PDF detection. The merged
     ``<workspace>/report.json`` is written from the result; see ``checks`` for its check section.
     """
+    from . import align, symbolic
+
     inputs.validate()
     started = time.monotonic()
     timings: dict[str, float] = {}
     records = _input_records(inputs)
-    digests = _digests(records)
+    digests = {name: record["sha256"] for name, record in records.items()}
 
     stage = time.monotonic()
-    score, written = _symbolic_step(inputs, digests, workspace)
-    timings["symbolic"] = round(time.monotonic() - stage, 3)
-
-    from . import symbolic
-
-    route = symbolic.build_route(score, override=inputs.route_override)
-    logger.info(
-        "route: %s, %d measure passes, %.1f quarter notes",
-        route.source,
-        len(route.passes),
-        route.total_q,
+    symbolic_key = workdir.key(digests["symbolic"], _tool_versions("partitura", "lxml"))
+    symbolic_step = workspace.step("symbolic", symbolic_key)
+    written = symbolic_step.path / "written.musicxml"
+    score = symbolic_step.run(
+        Score,
+        lambda path: symbolic.load_score(inputs.symbolic, written_path=path / written.name),
+        present=lambda _: written.is_file(),
     )
-    score_digest = workdir.hash_payload(score.to_dict())
+    timings["symbolic"] = round(time.monotonic() - stage, 3)
+    route = symbolic.build_route(score, override=inputs.route_override)
 
     layout = None
+    debug_dir = None
     if with_pdf:
         from . import pdf
 
         stage = time.monotonic()
-        layout = pdf.bind_measures(
-            _pdf_step(inputs, digests, score, workspace, debug_images),
-            score,
-            override=inputs.staff_override,
+        pdf_key = workdir.key(
+            digests["pdf"],
+            score.staff_count,
+            debug_images,
+            _tool_versions("pymupdf", "opencv-python-headless"),
         )
+        pdf_step = workspace.step("pdf", pdf_key)
+        detected = pdf_step.run(
+            StaffLayout,
+            lambda path: pdf.detect_layout(
+                inputs.pdf,
+                expected_staves=score.staff_count,
+                debug_dir=path / "debug" if debug_images else None,
+            ),
+            present=lambda _: not debug_images or (pdf_step.path / "debug").is_dir(),
+        )
+        layout = pdf.bind_measures(detected, score, override=inputs.staff_override)
+        debug_dir = pdf_step.path / "debug" if debug_images else None
         timings["pdf"] = round(time.monotonic() - stage, 3)
-        logger.info(
-            "measures: %d of %d systems bound to a measure range",
-            sum(1 for system in layout.systems if system.first_measure is not None),
-            len(layout.systems),
-        )
 
     stage = time.monotonic()
-    alignment, align_report = _align_step(inputs, digests, score, score_digest, route, workspace)
+    align_key = workdir.key(
+        digests["audio"],
+        digests.get("anchors"),
+        digests.get("route_override"),
+        symbolic_key,
+        _tool_versions("librosa", "numpy"),
+    )
+    align_step = workspace.step("align", align_key)
+    evidence_path = align_step.path / "report.json"
+    alignment = align_step.run(
+        Alignment,
+        lambda path: align.align(
+            score, route, inputs.audio, work_dir=path, constraints=inputs.anchors
+        ),
+        present=lambda _: evidence_path.is_file(),
+    )
+    align_report = workdir.read_json(evidence_path)
     timings["align"] = round(time.monotonic() - stage, 3)
 
-    flow_layout = None
+    flow_layout = tiles_dir = None
     if with_flow:
+        from . import flow
+        from .render.flow import CONTENT_HEIGHT_RATIO
+
         stage = time.monotonic()
-        flow_layout = _flow_step(score, score_digest, written, spec, workspace)
+        height = int(spec.height * CONTENT_HEIGHT_RATIO)
+        flow_key = workdir.key(
+            symbolic_key, height, spec.background, _tool_versions("verovio", "resvg-py")
+        )
+        flow_step = workspace.step("flow", flow_key)
+        flow_layout = flow_step.run(
+            FlowLayout,
+            lambda path: flow.build_layout(
+                score, written, work_dir=path, target_content_height=height, paper=spec.background
+            ),
+            present=lambda layout: all(
+                (flow_step.path / tile.path).is_file() for tile in layout.tiles
+            ),
+        )
+        tiles_dir = flow_step.path
         timings["flow"] = round(time.monotonic() - stage, 3)
 
     timings["total"] = round(time.monotonic() - started, 3)
@@ -326,8 +223,9 @@ def analyze(
         layout=layout,
         flow=flow_layout,
         align_report=align_report,
+        tiles_dir=tiles_dir,
     )
-    _write_report(workspace, records, spec, analysis, timings, debug_images)
+    _write_report(workspace, records, spec, analysis, timings, evidence_path, debug_dir)
     logger.info("analysis finished in %.1f s", timings["total"])
     return analysis
 
@@ -338,30 +236,22 @@ def _write_report(
     spec: VideoSpec,
     analysis: Analysis,
     timings: dict[str, float],
-    debug_images: bool,
-) -> Path:
-    """Write the one report of a run: inputs, tools, summaries, checks, artifacts and timings.
-
-    The alignment contributes its headline numbers only; the measured evidence stays in the
-    ``align/report.json`` this maps under ``artifacts``. ``artifacts.videos`` stays empty until a
-    render adds its mode, and names only files that exist.
-    """
+    evidence_path: Path,
+    debug_dir: Path | None,
+) -> None:
     score = analysis.score
     route = analysis.route
     alignment = analysis.alignment
     layout = analysis.layout
     flow = analysis.flow
     evidence = analysis.align_report
-    align_dir = workspace.step("align").path
-    align_report = align_dir / "report.json"
-    figure = align_dir / "alignment.png"
-    debug_dir = workspace.step("pdf").path / "debug"
+    figure = evidence_path.with_name("alignment.png")
     payload = {
         "inputs": records,
         "tools": _tool_versions(
             "partitura", "pymupdf", "opencv-python-headless", "verovio", "resvg-py", "librosa"
         ),
-        "spec": spec.to_dict(),
+        "spec": msgspec.to_builtins(spec),
         "score": {
             "title": score.title,
             "staves": score.staff_count,
@@ -402,19 +292,15 @@ def _write_report(
         },
         "checks": checks(analysis),
         "artifacts": {
-            "align_report": str(align_report.resolve()) if align_report.is_file() else None,
+            "align_report": str(evidence_path.resolve()),
             "alignment_figure": str(figure.resolve()) if figure.is_file() else None,
-            "debug_images": str(debug_dir.resolve())
-            if debug_images and debug_dir.is_dir()
-            else None,
-            "videos": {},
+            "debug_images": str(debug_dir.resolve()) if debug_dir else None,
         },
         "timings": timings,
     }
     path = workspace.root / REPORT_NAME
     workdir.write_json(path, payload)
     logger.info("wrote report %s", path)
-    return path
 
 
 def render(
@@ -425,28 +311,15 @@ def render(
     out: Path,
     spec: VideoSpec,
     preview: float | None = None,
-    analysis: Analysis | None = None,
+    analysis: Analysis,
 ) -> Path:
-    """Render one video and return its path.
-
-    Without ``analysis`` the stages the mode displays run first; with one, the analysis must
-    already carry what the mode needs (``layout`` for ``switch``, ``flow`` for ``flow``).
-    """
+    """Render one video from completed analysis."""
     from . import render as renderer
 
-    assert mode in ("switch", "flow")
-    if analysis is None:
-        analysis = analyze(
-            inputs,
-            workspace,
-            spec=spec,
-            with_pdf=mode == "switch",
-            with_flow=mode == "flow",
-        )
     if mode == "switch":
         assert analysis.layout is not None, "switch rendering needs the PDF staff layout"
     else:
-        assert analysis.flow is not None, "flow rendering needs the engraved flow layout"
+        assert analysis.flow is not None and analysis.tiles_dir is not None
     target = out if out.is_absolute() else Path.cwd() / out
     target.parent.mkdir(parents=True, exist_ok=True)
     work_dir = workspace.root / f"render-{mode}"
@@ -473,15 +346,10 @@ def render(
             spec=spec,
             out=target,
             work_dir=work_dir,
-            tiles_dir=workspace.step("flow").path,
+            tiles_dir=analysis.tiles_dir,
             preview=preview,
             audio=inputs.audio,
         )
-    report_path = workspace.root / REPORT_NAME
-    if report_path.is_file():
-        report = workdir.read_json(report_path)
-        report["artifacts"]["videos"][mode] = str(produced)
-        workdir.write_json(report_path, report)
     logger.info("rendered %s in %.1f s", produced, time.monotonic() - started)
     return produced
 
