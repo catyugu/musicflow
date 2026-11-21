@@ -1,9 +1,8 @@
 """Segmented ffmpeg encoding: raw RGB frames in, one MP4 with the original audio out.
 
 Frames are produced on demand from an absolute frame index, so a resumed run never re-renders a
-segment that is already complete. Segments carry a digest of the render parameters in their name:
-a completed segment is trusted only when its name matches the current parameters *and* ffprobe
-confirms its frame count, so neither a changed camera nor a half-written file can be reused.
+segment that is already complete. Segments carry a digest of the render parameters in their name,
+and a completed segment is trusted only when the name matches *and* ffprobe confirms its frames.
 """
 
 from __future__ import annotations
@@ -31,13 +30,11 @@ from .canvas import parameters_digest
 logger = logging.getLogger(__name__)
 
 SEGMENT_FRAMES = 600
-# x264 speed preset for the segment encoder. Measured on the real case1 flow preview (1920x1080,
-# 10 s = 300 frames, crf 18, median of three runs): medium 1.55 s wall / 17.6 s cpu / 2.08 MB,
-# faster 1.22 s / 12.8 s / 2.40 MB (+15.1%), veryfast 1.09 s / 9.75 s / 2.56 MB (+23.2%). No
-# faster preset is both ~1.8x quicker and at most ~15% larger, and at 1920x1080 the encode step adds
-# ~5 ms/frame of wall time to a frame source that needs 25-90 ms/frame, so the preset cannot shorten
-# a render by more than a few percent; 15-23% more bytes for that is not worth it.
+# x264 "medium" is the preset of record: measured on the case1 flow preview at 1920x1080 (crf 18),
+# "faster" saved 21% wall time for 15% more bytes and "veryfast" 30% for 23%; the encoder adds only
+# ~5 ms/frame to a 25-90 ms/frame frame source, so neither is worth the bytes.
 X264_PRESET = "medium"
+_FFMPEG_QUIET = ("-hide_banner", "-nostdin", "-loglevel", "error", "-nostats")
 _DURATION_TOLERANCE = 0.1
 _STDERR_TAIL = 4000
 
@@ -52,10 +49,9 @@ class Timeline:
     frames: int
 
 
-# Where the most recently completed encode spent its wall time: total, inside the frame source
-# (composing), blocked writing frames into ffmpeg's stdin (feeding, also the encoder holding the
-# producer back), and muxing. The acceptance harness reads it; rendering is one video at a time in
-# this process, so no result object has to be threaded through the render signatures.
+# Wall time of the most recent encode: inside the frame source (composing), writing into ffmpeg and
+# muxing (encoding), plus the frames and segments that were new or reused. The acceptance harness
+# reads it; rendering is one video at a time in this process.
 LAST_STATS: dict[str, float | int] | None = None
 
 
@@ -165,21 +161,24 @@ def encode(
         preview=preview,
     )
     muxing = time.perf_counter() - muxing_started
+    encoding = feeding + muxing
     global LAST_STATS
     LAST_STATS = {
-        "seconds": round(time.perf_counter() - started, 3),
         "composing": round(composing, 3),
-        "feeding": round(feeding, 3),
-        "muxing": round(muxing, 3),
+        "encoding": round(encoding, 3),
         "frames": encoded,
         "segments": len(segments),
         "cached_segments": cached,
     }
     logger.info(
-        f"{kind}: wrote {out}, {LAST_STATS['seconds']:.2f} s total "
-        f"({LAST_STATS['composing']:.1f} s composing, "
-        f"{LAST_STATS['feeding']:.1f} s feeding ffmpeg, "
-        f"{LAST_STATS['muxing']:.1f} s muxing), {count - cached}/{count} segments encoded"
+        "%s: wrote %s in %.1f s (%.1f s composing, %.1f s encoding), %d/%d segments encoded",
+        kind,
+        out,
+        time.perf_counter() - started,
+        composing,
+        encoding,
+        count - cached,
+        count,
     )
     logger.debug("%s: muxed duration %.3f s", kind, measured)
     return out
@@ -227,11 +226,7 @@ def _encode_segment(
     """Encode one segment and return the seconds spent composing frames and feeding ffmpeg."""
     command = [
         ffmpeg,
-        "-hide_banner",
-        "-nostdin",
-        "-loglevel",
-        "error",
-        "-nostats",
+        *_FFMPEG_QUIET,
         "-f",
         "rawvideo",
         "-pix_fmt",
@@ -296,32 +291,29 @@ def _encode_segment(
     return composing, feeding
 
 
-def _probe_value(path: Path, ffprobe: str, entries: str, extra: tuple[str, ...] = ()) -> str:
+def _ffprobe(path: Path, ffprobe: str, *query: str) -> str:
+    """The value ffprobe reports for ``query``, or "" when it cannot read the file."""
     result = _run(
         [
             ffprobe,
             "-v",
             "error",
-            "-select_streams",
-            "v:0",
-            *extra,
-            "-show_entries",
-            entries,
+            *query,
             "-of",
             "default=noprint_wrappers=1:nokey=1",
             str(path),
         ]
     )
-    if result.returncode != 0:
-        return ""
-    return result.stdout.strip().splitlines()[0].strip() if result.stdout.strip() else ""
+    lines = result.stdout.strip().splitlines()
+    return lines[0].strip() if result.returncode == 0 and lines else ""
 
 
 def _segment_frames(path: Path, ffprobe: str) -> int | None:
-    value = _probe_value(path, ffprobe, "stream=nb_frames")
-    if value.isdigit():
-        return int(value)
-    value = _probe_value(path, ffprobe, "stream=nb_read_frames", extra=("-count_frames",))
+    stream = ("-select_streams", "v:0")
+    value = _ffprobe(path, ffprobe, *stream, "-show_entries", "stream=nb_frames")
+    if not value.isdigit():
+        counted = ("-count_frames", "-show_entries", "stream=nb_read_frames")
+        value = _ffprobe(path, ffprobe, *stream, *counted)
     return int(value) if value.isdigit() else None
 
 
@@ -368,11 +360,7 @@ def _mux(
     temporary = out.with_name(f"{out.stem}.part{out.suffix}")
     command = [
         ffmpeg,
-        "-hide_banner",
-        "-nostdin",
-        "-loglevel",
-        "error",
-        "-nostats",
+        *_FFMPEG_QUIET,
         "-f",
         "concat",
         "-safe",
@@ -414,21 +402,7 @@ def _mux(
 
 
 def _duration_of(path: Path, ffprobe: str) -> float:
-    result = _run(
-        [
-            ffprobe,
-            "-v",
-            "error",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-            str(path),
-        ]
-    )
-    if result.returncode != 0:
-        raise RenderError(f"cannot read the duration of {path}: {_tail(result.stderr)}")
     try:
-        return float(result.stdout.strip())
+        return float(_ffprobe(path, ffprobe, "-show_entries", "format=duration"))
     except ValueError:
         raise RenderError(f"cannot read the duration of {path}") from None

@@ -113,8 +113,11 @@ def line_fraction(frame: np.ndarray, spec: VideoSpec) -> float:
     return float(matches.mean())
 
 
-def test_switch_preview(preview: Preview, media: type[Media]) -> None:
-    sampler = media(preview.switch)
+@pytest.mark.parametrize("mode", ("switch", "flow"))
+def test_preview(preview: Preview, mode: str) -> None:
+    """A preview is ``PREVIEW`` seconds of frames at the case's spec, and shows the score."""
+    video = getattr(preview, mode)
+    sampler = Media(video)
     info = sampler.probe()
     assert (info.width, info.height) == (SPEC.width, SPEC.height)
     assert info.fps == pytest.approx(SPEC.fps, abs=0.01)
@@ -122,36 +125,23 @@ def test_switch_preview(preview: Preview, media: type[Media]) -> None:
     assert info.duration == pytest.approx(PREVIEW, abs=0.15)
 
     samples = [
-        sampler.frame_at(t, preview.switch.with_name(f"switch-{index}.png"))
-        for index, t in enumerate((0.5, 2.0, 4.0, 5.5))
+        sampler.frame_at(moment, video.with_name(f"{mode}-{index}.png"))
+        for index, moment in enumerate((0.5, 2.0, 4.0, 5.5))
     ]
     inks = [ink_fraction(frame) for frame in samples]
-    assert min(inks) > 0.01, f"a switch frame is blank: ink fractions {inks}"
-    # The switch display shows the page as printed and draws no reading line.
-    assert all(line_fraction(frame, SPEC) < 0.2 for frame in samples)
-
-
-def test_flow_preview(preview: Preview, media: type[Media]) -> None:
-    sampler = media(preview.flow)
-    info = sampler.probe()
-    assert (info.width, info.height) == (SPEC.width, SPEC.height)
-    assert info.frames == pytest.approx(PREVIEW * SPEC.fps, abs=1)
-    assert info.duration == pytest.approx(PREVIEW, abs=0.15)
-
-    samples = [
-        sampler.frame_at(t, preview.flow.with_name(f"flow-{index}.png"))
-        for index, t in enumerate((0.5, 2.0, 4.0, 5.5))
-    ]
-    inks = [ink_fraction(frame) for frame in samples]
-    assert min(inks) > 0.01, f"a flow frame is blank: ink fractions {inks}"
+    assert min(inks) > 0.01, f"a {mode} frame is blank: ink fractions {inks}"
     lines = [line_fraction(frame, SPEC) for frame in samples]
-    assert min(lines) > 0.9, f"the reading line is missing or broken: {lines}"
-    # The score must actually move: the frame at 5.5 s differs from the frame at 0.5 s.
-    difference = np.abs(samples[0] - samples[-1]).mean()
-    assert difference > 2.0, f"flow frames barely differ (mean abs diff {difference:.2f})"
+    if mode == "flow":
+        assert min(lines) > 0.9, f"the reading line is missing or broken: {lines}"
+        # The score must actually move: the frame at 5.5 s differs from the frame at 0.5 s.
+        difference = np.abs(samples[0] - samples[-1]).mean()
+        assert difference > 2.0, f"flow frames barely differ (mean abs diff {difference:.2f})"
+    else:
+        # The switch display shows the page as printed and draws no reading line.
+        assert all(line < 0.2 for line in lines)
 
 
-def test_switch_from_midi(build_dir: Path, media: type[Media]) -> None:
+def test_switch_from_midi(build_dir: Path) -> None:
     case = _case("case1")
     if not case.has(".mid"):
         pytest.skip("no MIDI in this case")
@@ -164,7 +154,7 @@ def test_switch_from_midi(build_dir: Path, media: type[Media]) -> None:
         spec=SPEC,
         preview=4.0,
     )
-    sampler = media(video)
+    sampler = Media(video)
     info = sampler.probe()
     assert info.frames == pytest.approx(4.0 * SPEC.fps, abs=1)
     assert ink_fraction(sampler.frame_at(2.0, video.with_name("switch-midi-2.png"))) > 0.01
@@ -188,7 +178,10 @@ def test_analysis_reports_binding_and_alignment(preview: Preview) -> None:
     report = preview.report
     assert report["score"]["provider"] == "musicxml"
     layout = report["layout"]
-    assert layout["bound_systems"] == layout["systems"] > 0
+    assert layout["systems"] > 0, "the report carries no detected system"
+    # Binding is strict, so every system of a successful analysis carries its measure range; the
+    # report no longer repeats the count, the layout itself is the evidence.
+    assert all(system.first_measure is not None for system in preview.analysis.layout.systems)
     assert report["alignment"]["anchors"] >= 2
     assert report["alignment"]["audio_duration"] > 0
     assert report["route"]["total_q"] > 0
@@ -222,7 +215,7 @@ def test_render_reuses_cached_segments(preview: Preview) -> None:
     assert before == after, "a cached render re-encoded its segments"
 
 
-def test_flow_segments_join_without_gaps(build_dir: Path, media: type[Media]) -> None:
+def test_flow_segments_join_without_gaps(build_dir: Path) -> None:
     case = _case("case1")
     prepared = preview_of(case, build_dir)
     preview_seconds = 61.0  # more than one 600-frame segment at 10 fps
@@ -235,6 +228,6 @@ def test_flow_segments_join_without_gaps(build_dir: Path, media: type[Media]) ->
         preview=preview_seconds,
         analysis=prepared.analysis,
     )
-    info = media(video).probe()
+    info = Media(video).probe()
     assert info.frames == pytest.approx(preview_seconds * SPEC.fps, abs=1)
     assert info.duration == pytest.approx(preview_seconds, abs=0.2)

@@ -146,33 +146,39 @@ def _strip(directory: Path) -> FlowLayout:
     )
 
 
-def test_flow_moves_the_strip_past_the_reading_line(tmp_path: Path, media: type[Media]) -> None:
+@pytest.fixture
+def strip(tmp_path: Path) -> tuple[Path, FlowLayout]:
+    """A generated strip and the directory its tile PNGs live in."""
     tiles_dir = tmp_path / "tiles"
     tiles_dir.mkdir()
-    work = tmp_path / "work"
-    work.mkdir()
-    _, route = _score()
-    alignment = _alignment(route.total_q, 6.0)
-    flow = _strip(tiles_dir)
-    spec = VideoSpec(width=640, height=360, fps=10)
-    out = tmp_path / "flow.mp4"
+    return tiles_dir, _strip(tiles_dir)
 
-    produced = render_flow(
-        route=route,
-        alignment=alignment,
-        flow=flow,
-        spec=spec,
-        out=out,
-        work_dir=work,
-        tiles_dir=tiles_dir,
-        preview=3.0,
-        audio=_audio_excerpt(tmp_path, 6.0),
-    )
+
+@pytest.fixture
+def flow_render(strip: tuple[Path, FlowLayout], tmp_path: Path) -> dict:
+    """Every argument a flow render in this module shares: a 6 s synthetic timeline."""
+    tiles_dir, flow = strip
+    _, route = _score()
+    return {
+        "route": route,
+        "alignment": _alignment(route.total_q, 6.0),
+        "flow": flow,
+        "spec": VideoSpec(width=640, height=360, fps=10),
+        "work_dir": tmp_path / "work",
+        "tiles_dir": tiles_dir,
+        "audio": _audio_excerpt(tmp_path, 6.0),
+    }
+
+
+def test_flow_moves_the_strip_past_the_reading_line(tmp_path: Path, flow_render: dict) -> None:
+    spec = flow_render["spec"]
+    out = tmp_path / "flow.mp4"
+    produced = render_flow(**flow_render, out=out, preview=3.0)
     assert produced == out
     assert out.is_file()
 
-    early = media(out).frame_at(0.5, tmp_path / "early.png")
-    late = media(out).frame_at(2.5, tmp_path / "late.png")
+    early = Media(out).frame_at(0.5, tmp_path / "early.png")
+    late = Media(out).frame_at(2.5, tmp_path / "late.png")
     assert early.shape == (360, 640, 3), f"unexpected frame shape {early.shape}"
 
     # yuv420p subsamples chroma and x264 quantises, so a decoded pixel sits a few units away from
@@ -194,36 +200,42 @@ def test_flow_moves_the_strip_past_the_reading_line(tmp_path: Path, media: type[
     assert moved > 10.0, f"the strip did not move between 0.5 s and 2.5 s: MAD {moved:.1f}"
 
 
-def test_switch_shows_the_next_system_at_its_first_sounding_measure(
-    tmp_path: Path, media: type[Media]
-) -> None:
+def _layout(*systems: System) -> StaffLayout:
+    """A one-page score carrying ``systems`` in the order they are printed."""
+    return StaffLayout(pages=(PageInfo(1, 595.0, 842.0),), systems=systems)
+
+
+def _system(
+    index: int,
+    top: float,
+    bottom: float,
+    *,
+    measures: int,
+    first: int | None = None,
+    last: int | None = None,
+    staves: tuple[Rect, ...] | None = None,
+) -> System:
+    """One full-width printed system; ``staves`` defaults to one staff inset by 2 pt."""
+    return System(
+        index,
+        1,
+        Rect(80, top, 560, bottom),
+        (Rect(80, top + 2, 560, bottom - 30),) if staves is None else staves,
+        measure_count=measures,
+        first_measure=first,
+        last_measure=last,
+    )
+
+
+def test_switch_shows_the_next_system_at_its_first_sounding_measure(tmp_path: Path) -> None:
     pdf = CASE1 / "case1.pdf"
     if not pdf.is_file():
         pytest.skip(f"corpus PDF missing: {pdf}")
     score, route = _score()
     alignment = _alignment(route.total_q, 4.0)  # quarter 8, i.e. measure 5, at 2.0 s
-    layout = StaffLayout(
-        pages=(PageInfo(1, 595.0, 842.0),),
-        systems=(
-            System(
-                1,
-                1,
-                Rect(80, 118, 560, 278),
-                (Rect(80, 120, 560, 250),),
-                measure_count=4,
-                first_measure=1,
-                last_measure=4,
-            ),
-            System(
-                2,
-                1,
-                Rect(80, 470, 560, 640),
-                (Rect(80, 472, 560, 610),),
-                measure_count=4,
-                first_measure=5,
-                last_measure=8,
-            ),
-        ),
+    layout = _layout(
+        _system(1, 118, 278, measures=4, first=1, last=4),
+        _system(2, 470, 640, measures=4, first=5, last=8),
     )
     work = tmp_path / "work"
     work.mkdir()
@@ -244,7 +256,7 @@ def test_switch_shows_the_next_system_at_its_first_sounding_measure(
         pdf=pdf,
     )
 
-    sampler = media(out)
+    sampler = Media(out)
     early = sampler.frame_at(1.0, tmp_path / "early.png")
     late = sampler.frame_at(3.0, tmp_path / "late.png")
     assert early.shape == (360, 640, 3), f"unexpected frame shape {early.shape}"
@@ -258,7 +270,7 @@ def test_switch_shows_the_next_system_at_its_first_sounding_measure(
     for name, frame in (("1.0 s", early), ("3.0 s", late)):
         ink = float(np.mean(np.all(frame < 200, axis=2)))
         assert ink > 0.005, f"frame at {name} has almost no page content: {ink:.4f}"
-    assert abs(sampler.probe().duration - media(excerpt).probe().duration) <= 0.1
+    assert abs(sampler.probe().duration - Media(excerpt).probe().duration) <= 0.1
 
 
 def test_switch_plan_follows_a_repeat_back_to_the_first_system() -> None:
@@ -279,16 +291,9 @@ def test_switch_plan_follows_a_repeat_back_to_the_first_system() -> None:
         )
     route = Route(passes=tuple(passes), notes=tuple(notes), total_q=16.0, source="auto_repeats")
     alignment = _alignment(route.total_q, 8.0)
-    layout = StaffLayout(
-        pages=(PageInfo(1, 595.0, 842.0),),
-        systems=(
-            System(
-                1, 1, Rect(80, 100, 560, 240), (), measure_count=2, first_measure=1, last_measure=2
-            ),
-            System(
-                2, 1, Rect(80, 260, 560, 400), (), measure_count=2, first_measure=3, last_measure=4
-            ),
-        ),
+    layout = _layout(
+        _system(1, 100, 240, measures=2, first=1, last=2, staves=()),
+        _system(2, 260, 400, measures=2, first=3, last=4, staves=()),
     )
     plan = plan_switch(score=score, route=route, layout=layout, alignment=alignment, fps=10)
 
@@ -308,43 +313,21 @@ def test_switch_plan_follows_a_repeat_back_to_the_first_system() -> None:
 def test_unbound_system_is_an_analysis_error() -> None:
     score, route = _score()
     alignment = _alignment(route.total_q, 6.0)
-    layout = StaffLayout(
-        pages=(PageInfo(1, 595.0, 842.0),),
-        systems=(
-            System(
-                1, 1, Rect(80, 100, 560, 240), (), measure_count=4, first_measure=1, last_measure=4
-            ),
-            System(2, 1, Rect(80, 260, 560, 400), (), measure_count=4),
-        ),
+    layout = _layout(
+        _system(1, 100, 240, measures=4, first=1, last=4, staves=()),
+        _system(2, 260, 400, measures=4, staves=()),
     )
     with pytest.raises(AnalysisError, match=r"systems \[2\]"):
         plan_switch(score=score, route=route, layout=layout, alignment=alignment, fps=10)
 
 
-def test_output_duration_matches_the_recording(tmp_path: Path, media: type[Media]) -> None:
-    tiles_dir = tmp_path / "tiles"
-    tiles_dir.mkdir()
-    work = tmp_path / "work"
-    work.mkdir()
-    _, route = _score()
-    alignment = _alignment(route.total_q, 6.0)
-    excerpt = _audio_excerpt(tmp_path, 6.0)
+def test_output_duration_matches_the_recording(tmp_path: Path, flow_render: dict) -> None:
+    audio = flow_render["audio"]
     out = tmp_path / "full.mp4"
+    render_flow(**flow_render, out=out, preview=None)
 
-    render_flow(
-        route=route,
-        alignment=alignment,
-        flow=_strip(tiles_dir),
-        spec=VideoSpec(width=640, height=360, fps=10),
-        out=out,
-        work_dir=work,
-        tiles_dir=tiles_dir,
-        preview=None,
-        audio=excerpt,
-    )
-
-    audio_seconds = media(excerpt).probe().duration
-    produced = media(out).probe()
+    audio_seconds = Media(audio).probe().duration
+    produced = Media(out).probe()
     assert abs(produced.duration - audio_seconds) <= 0.1, (
         f"video is {produced.duration:.3f} s, recording is {audio_seconds:.3f} s"
     )
@@ -352,43 +335,25 @@ def test_output_duration_matches_the_recording(tmp_path: Path, media: type[Media
 
 
 def test_second_render_reuses_segments_and_frames_depend_only_on_time(
-    tmp_path: Path, media: type[Media]
+    tmp_path: Path, flow_render: dict
 ) -> None:
     from musicflow.render import encoder
 
-    tiles_dir = tmp_path / "tiles"
-    tiles_dir.mkdir()
-    work = tmp_path / "work"
-    work.mkdir()
-    _, route = _score()
-    alignment = _alignment(route.total_q, 6.0)
-    flow = _strip(tiles_dir)
-    spec = VideoSpec(width=640, height=360, fps=10)
-    excerpt = _audio_excerpt(tmp_path, 6.0)
-    arguments = {
-        "route": route,
-        "alignment": alignment,
-        "flow": flow,
-        "spec": spec,
-        "work_dir": work,
-        "tiles_dir": tiles_dir,
-        "audio": excerpt,
-    }
-
-    render_flow(**arguments, out=tmp_path / "once.mp4", preview=3.0)
+    work = flow_render["work_dir"]
+    render_flow(**flow_render, out=tmp_path / "once.mp4", preview=3.0)
     segments = sorted(path for path in work.glob("*.mp4"))
     assert len(segments) == 1, f"expected one 30-frame segment, found {segments}"
-    assert sorted(path.suffix for path in tiles_dir.iterdir()) == [".png"] * len(flow.tiles), (
-        "the flow renderer wrote outside its work directory"
-    )
+    assert sorted(path.suffix for path in flow_render["tiles_dir"].iterdir()) == [".png"] * len(
+        flow_render["flow"].tiles
+    ), "the flow renderer wrote outside its work directory"
     encode_stats = encoder.LAST_STATS
     assert encode_stats is not None
     assert (encode_stats["frames"], encode_stats["cached_segments"]) == (30, 0)
     assert encode_stats["composing"] > 0.0, "the encoder counted no frame composition time"
     before = {path.name: path.stat().st_mtime_ns for path in segments}
-    first = media(tmp_path / "once.mp4").frame_at(0.5, tmp_path / "once-0.5.png")
+    first = Media(tmp_path / "once.mp4").frame_at(0.5, tmp_path / "once-0.5.png")
 
-    render_flow(**arguments, out=tmp_path / "twice.mp4", preview=3.0)
+    render_flow(**flow_render, out=tmp_path / "twice.mp4", preview=3.0)
     after = {path.name: path.stat().st_mtime_ns for path in segments}
     assert after == before, "an unchanged render re-encoded its segment"
     assert (tmp_path / "twice.mp4").is_file()
@@ -396,20 +361,18 @@ def test_second_render_reuses_segments_and_frames_depend_only_on_time(
     assert reused is not None
     assert (reused["segments"], reused["cached_segments"], reused["frames"]) == (1, 1, 0)
     assert reused["composing"] == 0.0, "a segment served from the cache was composed again"
-    twice = media(tmp_path / "twice.mp4").frame_at(0.5, tmp_path / "twice-0.5.png")
+    twice = Media(tmp_path / "twice.mp4").frame_at(0.5, tmp_path / "twice-0.5.png")
     assert np.array_equal(first, twice)
 
     # A different length invalidates the segment (its frame count no longer matches) but must not
     # change what any instant looks like: frame state is a function of absolute time alone.
-    render_flow(**arguments, out=tmp_path / "longer.mp4", preview=3.4)
-    longer = media(tmp_path / "longer.mp4").frame_at(0.5, tmp_path / "longer-0.5.png")
+    render_flow(**flow_render, out=tmp_path / "longer.mp4", preview=3.4)
+    longer = Media(tmp_path / "longer.mp4").frame_at(0.5, tmp_path / "longer-0.5.png")
     assert np.array_equal(first, longer)
-    assert media(tmp_path / "longer.mp4").probe().frames == 34
+    assert Media(tmp_path / "longer.mp4").probe().frames == 34
 
 
-def test_segments_concatenate_without_losing_or_reordering_frames(
-    tmp_path: Path, media: type[Media]
-) -> None:
+def test_segments_concatenate_without_losing_or_reordering_frames(tmp_path: Path) -> None:
     """Each frame is filled with a colour derived from its index, so a concat gap or swap shows."""
     from musicflow.render import encoder
 
@@ -435,25 +398,20 @@ def test_segments_concatenate_without_losing_or_reordering_frames(
         segment_frames=4,
     )
 
-    total = round(media(excerpt).probe().duration * spec.fps)
+    total = round(Media(excerpt).probe().duration * spec.fps)
     segments = sorted(work.glob("*.mp4"))
     assert len(segments) > 1, f"the render did not split into segments: {segments}"
-    assert media(out).probe().frames == total
+    assert Media(out).probe().frames == total
     for seconds, index in ((0.0, 0), (0.9, 9), ((total - 1) / spec.fps, total - 1)):
-        frame = media(out).frame_at(seconds, tmp_path / f"at-{index}.png")
+        frame = Media(out).frame_at(seconds, tmp_path / f"at-{index}.png")
         red = int(frame[:, :, 0].mean())
         assert abs(red - index * 8) <= 6, (
             f"frame at {seconds:.1f} s should be frame {index} (red {index * 8}), got red {red}"
         )
 
 
-def test_missing_tile_is_a_render_error(tmp_path: Path) -> None:
-    tiles_dir = tmp_path / "tiles"
-    tiles_dir.mkdir()
-    work = tmp_path / "work"
-    work.mkdir()
-    _, route = _score()
-    flow = _strip(tiles_dir)
+def test_missing_tile_is_a_render_error(tmp_path: Path, flow_render: dict) -> None:
+    flow = flow_render["flow"]
     broken = FlowLayout(
         strip_width=flow.strip_width,
         strip_height=flow.strip_height,
@@ -464,36 +422,15 @@ def test_missing_tile_is_a_render_error(tmp_path: Path) -> None:
         scale=flow.scale,
     )
     with pytest.raises(RenderError, match="tile is missing"):
-        render_flow(
-            route=route,
-            alignment=_alignment(route.total_q, 6.0),
-            flow=broken,
-            spec=VideoSpec(width=640, height=360, fps=10),
-            out=tmp_path / "broken.mp4",
-            work_dir=work,
-            tiles_dir=tiles_dir,
-            preview=1.0,
-            audio=_audio_excerpt(tmp_path, 6.0),
-        )
+        render_flow(**(flow_render | {"flow": broken}), out=tmp_path / "broken.mp4", preview=1.0)
 
 
-def test_missing_audio_is_an_input_error(tmp_path: Path) -> None:
-    tiles_dir = tmp_path / "tiles"
-    tiles_dir.mkdir()
-    work = tmp_path / "work"
-    work.mkdir()
-    _, route = _score()
+def test_missing_audio_is_an_input_error(tmp_path: Path, flow_render: dict) -> None:
     with pytest.raises(InputError, match="not found"):
         render_flow(
-            route=route,
-            alignment=_alignment(route.total_q, 6.0),
-            flow=_strip(tiles_dir),
-            spec=VideoSpec(width=640, height=360, fps=10),
+            **(flow_render | {"audio": tmp_path / "absent.mp3"}),
             out=tmp_path / "silent.mp4",
-            work_dir=work,
-            tiles_dir=tiles_dir,
             preview=1.0,
-            audio=tmp_path / "absent.mp3",
         )
 
 
@@ -516,40 +453,18 @@ def test_missing_ffmpeg_is_a_missing_tool_error(
         )
 
 
-def test_unwritable_output_is_a_render_error(tmp_path: Path) -> None:
-    tiles_dir = tmp_path / "tiles"
-    tiles_dir.mkdir()
-    work = tmp_path / "work"
-    work.mkdir()
+def test_unwritable_output_is_a_render_error(tmp_path: Path, flow_render: dict) -> None:
     blocker = tmp_path / "blocker"
     blocker.write_text("not a directory", encoding="utf-8")
-    _, route = _score()
     with pytest.raises(RenderError, match="output path"):
-        render_flow(
-            route=route,
-            alignment=_alignment(route.total_q, 6.0),
-            flow=_strip(tiles_dir),
-            spec=VideoSpec(width=640, height=360, fps=10),
-            out=blocker / "video.mp4",
-            work_dir=work,
-            tiles_dir=tiles_dir,
-            preview=1.0,
-            audio=_audio_excerpt(tmp_path, 6.0),
-        )
+        render_flow(**flow_render, out=blocker / "video.mp4", preview=1.0)
 
 
 def test_missing_pdf_is_an_input_error(tmp_path: Path) -> None:
     work = tmp_path / "work"
     work.mkdir()
     score, route = _score()
-    layout = StaffLayout(
-        pages=(PageInfo(1, 595.0, 842.0),),
-        systems=(
-            System(
-                1, 1, Rect(80, 118, 560, 278), (), measure_count=8, first_measure=1, last_measure=8
-            ),
-        ),
-    )
+    layout = _layout(_system(1, 118, 278, measures=8, first=1, last=8, staves=()))
     with pytest.raises(InputError, match="PDF not found"):
         render_switch(
             score=score,

@@ -9,7 +9,7 @@ plus a contact sheet per render and a markdown table.
 
 The report splits the cost of a mode the way the plan asks for it: the shared analysis (the
 ``timings`` of ``report.json``), its engraving stage, and the render's own frame composition and
-encoding (see :class:`musicflow.render.encoder.EncodeStats`).
+encoding (see ``musicflow.render.encoder.LAST_STATS``).
 
 Usage:
 
@@ -315,7 +315,7 @@ def costs_of(seconds: float, report: dict, stats: dict[str, float | int] | None)
         analysis=float(timings.get("total") or 0.0),
         engraving=float(timings.get("flow") or 0.0),
         composing=0.0 if stats is None else float(stats["composing"]),
-        encoding=0.0 if stats is None else float(stats["feeding"]) + float(stats["muxing"]),
+        encoding=0.0 if stats is None else float(stats["encoding"]),
         render=seconds,
         frames=0 if stats is None else int(stats["frames"]),
         segments=0 if stats is None else int(stats["segments"]),

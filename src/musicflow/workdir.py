@@ -1,17 +1,10 @@
 """Run directories, content digests and cached pipeline steps.
 
-Every expensive stage owns one directory inside a run workspace:
-
-    <workspace>/<step>/
-        meta.json      schema version and the cache key the payload was produced from
-        payload.json   the step's serialised result
-        ...            any binary side files the step wrote (page rasters, strip tiles, ...)
-
-A step is skipped when its recorded key equals the key computed from the current inputs. The key
-covers the content digests of the files the step read, the parameters that influence the step, and
-the versions of the tools involved, so a re-run after changing any of them recomputes and
-everything else stays cached. A cached payload can also be rejected because the binary files it
-names are gone: ``validate`` is how a step says which files its payload depends on.
+Each expensive stage owns one directory: ``meta.json`` holds the schema version and cache key,
+``payload.json`` the serialised result, next to any binary side file the step wrote. A step is
+skipped when its recorded key equals the key of the current inputs — the content digests of the
+files it read, the parameters that influence it, and the versions of the tools involved — and its
+payload is rejected too when the binary files it names are gone, which is what ``validate`` answers.
 """
 
 from __future__ import annotations

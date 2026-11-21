@@ -56,7 +56,14 @@ def _patch_align(monkeypatch: pytest.MonkeyPatch, calls: list[model.Route]) -> N
             audio_duration=duration,
             method="fake",
         )
-        evidence = {"method": "fake", "similarity_mean": 0.5, "coverage": 1.0}
+        evidence = {
+            "method": "fake",
+            "audio_duration": round(duration, 6),
+            "implied_bpm": round(60.0 * route.total_q / duration, 3),
+            "similarity_mean": 0.5,
+            "coverage": 1.0,
+            "residual_ms": {"median": 1.0, "p90": 2.0, "max": 3.0},
+        }
         (work_dir / "report.json").write_text(json.dumps(evidence), encoding="utf-8")
         return alignment
 
@@ -130,6 +137,34 @@ def _hand_flow() -> model.FlowLayout:
     )
 
 
+def _task(case, tmp_path: Path, *, modes=("switch", "flow"), preview=None) -> pipeline.BatchTask:
+    return pipeline.BatchTask(
+        case=case.name,
+        inputs=_inputs(case),
+        out_dir=tmp_path / "out",
+        work_dir=tmp_path / "out" / case.name,
+        spec=SPEC,
+        preview=preview,
+        modes=modes,
+    )
+
+
+def _argv(case, tmp_path: Path, *extra: str) -> list[str]:
+    """A complete ``analyze`` command line over one case, plus the caller's extra arguments."""
+    return [
+        "analyze",
+        "--pdf",
+        str(case.pdf),
+        "--audio",
+        str(case.audio),
+        "--symbolic",
+        str(case.musicxml),
+        "--workdir",
+        str(tmp_path / "work"),
+        *extra,
+    ]
+
+
 def test_inputs_validate_rejects_missing_and_wrong_formats(case, tmp_path: Path) -> None:
     _inputs(case).validate()
 
@@ -149,24 +184,8 @@ def test_provider_follows_symbolic_suffix(case) -> None:
     assert _inputs(case, symbolic=case.midi).provider == "midi"
 
 
-def test_step_cache_hits_and_invalidates(tmp_path: Path) -> None:
-    calls: list[str] = []
-    step = workdir.Workspace(tmp_path).step("demo")
-
-    def compute(_: Path) -> dict[str, object]:
-        calls.append("run")
-        return {"value": len(calls)}
-
-    assert step.run("key-a", compute) == {"value": 1}
-    assert step.run("key-a", compute) == {"value": 1}
-    assert calls == ["run"]
-
-    assert step.run("key-b", compute) == {"value": 2}
-    assert calls == ["run", "run"]
-
-
-def test_step_validate_forces_a_recompute_when_a_side_file_is_gone(tmp_path: Path) -> None:
-    """A payload whose binary side file disappeared must not be served again."""
+def test_step_cache_reuses_payloads_and_drops_missing_side_files(tmp_path: Path) -> None:
+    """A payload is served by key, recomputed on a new key, and rejected when its file is gone."""
     calls: list[str] = []
     step = workdir.Workspace(tmp_path).step("demo")
 
@@ -178,16 +197,18 @@ def test_step_validate_forces_a_recompute_when_a_side_file_is_gone(tmp_path: Pat
     def present(payload: dict[str, object]) -> bool:
         return (step.path / str(payload["file"])).is_file()
 
-    assert step.run("same-key", compute, validate=present) == {"file": "side.bin"}
-    assert step.run("same-key", compute, validate=present) == {"file": "side.bin"}
-    assert calls == ["run"]
+    assert step.run("key-a", compute, validate=present) == {"file": "side.bin"}
+    assert step.run("key-a", compute, validate=present) == {"file": "side.bin"}
+    assert calls == ["run"], "an unchanged key did not reuse the payload"
+    assert step.run("key-b", compute, validate=present) == {"file": "side.bin"}
+    assert calls == ["run", "run"], "a different key served the old payload"
 
     (step.path / "side.bin").unlink()
-    assert step.run("same-key", compute, validate=present) == {"file": "side.bin"}
-    assert calls == ["run", "run"]
+    assert step.run("key-b", compute, validate=present) == {"file": "side.bin"}
+    assert calls == ["run", "run", "run"], "a payload whose side file is gone was reused"
 
 
-def test_key_tracks_digests_and_parameters(tmp_path: Path) -> None:
+def test_keys_track_digests_parameters_and_payload_order(tmp_path: Path) -> None:
     first = tmp_path / "a.bin"
     first.write_bytes(b"one")
     second = tmp_path / "b.bin"
@@ -200,8 +221,6 @@ def test_key_tracks_digests_and_parameters(tmp_path: Path) -> None:
     assert base != workdir.key({"a": workdir.digest_file(second)}, {"p": 1})
     assert base != workdir.key({"b": workdir.digest_file(first)}, {"p": 1})
 
-
-def test_payload_hash_is_order_independent() -> None:
     assert workdir.hash_payload({"a": 1, "b": [1, 2]}) == workdir.hash_payload(
         {"b": [1, 2], "a": 1}
     )
@@ -268,6 +287,7 @@ def test_analyze_writes_one_merged_report(monkeypatch: pytest.MonkeyPatch, tmp_p
     assert report["alignment"]["audio_duration"] == pytest.approx(
         analysis.alignment.audio_duration, abs=0.001
     )
+    assert report["alignment"]["anchors"] == len(analysis.alignment.anchors)
     assert report["alignment"]["unconfirmed"] == list(analysis.alignment.unconfirmed)
     assert report["alignment"]["similarity_mean"] == 0.5, "headline numbers come from the evidence"
     assert report["alignment"]["coverage"] == 1.0
@@ -459,8 +479,6 @@ def test_model_artifacts_round_trip() -> None:
     assert analysis.alignment.time_at(2.0) == pytest.approx(2.5)
     assert analysis.alignment.time_at(99.0) == 10.0
 
-
-def test_rectangle_rejects_inverted_boxes() -> None:
     with pytest.raises(AssertionError):
         model.Rect(1.0, 0.0, 0.0, 1.0)
 
@@ -480,7 +498,8 @@ def test_cli_doctor_succeeds(capsys: pytest.CaptureFixture[str]) -> None:
     assert "verovio" in out
 
 
-def test_cli_missing_input_exits_three(case, tmp_path: Path, capsys) -> None:
+def test_cli_reports_missing_input_bad_size_and_flow_on_midi(case, tmp_path: Path, capsys) -> None:
+    """The three expected CLI failures each reach their exit code with a one-line message."""
     code = cli.main(
         [
             "analyze",
@@ -497,8 +516,8 @@ def test_cli_missing_input_exits_three(case, tmp_path: Path, capsys) -> None:
     assert code == EXIT_INPUT
     assert "not found" in capsys.readouterr().err
 
+    assert cli.main(_argv(case, tmp_path, "--size", "1000x1001")) == EXIT_USAGE
 
-def test_cli_flow_with_midi_is_rejected(case, tmp_path: Path, capsys) -> None:
     if not case.has(".mid"):
         pytest.skip("no MIDI in this case")
     code = cli.main(
@@ -512,30 +531,11 @@ def test_cli_flow_with_midi_is_rejected(case, tmp_path: Path, capsys) -> None:
             str(case.midi),
             "--with-flow",
             "--workdir",
-            str(tmp_path / "work"),
+            str(tmp_path / "work-midi"),
         ]
     )
     assert code == EXIT_UNSUPPORTED
     assert "MusicXML" in capsys.readouterr().err
-
-
-def test_cli_bad_size_is_usage_error(case, tmp_path: Path) -> None:
-    code = cli.main(
-        [
-            "analyze",
-            "--pdf",
-            str(case.pdf),
-            "--audio",
-            str(case.audio),
-            "--symbolic",
-            str(case.musicxml),
-            "--size",
-            "1000x1001",
-            "--workdir",
-            str(tmp_path / "work"),
-        ]
-    )
-    assert code == EXIT_USAGE
 
 
 def test_discover_case_finds_the_three_inputs(case) -> None:
@@ -553,12 +553,7 @@ def test_batch_skips_flow_for_midi_only_cases(case, tmp_path: Path) -> None:
     for source in (case.pdf, case.audio, case.midi):
         (midi_case / source.name).write_bytes(source.read_bytes())
     records = pipeline.batch(
-        corpus,
-        tmp_path / "out",
-        modes=["flow"],
-        spec=SPEC,
-        preview=1.0,
-        jobs=1,
+        corpus, tmp_path / "out", modes=["flow"], spec=SPEC, preview=1.0, jobs=1
     )
     assert len(records) == 1
     assert records[0]["ok"] is True
@@ -575,22 +570,6 @@ def test_batch_rejects_missing_corpus(tmp_path: Path) -> None:
             preview=1.0,
             jobs=1,
         )
-
-
-def test_batch_task_is_picklable(case, tmp_path: Path) -> None:
-    """A batch runs in worker processes, so its tasks must survive pickling."""
-    task = pipeline.BatchTask(
-        case=case.name,
-        inputs=_inputs(case),
-        out_dir=tmp_path / "out",
-        work_dir=tmp_path / "out" / case.name,
-        spec=SPEC,
-        preview=2.0,
-        modes=("switch", "flow"),
-    )
-    restored = pickle.loads(pickle.dumps(task))
-    assert restored == task
-    assert pipeline.run_case_task.__module__ == "musicflow.pipeline"
 
 
 def test_run_case_task_analyses_once_and_records_every_mode(
@@ -616,15 +595,9 @@ def test_run_case_task_analyses_once_and_records_every_mode(
 
     monkeypatch.setattr(pipeline, "analyze", fake_analyze)
     monkeypatch.setattr(pipeline, "render", fake_render)
-    task = pipeline.BatchTask(
-        case=case.name,
-        inputs=_inputs(case),
-        out_dir=tmp_path / "out",
-        work_dir=tmp_path / "out" / case.name,
-        spec=SPEC,
-        preview=2.0,
-        modes=("switch", "flow"),
-    )
+    task = _task(case, tmp_path, preview=2.0)
+    # A batch runs in worker processes, so its tasks must survive pickling.
+    assert pickle.loads(pickle.dumps(task)) == task
 
     records = pipeline.run_case_task(task)
 
@@ -645,17 +618,7 @@ def test_run_case_task_reports_a_shared_failure_for_every_mode(
         raise InputError("corrupt symbolic score")
 
     monkeypatch.setattr(pipeline, "analyze", boom)
-    task = pipeline.BatchTask(
-        case=case.name,
-        inputs=_inputs(case),
-        out_dir=tmp_path / "out",
-        work_dir=tmp_path / "out" / case.name,
-        spec=SPEC,
-        preview=None,
-        modes=("switch", "flow"),
-    )
-
-    records = pipeline.run_case_task(task)
+    records = pipeline.run_case_task(_task(case, tmp_path))
 
     assert [record["mode"] for record in records] == ["switch", "flow"]
     assert all(record["ok"] is False for record in records)

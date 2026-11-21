@@ -258,7 +258,7 @@ ok      case4 switch / flow
 
 ### 6.5 证据留存
 
-每次分析在 `<workspace>/run.json` 写下：三个输入的绝对路径、字节数、sha256，工具版本，`VideoSpec`，路线
+每次分析在 `<workspace>/report.json` 写下：三个输入的绝对路径、字节数、sha256，工具版本，`VideoSpec`，路线
 来源与音符数，对齐方法与锚点数，四项跨产物检查（`staffs_per_system`、`measure_count`、`tempo`、
 `alignment_confidence`）与所有 `unconfirmed` 条目。`align/report.json` 与 `align/alignment.png` 记录对齐
 证据，`staffs/debug/` 记录谱行检测的叠加图与逐行裁切图。

@@ -65,36 +65,29 @@ def _package_version() -> str:
 
 
 def _cmd_doctor(args: argparse.Namespace) -> int:
+    import librosa
+    import numpy
+    import partitura
+    import pymupdf
+    import resvg_py
+    import scipy
     import verovio
 
     print(f"python           {sys.version.split()[0]}")
     print(f"musicflow        {_package_version()}")
-
-    ffmpeg = _tool_version(["ffmpeg", "-version"])
-    print(f"ffmpeg           {ffmpeg or 'MISSING: install ffmpeg and put it on PATH'}")
-    ffprobe = _tool_version(["ffprobe", "-version"])
-    print(f"ffprobe          {ffprobe or 'MISSING: install ffmpeg (ffprobe) and put it on PATH'}")
-    print(f"verovio          {verovio.toolkit().getVersion()}")
-
-    import resvg_py
-
-    print(f"resvg-py         {getattr(resvg_py, '__version__', 'installed')}")
-
-    import pymupdf
-
-    print(f"pymupdf          {pymupdf.__version__}")
-
-    import numpy
-    import scipy
-
-    print(f"numpy            {numpy.__version__}")
-    print(f"scipy            {scipy.__version__}")
-
-    import librosa
-    import partitura
-
-    print(f"librosa          {librosa.__version__}")
-    print(f"partitura        {partitura.__version__}")
+    versions = (
+        ("ffmpeg", _tool_version(["ffmpeg", "-version"])),
+        ("ffprobe", _tool_version(["ffprobe", "-version"])),
+        ("verovio", verovio.toolkit().getVersion()),
+        ("resvg-py", getattr(resvg_py, "__version__", "installed")),
+        ("pymupdf", pymupdf.__version__),
+        ("numpy", numpy.__version__),
+        ("scipy", scipy.__version__),
+        ("librosa", librosa.__version__),
+        ("partitura", partitura.__version__),
+    )
+    for label, value in versions:
+        print(f"{label:<17}{value or 'MISSING: install it and put it on PATH'}")
 
     from . import pipeline, scorexml
 
@@ -161,20 +154,14 @@ def _workspace(args: argparse.Namespace) -> Path:
 
 def _print_report(report: dict) -> None:
     """The human summary of one run, from the merged report."""
-    score = report["score"]
-    route = report["route"]
-    layout = report["layout"]
-    alignment = report["alignment"]
-    flow = report["flow"]
+    score, route = report["score"], report["route"]
+    layout, alignment, flow = report["layout"], report["alignment"], report["flow"]
     notes = f"{score['written_notes']} written, {route['notes']} performed ({route['source']})"
     audio = f"{alignment['audio_duration']:.2f} s, route {route['total_q']:.1f} quarter notes"
-    systems = "not detected"
-    if layout is not None:
-        systems = f"{layout['systems']} ({layout['bound_systems']} bound)"
     print(f"provider         {score['provider']}")
     print(f"parts            {len(score['parts'])} ({score['measures']} measures)")
     print(f"notes            {notes}")
-    print(f"systems          {systems}")
+    print(f"systems          {'not detected' if layout is None else layout['systems']}")
     print(f"anchors          {alignment['anchors']} ({alignment['method']})")
     print(f"audio            {audio}")
     for name in ("score", "route", "layout", "alignment"):

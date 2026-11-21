@@ -1,19 +1,9 @@
-"""Pipeline orchestration: input validation, cached analysis stages, rendering and batch runs.
+"""Pipeline orchestration: cached analysis stages, rendering, batch runs and the merged report.
 
-This module owns the cache keys, the order of stages and the merged report. The stages themselves
-live in ``musicflow.symbolic``, ``musicflow.pdf``, ``musicflow.align``, ``musicflow.flow`` and
-``musicflow.render`` and are pure functions over the structures in ``musicflow.model``. ``route``
-and the measure binding read data the run already loaded, so they are computed in memory and have
-neither a directory nor a cache key.
-
-Only the expensive stages are cached, and each of them is keyed by the files and parameters it
-actually reads: ``symbolic`` by the symbolic score, ``pdf`` by the score PDF and the staff count the
-detection is validated against, ``align`` by the recording, the route and the written notes it
-aligns, ``flow`` by the written MusicXML and the engraving geometry.
-
-The stage modules are imported inside their stage functions on purpose: importing ``librosa``,
-``verovio`` and ``partitura`` costs seconds, and `musicflow --help`, `musicflow doctor` and the
-input-validation paths must not pay for a stage they never run.
+Only the expensive stages are cached, each keyed by the files and parameters it reads. ``route`` and
+the measure binding are computed in memory from data the run already loaded. The stage modules are
+imported inside their stage functions so that ``--help``, ``doctor`` and input validation never pay
+for importing ``librosa``, ``verovio`` or ``partitura``. The contract is ``doc/design.md``.
 """
 
 from __future__ import annotations
@@ -37,6 +27,8 @@ Mode = Literal["switch", "flow"]
 # older algorithm can never be mistaken for current output.
 PIPELINE_VERSION = 6
 REPORT_NAME = "report.json"
+# The alignment evidence the merged report repeats: the rest of it stays in ``align/report.json``.
+HEADLINE_KEYS = ("audio_duration", "implied_bpm", "similarity_mean", "coverage", "residual_ms")
 
 AUDIO_SUFFIXES = (".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".opus", ".wma")
 
@@ -231,10 +223,8 @@ def _align_step(
             constraints=inputs.anchors,
         ).to_dict()
 
-    def present(payload: dict[str, Any]) -> bool:
-        return (step.path / "report.json").is_file()
-
-    alignment = Alignment.from_dict(step.run(key, compute, validate=present))
+    payload = step.run(key, compute, validate=lambda _: (step.path / "report.json").is_file())
+    alignment = Alignment.from_dict(payload)
     report_path = step.path / "report.json"
     report: dict[str, Any] = workdir.read_json(report_path) if report_path.is_file() else {}
     logger.info(
@@ -303,7 +293,7 @@ def analyze(
 
     ``with_pdf`` adds the staff geometry ``switch`` displays, ``with_flow`` the engraved strip
     ``flow`` displays, and ``debug_images`` the diagnostic bitmaps of the PDF detection. The merged
-    ``<workspace>/report.json`` is written from the result.
+    ``<workspace>/report.json`` is written from the result; see ``checks`` for its check section.
     """
     inputs.validate()
     if with_flow and inputs.provider != "musicxml":
@@ -411,7 +401,6 @@ def _write_report(
             ],
             "measures": len(score.measures),
             "written_notes": len(score.notes),
-            "total_q": round(score.total_q, 3),
             "unconfirmed": list(score.unconfirmed),
         },
         "route": {
@@ -426,19 +415,12 @@ def _write_report(
         else {
             "pages": len(layout.pages),
             "systems": len(layout.systems),
-            "bound_systems": sum(
-                1 for system in layout.systems if system.first_measure is not None
-            ),
             "unconfirmed": list(layout.unconfirmed),
         },
         "alignment": {
+            **{name: evidence.get(name) for name in HEADLINE_KEYS},
             "method": alignment.method,
             "anchors": len(alignment.anchors),
-            "audio_duration": round(alignment.audio_duration, 3),
-            "implied_bpm": round(_implied_bpm(analysis), 2),
-            "similarity_mean": evidence.get("similarity_mean"),
-            "coverage": evidence.get("coverage"),
-            "residual_ms": evidence.get("residual_ms"),
             "unconfirmed": list(alignment.unconfirmed),
         },
         "flow": None
@@ -448,7 +430,6 @@ def _write_report(
             "strip_height": round(flow.strip_height, 1),
             "tiles": len(flow.tiles),
             "scale": flow.scale,
-            "note_coverage": round(len(flow.note_x) / len(score.notes), 4),
         },
         "checks": checks(analysis),
         "artifacts": {
@@ -465,16 +446,6 @@ def _write_report(
     workdir.write_json(path, payload)
     logger.info("wrote report %s", path)
     return path
-
-
-def _record_video(workspace: workdir.Workspace, mode: Mode, video: Path) -> None:
-    """Add the video this render produced to the report, next to the other mode's."""
-    path = workspace.root / REPORT_NAME
-    if not path.is_file():
-        return
-    report = workdir.read_json(path)
-    report.setdefault("artifacts", {}).setdefault("videos", {})[mode] = str(video)
-    workdir.write_json(path, report)
 
 
 def render(
@@ -537,7 +508,11 @@ def render(
             preview=preview,
             audio=inputs.audio,
         )
-    _record_video(workspace, mode, produced)
+    report_path = workspace.root / REPORT_NAME
+    if report_path.is_file():
+        report = workdir.read_json(report_path)
+        report["artifacts"]["videos"][mode] = str(produced)
+        workdir.write_json(report_path, report)
     logger.info("rendered %s in %.1f s", produced, time.monotonic() - started)
     return produced
 
@@ -671,14 +646,8 @@ def batch(
             continue
         wanted = list(requested)
         if "flow" in wanted and symbolic.suffix.lower() in scorexml.MIDI_SUFFIXES:
-            skipped.append(
-                {
-                    "case": case.name,
-                    "mode": "flow",
-                    "ok": True,
-                    "skipped": "flow requires MusicXML or MXL",
-                }
-            )
+            reason = "flow requires MusicXML or MXL"
+            skipped.append({"case": case.name, "mode": "flow", "ok": True, "skipped": reason})
             wanted.remove("flow")
         if not wanted:
             continue
@@ -712,13 +681,12 @@ def _implied_bpm(analysis: Analysis) -> float:
 def checks(analysis: Analysis) -> list[dict[str, Any]]:
     """Cross-check the artifacts that exist against each other: the diagnostics of doc/PLAN.md 二.5.
 
-    These are the comparisons that can be made without reading the PDF as notation: the staff count
-    each printed system carries, the number of measures the printed barlines divide the page into,
-    the tempo the recording implies for the route, the number of engraved notes the flow layout
-    resolved, and whether the aligner can stand behind its map. A check whose evidence was not
-    produced is absent rather than reported as passing.
+    These are the comparisons that do not read the PDF as notation: staves per printed system,
+    barlines against written measures, the tempo the recording implies, the shares of written notes
+    the flow layout resolved, and whether the aligner stands behind its map. A check whose evidence
+    was not produced is absent rather than reported as passing.
     """
-    results: list[dict[str, Any]] = []
+    found: list[tuple[str, bool, str]] = []
     if analysis.layout is not None:
         from .pdf.detect import MIN_MATCHING_SHARE
 
@@ -737,52 +705,43 @@ def checks(analysis: Analysis) -> list[dict[str, Any]]:
         measure_ok = score_measures > 0 and abs(detected_measures - score_measures) <= max(
             2, round(0.02 * score_measures)
         )
-        results.append(
-            {
-                "name": "staffs_per_system",
-                "ok": staff_ratio >= MIN_MATCHING_SHARE and not overfull,
-                "detail": (
-                    f"{plausible}/{len(systems)} printed systems carry {floor}..{expected_staves} "
-                    f"staves ({partial} have fewer, which is normal when a staff stays empty); "
-                    f"overfull systems: {overfull or 'none'}"
-                ),
-            }
+        found.append(
+            (
+                "staffs_per_system",
+                staff_ratio >= MIN_MATCHING_SHARE and not overfull,
+                f"{plausible}/{len(systems)} printed systems carry {floor}..{expected_staves} "
+                f"staves ({partial} have fewer, which is normal when a staff stays empty); "
+                f"overfull systems: {overfull or 'none'}",
+            )
         )
-        results.append(
-            {
-                "name": "measure_count",
-                "ok": measure_ok,
-                "detail": (
-                    f"barlines give {detected_measures} measures, the symbolic score has "
-                    f"{score_measures}"
-                ),
-            }
+        found.append(
+            (
+                "measure_count",
+                measure_ok,
+                f"barlines give {detected_measures} measures, the symbolic score has "
+                f"{score_measures}",
+            )
         )
 
     implied_bpm = _implied_bpm(analysis)
-    results.append(
-        {
-            "name": "tempo",
-            "ok": 20.0 <= implied_bpm <= 300.0,
-            "detail": f"the route implies {implied_bpm:.1f} quarter notes per minute",
-        }
-    )
+    tempo = f"the route implies {implied_bpm:.1f} quarter notes per minute"
+    found.append(("tempo", 20.0 <= implied_bpm <= 300.0, tempo))
     unconfirmed = analysis.alignment.unconfirmed
-    results.append(
-        {
-            "name": "alignment_confidence",
-            "ok": not unconfirmed,
-            "detail": "; ".join(unconfirmed) or "the aligner reported no unconfirmed item",
-        }
+    found.append(
+        (
+            "alignment_confidence",
+            not unconfirmed,
+            "; ".join(unconfirmed) or "the aligner reported no unconfirmed item",
+        )
     )
     if analysis.flow is not None:
         resolved = len(analysis.flow.note_x)
         total = len(analysis.score.notes)
-        results.append(
-            {
-                "name": "flow_note_coverage",
-                "ok": total > 0 and resolved / total >= 0.99,
-                "detail": f"{resolved}/{total} written notes have an engraved position",
-            }
+        found.append(
+            (
+                "flow_note_coverage",
+                total > 0 and resolved / total >= 0.99,
+                f"{resolved}/{total} written notes have an engraved position",
+            )
         )
-    return results
+    return [{"name": name, "ok": ok, "detail": detail} for name, ok, detail in found]

@@ -2,10 +2,8 @@
 
 Each case directory holds one work: a PDF score, a recording and the same music as MIDI, plain
 MusicXML and compressed MusicXML. Tests that need a case take the ``case`` fixture, which yields a
-:class:`Case` for every case present on disk.
-
-The one thing the corpus-wide video tests share besides the corpus itself is ``media``: the probe
-and frame sampler for a produced file, so no module re-declares its own ffprobe/ffmpeg calls.
+:class:`Case` for every case present on disk. ``Media`` probes a produced file and samples decoded
+frames from it, so no module repeats its own ffprobe/ffmpeg calls.
 
 case4 is the one single-staff work, the case that exercises the solo-instrument paths: one staff per
 system, no grand staff to find measures in.
@@ -162,9 +160,3 @@ def solo() -> Case:
 @pytest.fixture(scope="session")
 def corpus() -> Path:
     return CORPUS
-
-
-@pytest.fixture(scope="session")
-def media() -> type[Media]:
-    """The probe and frame sampler a test module uses to measure a produced file."""
-    return Media
