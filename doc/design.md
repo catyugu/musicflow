@@ -59,10 +59,10 @@ cue），由 `musicflow.scorexml.assign_note_ids` 写入 `<note id="...">`，Ver
 `workdir.Step.run(key, compute, validate=...)` 负责命中与落盘，步骤内部不判断缓存；`validate` 拿到已存
 载荷并回答"它指名的二进制文件是否都还在"，不在就重算：`symbolic` 查 `written.musicxml`，`flow` 查每个
 瓦片，`align` 查 `report.json`。任何步骤的行为改变都必须递增 `PIPELINE_VERSION`（当前 6），否则旧产物会
-被当作仍然有效。渲染不是缓存步骤：`render-switch/` 放页面位图与分块 MP4，`render-flow/` 只放分块 MP4，
-`flow/` 只放排谱产物；分块续渲是唯一的渲染缓存，分块名带参数摘要，复用前用 ffprobe 复核帧数。`encoder`
-把每次编码的耗时（帧合成、喂 ffmpeg 与封装）、帧数与分块数写进模块级 `LAST_STATS` 并打一条 INFO 日志，
-验收工具读它填 `acceptance.json`。
+被当作仍然有效。渲染不是缓存步骤：`render-switch/` 只放分块 MP4，页面位图按需在内存里重绘，
+`render-flow/` 只放分块 MP4，`flow/` 只放排谱产物；分块续渲是唯一的渲染缓存，分块名带参数摘要，复用前用
+ffprobe 复核帧数。`encoder` 把每次编码的耗时（帧合成、喂 ffmpeg 与封装）、帧数与分块数写进模块级
+`LAST_STATS` 并打一条 INFO 日志，验收工具读它填 `acceptance.json`。
 
 ### 报告产物：`<workspace>/report.json`
 
@@ -134,11 +134,11 @@ cue），由 `musicflow.scorexml.assign_note_ids` 写入 `<note id="...">`，Ver
 
 ## 八、测试策略
 
-- 端到端以 `test_cases/case1..4` 为准：每个案例只分析一次，两种模式都从这次分析渲染（V1 谱行检测与排谱、
-  V2 两种符号输入的 switch、V3 flow、V4 拒绝与缓存）。模块级测试只测语义与不变量，不追求分支覆盖。
-- 精度用可量化判据：合成音频（case1、case3）的对齐残差中位数 ≤ 20 ms，真实录音（case2、case4）≤ 150 ms，
-  且报告里残差分布可视检；渲染验收抽样帧，检查阅读线、谱面完整、无空白帧与音频时长。
-- `tools/acceptance.py` 逐案例复用一次分析，把成本拆成分析、排谱、合帧、编码四项写进 `acceptance.json`。
+测试只有一套：`uv run pytest` 全部使用合成输入（内存中构造的乐谱、布局、合成数组和内联文档），不依赖
+`test_cases/`，整套在 10 s 内跑完，只钉模块级语义与不变量，不追求分支覆盖。语料级验证只在
+`tools/acceptance.py`：每个 case 分析一次、两种模式都从这次分析渲染，判定 `report.json` 的 checks、对齐证据
+门槛（覆盖率 ≥ 0.9、残差中位数 ≤ 150 ms）与 case1/case3 的 MIDI 真值误差（去中位数 p50 ≤ 20 ms、p90 ≤ 60 ms），
+并抽样帧检查阅读线、谱面墨量、时长与帧数；成本按分析、排谱、合帧、编码四项写进 `acceptance.json`。
 
 ## 九、待定
 

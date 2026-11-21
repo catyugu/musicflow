@@ -1,11 +1,19 @@
-"""Acceptance harness: analyse each case once, render its modes, then measure the videos.
+"""Acceptance harness: judge each case, render its modes, measure the produced videos.
 
-This is the V1-V4 regression driver of doc/PLAN.md. It is deliberately outside the pytest suite: a
-full-length 1080p render takes minutes per case, while the tests that guard semantics run in the
-suite. It runs one analysis per case, renders every requested mode from it, probes each produced MP4
-(frame rate, frame count, duration against the recording), samples frames at native resolution,
-checks that each one carries score ink and, for flow, the reading line, then writes a JSON report
-plus a contact sheet per render and a markdown table.
+This is the V1-V4 regression driver of doc/PLAN.md and the only place where the corpus in
+``test_cases/`` is exercised: the pytest suite is a small unit suite over synthetic input. It runs
+one analysis per case, checks that analysis against the corpus verdicts, renders every requested
+mode from it, probes each produced MP4 (frame rate, frame count, duration against the recording),
+samples frames at native resolution, checks that each one carries score ink and, for flow, the
+reading line, then writes a JSON report plus a contact sheet per render.
+
+The corpus verdicts are the checks pytest used to own before the corpus left the test framework:
+
+* every ``checks`` entry of the case's ``report.json`` must hold (staffs per system, measure count,
+  tempo, alignment confidence, flow note coverage);
+* the alignment evidence (``align/report.json``) must reach the corpus accuracy gates: coverage and
+  snapped residual median everywhere, and for the cases whose MIDI renders the same performance
+  (case1, case3) the de-medianed error against the MIDI's performed onsets.
 
 The report splits the cost of a mode the way the plan asks for it: the shared analysis (the
 ``timings`` of ``report.json``), its engraving stage, and the render's own frame composition and
@@ -29,6 +37,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
+import partitura
 from PIL import Image, ImageDraw
 
 from musicflow import pipeline, scorexml, workdir
@@ -41,6 +50,105 @@ SAMPLE_FRAMES = 6
 SHEET_WIDTH = 640
 DURATION_TOLERANCE = 0.2
 FRAME_TOLERANCE = 5
+
+#: Accuracy gates of the corpus alignment, in milliseconds where a duration is named.
+MIN_COVERAGE = 0.9
+MAX_RESIDUAL_MS = 150.0
+MAX_MIDI_P50_MS = 20.0
+MAX_MIDI_P90_MS = 60.0
+MIN_MATCH_RATE = 0.95
+MAX_OFFSET_MS = 100.0
+#: The corpus MIDI of these cases renders the very performance its recording holds.
+MIDI_GROUND_TRUTH = ("case1", "case3")
+#: Ticks per quarter note of the corpus MIDI files; their tick position is the written quarter.
+QUARTER_TICKS = 480.0
+#: A MIDI that is not on this quarter grid, or lasts another time, is the notation at its own tempo.
+GRID_RATIO = (0.9, 1.1)
+DURATION_RATIO = (0.95, 1.05)
+
+
+@dataclass(frozen=True)
+class MidiError:
+    """Error of the aligned time map against a MIDI that renders the same performance.
+
+    ``p50`` and ``p90`` are the absolute error after removing its median, so a systematic lag is
+    visible through ``offset`` instead of hiding inside the spread. ``note`` is set instead of a
+    measurement when the MIDI provably is not this performance: such a case has no ground truth and
+    is recorded, never quietly passed.
+    """
+
+    pairs: int
+    match_rate: float
+    offset_ms: float
+    p50_ms: float
+    p90_ms: float
+    note: str = ""
+
+    def problems(self) -> list[str]:
+        if self.note:
+            return []
+        if self.pairs == 0:
+            return ["the MIDI shares no performed onset with the performance route"]
+        found: list[str] = []
+        if self.match_rate < MIN_MATCH_RATE:
+            found.append(f"only {self.match_rate:.1%} of the route's notes matched the MIDI")
+        if abs(self.offset_ms) > MAX_OFFSET_MS:
+            found.append(f"systematic offset {self.offset_ms:+.0f} ms against the MIDI")
+        if self.p50_ms > MAX_MIDI_P50_MS:
+            found.append(f"de-medianed p50 {self.p50_ms:.1f} ms against the MIDI")
+        if self.p90_ms > MAX_MIDI_P90_MS:
+            found.append(f"de-medianed p90 {self.p90_ms:.1f} ms against the MIDI")
+        return found
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "pairs": self.pairs,
+            "match_rate": round(self.match_rate, 4),
+            "offset_ms": round(self.offset_ms, 2),
+            "p50_ms": round(self.p50_ms, 2),
+            "p90_ms": round(self.p90_ms, 2),
+            "note": self.note,
+        }
+
+
+@dataclass(frozen=True)
+class Verdict:
+    """What one case's analysis must satisfy before its renders count as acceptance evidence."""
+
+    checks: tuple[tuple[str, str, bool], ...]
+    coverage: float
+    residual_ms: float
+    midi: MidiError | None
+    problems: tuple[str, ...]
+
+    def summary(self) -> str:
+        passing = sum(1 for _, _, ok in self.checks if ok)
+        parts = [
+            f"checks {passing}/{len(self.checks)}",
+            f"coverage {self.coverage:.3f}",
+            f"residual {self.residual_ms:.1f} ms",
+        ]
+        if self.midi is None:
+            parts.append("midi no ground truth")
+        elif self.midi.note:
+            parts.append(f"midi n/a: {self.midi.note}")
+        else:
+            parts.append(
+                f"midi {self.midi.pairs} pairs p50 {self.midi.p50_ms:.1f} ms "
+                f"p90 {self.midi.p90_ms:.1f} ms"
+            )
+        return "  ".join(parts)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "checks": [
+                {"name": name, "detail": detail, "ok": ok} for name, detail, ok in self.checks
+            ],
+            "coverage": round(self.coverage, 4),
+            "residual_ms": round(self.residual_ms, 3),
+            "midi": None if self.midi is None else self.midi.to_dict(),
+            "problems": list(self.problems),
+        }
 
 
 @dataclass(frozen=True)
@@ -93,12 +201,13 @@ class CaseResult:
     line: list[float] = field(default_factory=list)
     sheet: str = ""
     costs: Costs | None = None
+    verdict: Verdict | None = None
 
     def problems(self) -> list[str]:
-        """Everything the video must satisfy to count as a delivered artifact."""
-        found: list[str] = []
+        """Everything the case and its video must satisfy to count as delivered evidence."""
         if not self.ok:
             return [self.error or "render failed"]
+        found: list[str] = [] if self.verdict is None else list(self.verdict.problems)
         if not self.has_audio:
             found.append("no audio stream in the MP4")
         if abs(self.video_seconds - self.expected_seconds) > DURATION_TOLERANCE:
@@ -133,6 +242,7 @@ class CaseResult:
             "min_ink": round(min(self.ink), 4) if self.ink else None,
             "min_line_contrast": round(min(self.line), 2) if self.line else None,
             "sheet": self.sheet,
+            "verdict": None if self.verdict is None else self.verdict.to_dict(),
         }
 
 
@@ -258,6 +368,118 @@ def analyse_case(
     return workspace, analysis, report
 
 
+def midi_error(analysis: pipeline.Analysis, midi: Path) -> MidiError:
+    """Error of the aligned time map against the performed onsets the MIDI states.
+
+    Where the corpus MIDI renders this very performance, its tick position divided by the ticks per
+    quarter *is* the written quarter position and its onset seconds are the performed times, so
+    grouping by that pair matches a route note to its MIDI note without going through the alignment
+    numbers. The grid and length ratios first decide whether the MIDI is this performance at all.
+    """
+    notes = partitura.load_performance_midi(midi).note_array()
+    ticks = np.asarray(notes["onset_tick"], dtype=float)
+    pitches = np.asarray(notes["pitch"])
+    seconds = np.asarray(notes["onset_sec"], dtype=float)
+    ends = seconds + np.asarray(notes["duration_sec"], dtype=float)
+    buckets: dict[tuple[float, int], list[float]] = {}
+    for tick, pitch, second in zip(ticks, pitches, seconds, strict=True):
+        buckets.setdefault((round(tick / QUARTER_TICKS, 3), int(pitch)), []).append(float(second))
+    for values in buckets.values():
+        values.sort()
+
+    last_attack_q = max(note.onset_q for note in analysis.route.notes)
+    grid_ratio = (float(ticks.max()) / QUARTER_TICKS) / max(last_attack_q, 1e-9)
+    if not GRID_RATIO[0] <= grid_ratio <= GRID_RATIO[1]:
+        return MidiError(
+            0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            f"the MIDI is on another quarter grid ({grid_ratio:.2f}x the route), so it is not "
+            "this performance",
+        )
+    duration_ratio = float(ends.max()) / max(analysis.alignment.audio_duration, 1e-9)
+    if not DURATION_RATIO[0] <= duration_ratio <= DURATION_RATIO[1]:
+        return MidiError(
+            0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            f"the MIDI lasts {duration_ratio:.2f}x the recording, so it is the notation at its "
+            "own tempo, not this performance",
+        )
+
+    written = analysis.score.note_by_id()
+    quarters: list[float] = []
+    times: list[float] = []
+    for note in analysis.route.notes:
+        values = buckets.get((round(note.onset_q, 3), written[note.note_id].pitch))
+        if values:
+            quarters.append(note.onset_q)
+            times.append(values.pop(0))
+    if not quarters:
+        return MidiError(0, 0.0, 0.0, 0.0, 0.0)
+    predicted = np.asarray([analysis.alignment.time_at(q) for q in quarters])
+    error = (predicted - np.asarray(times)) * 1000.0
+    offset = float(np.median(error))
+    centred = np.abs(error - offset)
+    return MidiError(
+        pairs=len(quarters),
+        match_rate=len(quarters) / max(len(analysis.route.notes), 1),
+        offset_ms=offset,
+        p50_ms=float(np.median(centred)),
+        p90_ms=float(np.percentile(centred, 90)),
+    )
+
+
+def judge(
+    case_name: str,
+    report: dict,
+    analysis: pipeline.Analysis,
+    midi: Path | None,
+) -> Verdict:
+    """Judge one case's analysis: its report checks, its alignment evidence and the MIDI gates."""
+    checks = tuple(
+        (str(check.get("name")), str(check.get("detail")), bool(check.get("ok")))
+        for check in report.get("checks") or ()
+    )
+    evidence = analysis.align_report or {}
+    coverage = float(evidence.get("coverage") or 0.0)
+    residual_ms = float((evidence.get("residual_ms") or {}).get("median") or 0.0)
+
+    problems = [f"check {name}: {detail}" for name, detail, ok in checks if not ok]
+    if not checks:
+        problems.append("the report carries no check")
+    if not evidence:
+        problems.append("the alignment evidence align/report.json is empty")
+    figure = (report.get("artifacts") or {}).get("alignment_figure")
+    if not figure or not Path(figure).is_file():
+        problems.append("the alignment figure is missing")
+    if coverage < MIN_COVERAGE:
+        problems.append(f"alignment coverage {coverage:.3f} is below {MIN_COVERAGE}")
+    if residual_ms > MAX_RESIDUAL_MS:
+        problems.append(
+            f"snapped residual median {residual_ms:.0f} ms is above {MAX_RESIDUAL_MS:.0f} ms"
+        )
+
+    measured: MidiError | None = None
+    if case_name in MIDI_GROUND_TRUTH:
+        if midi is None or not midi.is_file():
+            problems.append(f"the MIDI ground truth {case_name}.mid is missing")
+        else:
+            measured = midi_error(analysis, midi)
+            problems.extend(f"MIDI ground truth: {line}" for line in measured.problems())
+    return Verdict(
+        checks=checks,
+        coverage=coverage,
+        residual_ms=residual_ms,
+        midi=measured,
+        problems=tuple(problems),
+    )
+
+
 def render_mode(
     case_name: str,
     mode: str,
@@ -268,9 +490,10 @@ def render_mode(
     out: Path,
     spec: VideoSpec,
     preview: float | None,
+    verdict: Verdict,
 ) -> CaseResult:
     """Render one mode from the shared analysis and measure the produced video."""
-    result = CaseResult(case=case_name, mode=mode, spec_fps=float(spec.fps))
+    result = CaseResult(case=case_name, mode=mode, spec_fps=float(spec.fps), verdict=verdict)
     video = out / f"{case_name}.{mode}.mp4"
     started = time.perf_counter()
     pipeline.render(
@@ -356,6 +579,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     results: list[CaseResult] = []
+    verdicts: dict[str, Verdict] = {}
     for directory in cases:
         pdf, track, symbolic = pipeline.discover_case(directory)
         inputs = pipeline.Inputs(pdf=pdf, audio=track, symbolic=symbolic)
@@ -372,6 +596,13 @@ def main(argv: list[str] | None = None) -> int:
             results.extend(failure(directory.name, modes, error))
             print(f"{directory.name:>7} FAILED: {type(error).__name__}: {error}")
             continue
+        verdict = judge(directory.name, report, analysis, directory / f"{directory.name}.mid")
+        verdicts[directory.name] = verdict
+        print(
+            f"{directory.name:>7} {'verdict':<6} {verdict.summary()}"
+            + ("" if not verdict.problems else "  PROBLEMS: " + "; ".join(verdict.problems)),
+            flush=True,
+        )
         for mode in modes:
             print(f"{directory.name:>7} {mode:<6} rendering ...", flush=True)
             try:
@@ -385,6 +616,7 @@ def main(argv: list[str] | None = None) -> int:
                     out,
                     spec,
                     args.preview,
+                    verdict,
                 )
             except (MusicFlowError, RuntimeError, subprocess.CalledProcessError) as error:
                 results.extend(failure(directory.name, [mode], error))
@@ -414,7 +646,9 @@ def main(argv: list[str] | None = None) -> int:
     report_path.write_text(json.dumps(payload, indent=1), encoding="utf-8")
 
     failures = [record for record in results if record.problems()]
+    failed_cases = sorted(name for name, verdict in verdicts.items() if verdict.problems)
     print(f"\n{len(results) - len(failures)}/{len(results)} renders ok; report {report_path}")
+    print(f"{len(verdicts) - len(failed_cases)}/{len(verdicts)} case verdicts ok")
     for failed in failures:
         print(f"  failed {failed.case} {failed.mode}: {'; '.join(failed.problems())}")
     return 0 if not failures else 1
