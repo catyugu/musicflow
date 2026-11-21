@@ -232,7 +232,6 @@ def test_checks_and_render_cover_only_the_artifacts_they_have(tmp_path: Path) ->
         with pytest.raises(AssertionError):
             pipeline.render(
                 inputs,
-                workdir.Workspace(tmp_path / "work"),
                 mode=mode,
                 out=tmp_path / f"{mode}.mp4",
                 spec=SPEC,
@@ -249,7 +248,7 @@ def test_run_case_task_analyses_once_and_records_every_mode(
         analyses.append((kw["with_pdf"], kw["with_flow"]))
         return hand_analysis()
 
-    def fake_render(inputs, workspace, *, mode, out, spec, preview=None, analysis=None):
+    def fake_render(inputs, *, mode, out, spec, preview=None, analysis=None):
         if mode == "flow":
             raise RuntimeError("encoder exploded")
         out.parent.mkdir(parents=True, exist_ok=True)
@@ -302,7 +301,7 @@ def test_batch_requires_musicxml(monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     assert pipeline.discover_case(alpha).symbolic == alpha / "alpha.musicxml"
     monkeypatch.setattr(pipeline, "analyze", lambda inputs, workspace, **kw: hand_analysis())
 
-    def fake_render(inputs, workspace, *, mode, out, spec, preview=None, analysis=None):
+    def fake_render(inputs, *, mode, out, spec, preview=None, analysis=None):
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_bytes(b"mp4")
         return out

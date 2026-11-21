@@ -130,7 +130,6 @@ def _cmd_render(args: argparse.Namespace) -> int:
     )
     produced = pipeline.render(
         inputs,
-        workspace,
         mode=args.mode,
         out=out,
         spec=spec,

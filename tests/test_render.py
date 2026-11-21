@@ -13,7 +13,7 @@ from musicflow import model
 from musicflow.errors import InputError, RenderError
 from musicflow.render import render_flow
 from musicflow.render.camera import CameraTrack
-from musicflow.render.canvas import blank, draw_reading_line, parameters_digest, rgb
+from musicflow.render.canvas import blank, draw_reading_line, rgb
 from musicflow.render.encoder import plan_timeline
 from musicflow.render.flow import _frame_source
 from musicflow.render.switch import _system_frame, plan_switch
@@ -146,7 +146,6 @@ def test_missing_resources_are_typed_errors(tmp_path: Path) -> None:
             flow=flow,
             spec=model.VideoSpec(width=320, height=180, fps=10),
             out=tmp_path / "out.mp4",
-            work_dir=tmp_path / "work",
             tiles_dir=tiles_dir,
             preview=1.0,
             audio=tmp_path / "absent.mp3",
@@ -171,7 +170,3 @@ def test_canvas_paints_paper_and_line_and_timeline_follows_the_preview() -> None
     preview = plan_timeline(10.0, spec, 3.0)
     assert (preview.seconds, preview.frames) == (3.0, 30)
     assert plan_timeline(10.0, spec, 99.0).seconds == 10.0
-    assert parameters_digest("flow", spec, {"a": 1, "b": 2}) == parameters_digest(
-        "flow", spec, {"b": 2, "a": 1}
-    )
-    assert parameters_digest("flow", spec, {"a": 1}) != parameters_digest("flow", spec, {"a": 2})

@@ -305,7 +305,6 @@ def _write_report(
 
 def render(
     inputs: Inputs,
-    workspace: workdir.Workspace,
     *,
     mode: Mode,
     out: Path,
@@ -322,8 +321,6 @@ def render(
         assert analysis.flow is not None and analysis.tiles_dir is not None
     target = out if out.is_absolute() else Path.cwd() / out
     target.parent.mkdir(parents=True, exist_ok=True)
-    work_dir = workspace.root / f"render-{mode}"
-    work_dir.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
     if mode == "switch":
         produced = renderer.render_switch(
@@ -333,7 +330,6 @@ def render(
             alignment=analysis.alignment,
             spec=spec,
             out=target,
-            work_dir=work_dir,
             preview=preview,
             audio=inputs.audio,
             pdf=inputs.pdf,
@@ -345,7 +341,6 @@ def render(
             flow=analysis.flow,
             spec=spec,
             out=target,
-            work_dir=work_dir,
             tiles_dir=analysis.tiles_dir,
             preview=preview,
             audio=inputs.audio,
@@ -432,7 +427,6 @@ def run_case_task(task: BatchTask) -> list[dict[str, Any]]:
         try:
             produced = render(
                 task.inputs,
-                workspace,
                 mode=mode,
                 out=out,
                 spec=task.spec,

@@ -17,7 +17,7 @@ The corpus verdicts are the checks pytest used to own before the corpus left the
 
 The report splits the cost of a mode the way the plan asks for it: the shared analysis (the
 ``timings`` of ``report.json``), its engraving stage, and the render's own frame composition and
-encoding (see ``musicflow.render.encoder.LAST_STATS``).
+end-to-end render time.
 
 Usage:
 
@@ -44,7 +44,6 @@ from PIL import Image, ImageDraw
 from musicflow import pipeline, workdir
 from musicflow.errors import MusicFlowError
 from musicflow.model import VideoSpec
-from musicflow.render import encoder
 from musicflow.render.canvas import rgb
 
 SAMPLE_FRAMES = 6
@@ -152,37 +151,6 @@ class Verdict:
         }
 
 
-@dataclass(frozen=True)
-class Costs:
-    """What one mode cost: the analysis it shares, its engraving, and its render.
-
-    ``analysis`` is ``report.json``'s ``timings.total`` and ``engraving`` its ``timings.flow``, so
-    both are what the pipeline already recorded; ``composing`` and ``encoding`` come from the
-    encoder statistics of this render. ``analysis`` is paid once per case, not once per mode.
-    """
-
-    analysis: float
-    engraving: float
-    composing: float
-    encoding: float
-    render: float
-    frames: int
-    segments: int
-    cached_segments: int
-
-    def to_dict(self) -> dict[str, float | int]:
-        return {
-            "analysis": round(self.analysis, 1),
-            "engraving": round(self.engraving, 1),
-            "composing": round(self.composing, 1),
-            "encoding": round(self.encoding, 1),
-            "render": round(self.render, 1),
-            "frames": self.frames,
-            "segments": self.segments,
-            "cached_segments": self.cached_segments,
-        }
-
-
 @dataclass
 class CaseResult:
     case: str
@@ -201,7 +169,6 @@ class CaseResult:
     ink: list[float] = field(default_factory=list)
     line: list[float] = field(default_factory=list)
     sheet: str = ""
-    costs: Costs | None = None
     verdict: Verdict | None = None
 
     def problems(self) -> list[str]:
@@ -233,7 +200,6 @@ class CaseResult:
             "ok": not problems,
             "problems": problems,
             "seconds": round(self.seconds, 1),
-            "costs": None if self.costs is None else self.costs.to_dict(),
             "video": self.video,
             "video_seconds": round(self.video_seconds, 3),
             "audio_seconds": round(self.expected_seconds, 3),
@@ -485,9 +451,7 @@ def render_mode(
     case_name: str,
     mode: str,
     inputs: pipeline.Inputs,
-    workspace: workdir.Workspace,
     analysis: pipeline.Analysis,
-    report: dict,
     out: Path,
     spec: VideoSpec,
     preview: float | None,
@@ -499,7 +463,6 @@ def render_mode(
     started = time.perf_counter()
     pipeline.render(
         inputs,
-        workspace,
         mode=mode,
         out=video,
         spec=spec,
@@ -507,7 +470,6 @@ def render_mode(
         analysis=analysis,
     )
     result.seconds = time.perf_counter() - started
-    result.costs = costs_of(result.seconds, report, encoder.LAST_STATS)
     result.video = str(video)
     result.fps, result.frames, result.video_seconds, audio_in_file = probe_video(video)
     result.has_audio = audio_in_file > 0.0
@@ -530,21 +492,6 @@ def render_mode(
     )
     result.ok = True
     return result
-
-
-def costs_of(seconds: float, report: dict, stats: dict[str, float | int] | None) -> Costs:
-    """Split what this render cost, taking the analysis and engraving from the merged report."""
-    timings = report.get("timings") or {}
-    return Costs(
-        analysis=float(timings.get("total") or 0.0),
-        engraving=float(timings.get("flow") or 0.0),
-        composing=0.0 if stats is None else float(stats["composing"]),
-        encoding=0.0 if stats is None else float(stats["encoding"]),
-        render=seconds,
-        frames=0 if stats is None else int(stats["frames"]),
-        segments=0 if stats is None else int(stats["segments"]),
-        cached_segments=0 if stats is None else int(stats["cached_segments"]),
-    )
 
 
 def failure(case_name: str, modes: list[str], error: Exception) -> list[CaseResult]:
@@ -586,7 +533,7 @@ def main(argv: list[str] | None = None) -> int:
         modes = requested
         print(f"{directory.name:>7} analysing ...", flush=True)
         try:
-            workspace, analysis, report = analyse_case(directory.name, inputs, out, spec, modes)
+            _workspace, analysis, report = analyse_case(directory.name, inputs, out, spec, modes)
         except (MusicFlowError, RuntimeError, subprocess.CalledProcessError) as error:
             results.extend(failure(directory.name, modes, error))
             print(f"{directory.name:>7} FAILED: {type(error).__name__}: {error}")
@@ -605,9 +552,7 @@ def main(argv: list[str] | None = None) -> int:
                     directory.name,
                     mode,
                     inputs,
-                    workspace,
                     analysis,
-                    report,
                     out,
                     spec,
                     args.preview,
@@ -618,18 +563,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"{directory.name:>7} {mode:<6} FAILED: {type(error).__name__}: {error}")
                 continue
             results.append(record)
-            problems = record.problems()
-            costs = record.costs
-            print(
-                f"{directory.name:>7} {mode:<6} {record.seconds:7.1f}s  "
-                f"costs analysis {costs.analysis:5.1f}s engraving {costs.engraving:5.1f}s "
-                f"compose {costs.composing:5.1f}s encode {costs.encoding:5.1f}s  "
-                f"video {record.video_seconds:8.2f}s / audio {record.expected_seconds:8.2f}s  "
-                f"{record.frames} frames @ {record.fps:g} fps  "
-                f"ink_min {min(record.ink):.3f}"
-                + (f"  line {min(record.line):.1f}" if record.line else "")
-                + ("" if not problems else "  PROBLEMS: " + "; ".join(problems))
-            )
+            print(f"{directory.name:>7} {mode:<6} {record.seconds:.1f}s", flush=True)
 
     report_path = out / "acceptance.json"
     payload = {

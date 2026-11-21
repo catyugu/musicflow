@@ -2,7 +2,7 @@
 
 ``render_switch`` shows the original PDF one staff system at a time; ``render_flow`` moves one
 engraved strip past a fixed reading line. Both compute every frame from the absolute recording
-time and share the same segmented encoder, so an interrupted run resumes segment by segment.
+time and share the same FFmpeg encoder.
 """
 
 from .flow import render_flow

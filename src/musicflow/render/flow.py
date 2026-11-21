@@ -11,15 +11,13 @@ import logging
 import math
 from pathlib import Path
 
-import msgspec
 import numpy as np
 from PIL import Image
 
-from ..audio import probe as probe_audio
 from ..errors import RenderError
 from ..model import Alignment, FlowLayout, Route, VideoSpec
 from .camera import CameraTrack
-from .canvas import draw_reading_line, file_signature, rgb
+from .canvas import draw_reading_line, rgb
 from .encoder import FrameSource, encode, plan_timeline
 from .tiles import StripTiles
 
@@ -112,38 +110,17 @@ def render_flow(
     flow: FlowLayout,
     spec: VideoSpec,
     out: Path,
-    work_dir: Path,
     tiles_dir: Path,
     preview: float | None,
     audio: Path,
 ) -> Path:
     """Render the continuous-flow view and return the MP4 path.
 
-    ``tiles_dir`` is the flow step directory that the layout's tile paths are relative to;
-    ``work_dir`` receives this render's segments and nothing of the engraver's.
+    ``tiles_dir`` is the directory that the layout's tile paths are relative to.
     """
     tiles = StripTiles(flow.tiles, tiles_dir)
     track = plan_camera(route=route, flow=flow, alignment=alignment)
-    timeline = plan_timeline(probe_audio(audio).duration, spec, preview)
+    timeline = plan_timeline(alignment.audio_duration, spec, preview)
     camera_x = track.x_many(np.arange(timeline.frames) / spec.fps)
     frame_at = _frame_source(camera_x=camera_x, tiles=tiles, flow=flow, spec=spec)
-    return encode(
-        frame_at,
-        spec=spec,
-        audio=audio,
-        out=out,
-        work_dir=work_dir,
-        preview=preview,
-        timeline=timeline,
-        kind="flow",
-        parameters={
-            "mode": "flow",
-            "content": msgspec.to_builtins(flow.content),
-            "strip_height": flow.strip_height,
-            "tiles": [
-                [tile.path, tile.x0, tile.width, tile.height, file_signature(tiles_dir / tile.path)]
-                for tile in flow.tiles
-            ],
-            "anchors": [list(anchor) for anchor in track.anchors],
-        },
-    )
+    return encode(frame_at, spec=spec, audio=audio, out=out, timeline=timeline, preview=preview)

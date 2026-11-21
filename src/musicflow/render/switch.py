@@ -14,15 +14,15 @@ import math
 from dataclasses import dataclass
 from pathlib import Path
 
-import msgspec
+import cv2
 import numpy as np
 import pymupdf
 from PIL import Image
 
 from ..errors import AnalysisError, InputError, RenderError
 from ..model import Alignment, Route, Score, StaffLayout, System, VideoSpec
-from .canvas import FrameCache, blank, file_signature, paste
-from .encoder import encode
+from .canvas import FrameCache, blank, paste
+from .encoder import encode, plan_timeline
 
 logger = logging.getLogger(__name__)
 
@@ -181,7 +181,6 @@ def render_switch(
     alignment: Alignment,
     spec: VideoSpec,
     out: Path,
-    work_dir: Path,
     preview: float | None,
     audio: Path,
     pdf: Path,
@@ -200,7 +199,8 @@ def render_switch(
         def build() -> np.ndarray:
             dpi = dpis[system.page]
             image = rasters.get(system.page, lambda: _page_raster(pdf, system.page, dpi))
-            return _system_frame(image, dpi, system, spec)
+            # Consecutive frames reuse both the crop and its encoder pixel format.
+            return cv2.cvtColor(_system_frame(image, dpi, system, spec), cv2.COLOR_RGB2YUV_I420)
 
         return frames.get(system.index, build)
 
@@ -209,14 +209,7 @@ def render_switch(
         spec=spec,
         audio=audio,
         out=out,
-        work_dir=work_dir,
+        timeline=plan_timeline(alignment.audio_duration, spec, preview),
         preview=preview,
-        kind="switch",
-        parameters={
-            "mode": "switch",
-            "pdf": file_signature(pdf),
-            "systems": [[s.index, s.page, msgspec.to_builtins(s.bbox)] for s in plan.systems],
-            "times": list(plan.times),
-            "dpi": sorted(dpis.items()),
-        },
+        pixel_format="yuv420p",
     )
